@@ -47,7 +47,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compaction_notice_token_reserve: Tokens to reserve for notice (default: 800)
             - compaction_notice_verbosity: Notice detail level - "minimal", "normal", "verbose" (default: "normal")
             - compaction_notice_min_level: Only show notice if compaction level >= this (default: 1)
-            - add_timestamps: Add ISO 8601 timestamps to messages at creation (default: False)
 
     Returns:
         Optional cleanup function
@@ -66,7 +65,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         ),
         compaction_notice_verbosity=config.get("compaction_notice_verbosity", "normal"),
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
-        add_timestamps=config.get("add_timestamps", True),
         hooks=getattr(coordinator, "hooks", None),
     )
     await coordinator.mount("context", context)
@@ -120,7 +118,6 @@ class SimpleContextManager:
         compaction_notice_token_reserve: int = 800,
         compaction_notice_verbosity: str = "normal",
         compaction_notice_min_level: int = 1,
-        add_timestamps: bool = True,
         hooks: Any = None,
     ):
         """
@@ -137,7 +134,6 @@ class SimpleContextManager:
             compaction_notice_token_reserve: Tokens to reserve for notice
             compaction_notice_verbosity: Notice detail level ("minimal", "normal", "verbose")
             compaction_notice_min_level: Only show notice if compaction level >= this
-            add_timestamps: Add ISO 8601 timestamps to messages at creation (default: True)
             hooks: Optional hooks instance for emitting observability events
         """
         self.messages: list[dict[str, Any]] = []
@@ -151,7 +147,6 @@ class SimpleContextManager:
         self.compaction_notice_token_reserve = compaction_notice_token_reserve
         self.compaction_notice_verbosity = compaction_notice_verbosity
         self.compaction_notice_min_level = compaction_notice_min_level
-        self.add_timestamps = add_timestamps
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
@@ -165,12 +160,19 @@ class SimpleContextManager:
         Tool results MUST be added even if over threshold, otherwise
         tool_use/tool_result pairing breaks.
 
-        If add_timestamps is enabled, adds ISO 8601 timestamp with millisecond
-        precision to messages that don't already have one.
+        Timestamps are automatically added to message metadata for replay timing.
+        Existing timestamps and metadata are preserved.
         """
-        # Add timestamp if enabled and not present (for replay timing)
-        if self.add_timestamps and "timestamp" not in message:
-            message["timestamp"] = datetime.now(UTC).isoformat(timespec="milliseconds")
+        # Add timestamp in metadata if not already present (for replay timing)
+        existing_meta = message.get("metadata", {})
+        if "timestamp" not in existing_meta:
+            message = {
+                **message,
+                "metadata": {
+                    **existing_meta,
+                    "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                },
+            }
 
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
