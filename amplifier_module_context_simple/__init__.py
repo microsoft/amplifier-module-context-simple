@@ -66,7 +66,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         ),
         compaction_notice_verbosity=config.get("compaction_notice_verbosity", "normal"),
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
-        add_timestamps=config.get("add_timestamps", False),
+        add_timestamps=config.get("add_timestamps", True),
         hooks=getattr(coordinator, "hooks", None),
     )
     await coordinator.mount("context", context)
@@ -120,7 +120,7 @@ class SimpleContextManager:
         compaction_notice_token_reserve: int = 800,
         compaction_notice_verbosity: str = "normal",
         compaction_notice_min_level: int = 1,
-        add_timestamps: bool = False,
+        add_timestamps: bool = True,
         hooks: Any = None,
     ):
         """
@@ -137,7 +137,7 @@ class SimpleContextManager:
             compaction_notice_token_reserve: Tokens to reserve for notice
             compaction_notice_verbosity: Notice detail level ("minimal", "normal", "verbose")
             compaction_notice_min_level: Only show notice if compaction level >= this
-            add_timestamps: Add ISO 8601 timestamps to messages at creation (default: False)
+            add_timestamps: Add ISO 8601 timestamps to messages at creation (default: True)
             hooks: Optional hooks instance for emitting observability events
         """
         self.messages: list[dict[str, Any]] = []

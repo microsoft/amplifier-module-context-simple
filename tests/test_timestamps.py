@@ -7,15 +7,32 @@ from amplifier_module_context_simple import SimpleContextManager
 
 
 @pytest.mark.asyncio
-async def test_timestamps_disabled_by_default():
-    """Verify timestamps are NOT added when add_timestamps=False (default)."""
+async def test_timestamps_enabled_by_default():
+    """Verify timestamps ARE added by default (add_timestamps=True)."""
+    context = SimpleContextManager()  # No explicit add_timestamps - uses default True
+
+    # Add message without timestamp
+    message = {"role": "user", "content": "Hello"}
+    await context.add_message(message)
+
+    # Verify timestamp WAS added (default behavior)
+    messages = await context.get_messages()
+    assert len(messages) == 1
+    assert "timestamp" in messages[0]
+    assert messages[0]["role"] == "user"
+    assert messages[0]["content"] == "Hello"
+
+
+@pytest.mark.asyncio
+async def test_timestamps_can_be_disabled():
+    """Verify timestamps can be disabled via add_timestamps=False."""
     context = SimpleContextManager(add_timestamps=False)
 
     # Add message without timestamp
     message = {"role": "user", "content": "Hello"}
     await context.add_message(message)
 
-    # Verify NO timestamp was added
+    # Verify NO timestamp was added when disabled
     messages = await context.get_messages()
     assert len(messages) == 1
     assert "timestamp" not in messages[0]
@@ -144,12 +161,12 @@ async def test_timestamp_format():
     messages = await context.get_messages()
     timestamp = messages[0]["timestamp"]
 
-    # Should match format: 2026-02-06T10:00:00.123Z
-    # Year-Month-DayTHour:Minute:Second.MillisecondsZ
+    # Should match format: 2026-02-06T10:00:00.123+00:00
+    # Year-Month-DayTHour:Minute:Second.Milliseconds+00:00
     assert "T" in timestamp
     assert timestamp.endswith("+00:00")
     assert "." in timestamp  # Has milliseconds
 
     # Should be parseable
-    parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+    parsed = datetime.fromisoformat(timestamp)
     assert isinstance(parsed, datetime)
