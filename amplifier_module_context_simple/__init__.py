@@ -164,7 +164,7 @@ class SimpleContextManager:
         Existing timestamps and metadata are preserved.
         """
         # Add timestamp in metadata if not already present (for replay timing)
-        existing_meta = message.get("metadata", {})
+        existing_meta = message.get("metadata") or {}
         if "timestamp" not in existing_meta:
             message = {
                 **message,
@@ -256,7 +256,7 @@ class SimpleContextManager:
                 msg
                 for msg in self.messages
                 if msg.get("role") != "system"
-                or msg.get("metadata", {}).get("source") == "hook"
+                or (msg.get("metadata") or {}).get("source") == "hook"
             ]
             working_messages = [system_message] + conversation_messages
             logger.debug(
