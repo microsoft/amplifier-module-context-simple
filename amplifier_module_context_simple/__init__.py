@@ -1165,7 +1165,7 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             logger.debug(f"Using explicit token_budget: {token_budget}")
             return token_budget
 
-        safety_margin = 1000  # Buffer to avoid hitting hard limits
+        safety_margin = 4096  # Buffer to avoid hitting hard limits
         output_reserve_fraction = (
             0.5  # Reserve 50% of max output (most responses are smaller)
         )
