@@ -281,3 +281,111 @@ async def test_compact_with_multiple_tool_calls_in_one_message():
         f"Expected 6 tool results after assistant with 6 tool_calls, "
         f"but found only {tool_result_count}. This is the bug!"
     )
+
+
+@pytest.mark.asyncio
+async def test_incomplete_tool_results_not_removed():
+    """Test that assistant with incomplete tool results is NOT removed during compaction.
+    
+    Regression test for bug where compaction would remove assistant messages
+    even when not all tool_results had been added yet, causing orphaned
+    tool_results and API errors.
+    """
+    context = SimpleContextManager(
+        max_tokens=1000,
+        compact_threshold=0.01,  # Force compaction
+        target_usage=0.5,
+    )
+    
+    # Scenario: Assistant makes 2 tool calls, but only 1 result added so far
+    await context.add_message({
+        "role": "assistant",
+        "content": "Let me check both",
+        "tool_calls": [
+            {"id": "call_A", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+            {"id": "call_B", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+        ]
+    })
+    
+    # Only result A added
+    await context.add_message({
+        "role": "tool",
+        "tool_call_id": "call_A",
+        "content": "Result from tool A"
+    })
+    
+    # User interrupts (like typing "continue")
+    await context.add_message({
+        "role": "user",
+        "content": "continue"
+    })
+    
+    # Result B hasn't been added yet!
+    
+    # Force compaction
+    compacted = await context._compact_ephemeral(budget=1000, source_messages=context.messages)
+    
+    # CRITICAL: Assistant message should still be present
+    # because call_B is missing its result
+    assistant_messages = [m for m in compacted if m.get("role") == "assistant" and m.get("tool_calls")]
+    
+    assert len(assistant_messages) == 1, "Assistant with incomplete tool results should NOT be removed"
+    
+    # Verify the assistant message has both tool_calls
+    assert len(assistant_messages[0]["tool_calls"]) == 2
+
+
+@pytest.mark.asyncio  
+async def test_complete_tool_results_can_be_removed():
+    """Test that assistant with ALL tool results CAN be removed during compaction."""
+    context = SimpleContextManager(
+        max_tokens=1000,
+        compact_threshold=0.01,  # Force compaction
+        target_usage=0.5,
+    )
+    
+    # Scenario: Assistant makes 2 tool calls, BOTH results added
+    await context.add_message({
+        "role": "assistant",
+        "content": "Let me check both",
+        "tool_calls": [
+            {"id": "call_A", "type": "function", "function": {"name": "tool_a", "arguments": "{}"}},
+            {"id": "call_B", "type": "function", "function": {"name": "tool_b", "arguments": "{}"}},
+        ]
+    })
+    
+    # Both results added
+    await context.add_message({
+        "role": "tool",
+        "tool_call_id": "call_A",
+        "content": "Result A"
+    })
+    await context.add_message({
+        "role": "tool",
+        "tool_call_id": "call_B",
+        "content": "Result B"
+    })
+    
+    # Add more messages to trigger compaction
+    for i in range(20):
+        await context.add_message({"role": "user", "content": f"Message {i}" * 100})
+        await context.add_message({"role": "assistant", "content": f"Response {i}" * 100})
+    
+    # Force compaction - should be able to remove the old tool pair
+    compacted = await context._compact_ephemeral(budget=1000, source_messages=context.messages)
+    
+    # The old assistant with tool_calls might be removed (that's OK now)
+    # We just verify no orphaned tool_results exist
+    tool_use_ids = set()
+    for msg in compacted:
+        if msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                tc_id = tc.get("id") or tc.get("tool_call_id")
+                if tc_id:
+                    tool_use_ids.add(tc_id)
+    
+    # Check all tool results have matching tool_uses
+    for msg in compacted:
+        if msg.get("role") == "tool":
+            tc_id = msg.get("tool_call_id")
+            assert tc_id in tool_use_ids, f"Orphaned tool_result with tool_call_id: {tc_id}"

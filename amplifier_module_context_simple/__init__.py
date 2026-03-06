@@ -934,19 +934,35 @@ class SimpleContextManager:
         assistant_msg: dict[str, Any],
         protected_indices: set[int],
     ) -> tuple[bool, list[int]]:
-        """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices)."""
+        """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices).
+        
+        CRITICAL FIX: This function now verifies that ALL tool_calls have corresponding tool_results.
+        If any tool_call is missing its result, we must NOT remove the assistant, because:
+        1. The tool result might be added later (e.g., user types "continue" during execution)
+        2. Removing the assistant would orphan that future tool result
+        3. This causes: "tool_use ids were found without tool_result blocks" error
+        """
         all_removable = True
         tool_result_indices = []
 
         for tc in assistant_msg.get("tool_calls", []):
             tc_id = tc.get("id") or tc.get("tool_call_id")
             if tc_id:
+                found = False  # Track if we found this specific result
                 for k, m in enumerate(messages):
                     if m.get("tool_call_id") == tc_id:
+                        found = True  # Mark as found
                         if k in protected_indices:
                             all_removable = False
                         else:
                             tool_result_indices.append(k)
+                
+                # CRITICAL: If we didn't find a result for this tool_call,
+                # we CANNOT remove the assistant safely. The tool result might
+                # be added later, and removing the assistant now would create
+                # an orphaned tool_result with no matching tool_use.
+                if not found:
+                    all_removable = False
 
         return all_removable, tool_result_indices
 
