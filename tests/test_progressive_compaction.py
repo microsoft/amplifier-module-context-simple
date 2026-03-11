@@ -13,59 +13,128 @@ from amplifier_module_context_simple import SimpleContextManager
 
 
 @pytest.mark.asyncio
+async def test_truncate_tool_result_compaction_summary():
+    """_truncate_tool_result produces a summary with tool name + first/last lines.
+
+    This is a direct unit test of the helper method, independent of the full
+    compaction pipeline so the new summary format is clearly verified.
+    See: microsoft-amplifier/amplifier-support#136
+    """
+    context = SimpleContextManager(max_tokens=10000, truncate_chars=50)
+
+    # Build a multi-line tool result so first_line != last_line
+    body = "\n".join(
+        ["line one: the beginning of the output"]
+        + [f"middle line {i}" for i in range(5)]
+        + ["line seven: the end of the output"]
+    )
+    msg = {"role": "tool", "tool_call_id": "tc_1", "name": "read_file", "content": body}
+
+    result = context._truncate_tool_result(msg)
+
+    # Markers preserved
+    assert result.get("_truncated") is True
+    assert result.get("_original_tokens") == len(body) // 4
+
+    content = result["content"]
+
+    # New summary header format
+    assert "[Compacted tool result from 'read_file':" in content
+    assert "First:" in content
+    assert "Last:" in content
+
+    # First and last lines are captured in the summary
+    assert "line one: the beginning" in content
+    assert "line seven: the end" in content
+
+    # Preview of original content is still appended
+    assert body[:50] in content
+
+    # Length is bounded: summary + 50-char preview, well under 600
+    assert len(content) < 600, f"Truncated content too large: {len(content)}"
+
+
+@pytest.mark.asyncio
+async def test_truncate_tool_result_short_content_untouched():
+    """Content shorter than truncate_chars is returned unchanged."""
+    context = SimpleContextManager(max_tokens=10000, truncate_chars=200)
+    msg = {"role": "tool", "tool_call_id": "tc_1", "name": "ls", "content": "short"}
+    result = context._truncate_tool_result(msg)
+    assert result is msg  # exact same object — no copy made
+
+
+@pytest.mark.asyncio
 async def test_tool_result_truncation_phase1():
-    """Phase 1 truncates old tool results while preserving structure."""
-    # Configure for easy testing: low tokens, aggressive truncation
-    # Use lower max_tokens to ensure compaction triggers with our message sizes
+    """Phase 1 truncates old tool results while preserving structure.
+
+    The wave-based slicing uses int(total_tools * 0.25), which rounds to 0 when
+    there is only one tool result.  We use 4 tool results so wave1_end = 1 and
+    the oldest (largest) tool result actually lands in the Level-1 truncation
+    slice.  The test accepts either outcome — truncated-in-place or removed
+    entirely — both are valid compaction results.
+    """
     context = SimpleContextManager(
-        max_tokens=300,  # Lower to ensure compaction triggers
+        max_tokens=1000,
         compact_threshold=0.5,
         target_usage=0.3,
         truncate_chars=50,
-        protected_recent=0.3,  # Protect recent messages but allow truncation of old tool
-        protected_tool_results=2,  # Only protect last 2 tool results
+        protected_recent=0.2,
+        protected_tool_results=0,  # Don't protect any — we want Level 1 to fire
     )
 
-    # Add a tool pair early (will be in truncate zone)
-    await context.add_message({"role": "user", "content": "read file"})
-    await context.add_message(
-        {
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": "toolu_early", "type": "function", "function": {"name": "read_file"}}],
-        }
-    )
-    # Add a large tool result - this will push us over the threshold
-    large_content = "x" * 500  # 500 chars = ~125 tokens
-    await context.add_message({"role": "tool", "tool_call_id": "toolu_early", "content": large_content})
+    # Add 4 tool pairs: first one is large (the truncation target), rest are small
+    tool_specs = [
+        ("toolu_large", "read_file", "x" * 500),  # ~125 tokens — truncation target
+        ("toolu_b", "ls", "small result B"),
+        ("toolu_c", "ls", "small result C"),
+        ("toulu_d", "ls", "small result D"),
+    ]
+    for tool_id, tool_name, content in tool_specs:
+        await context.add_message({"role": "user", "content": f"request {tool_id}"})
+        await context.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": tool_id,
+                        "type": "function",
+                        "function": {"name": tool_name},
+                    }
+                ],
+            }
+        )
+        await context.add_message(
+            {"role": "tool", "tool_call_id": tool_id, "content": content}
+        )
 
-    # Add more messages to push tool pair into truncate zone (first 50%)
-    for i in range(10):
-        await context.add_message({"role": "user", "content": f"message {i} with extra padding"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with extra padding"})
+    # Push total tokens over the 50% threshold with padding messages
+    for i in range(15):
+        await context.add_message({"role": "user", "content": f"message {i} padding"})
+        await context.add_message({"role": "assistant", "content": f"response {i}"})
 
     # Trigger compaction
     messages = await context.get_messages_for_request()
 
-    # Find the old tool result
-    tool_result = None
-    for msg in messages:
-        if msg.get("tool_call_id") == "toolu_early":
-            tool_result = msg
-            break
+    # Find the large tool result (may have been truncated OR removed — both valid)
+    tool_result = next(
+        (m for m in messages if m.get("tool_call_id") == "toolu_large"), None
+    )
 
-    # Verify truncation occurred
     if tool_result:
+        # Survived compaction — must have been truncated with the new summary format
         content = tool_result.get("content", "")
-        assert "[truncated:" in content, "Tool result should be truncated"
-        assert tool_result.get("_truncated") is True, "Should have _truncated marker"
-        assert len(content) < 200, f"Truncated content should be small, got {len(content)}"
+        assert "[Compacted tool result from" in content, (
+            f"Tool result present but not truncated with summary format: {content[:120]}"
+        )
+        assert tool_result.get("_truncated") is True
+        assert len(content) < 600
 
 
 @pytest.mark.asyncio
 async def test_percentage_based_target():
     """Compaction reduces returned messages to fit within target_usage percentage.
-    
+
     Note: context-simple uses EPHEMERAL compaction - get_messages_for_request()
     returns a compacted VIEW without modifying internal state. The full history
     is always preserved in self.messages.
@@ -80,8 +149,12 @@ async def test_percentage_based_target():
 
     # Add messages until we exceed threshold
     for i in range(50):
-        await context.add_message({"role": "user", "content": f"message {i} with some padding content"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with some padding content"})
+        await context.add_message(
+            {"role": "user", "content": f"message {i} with some padding content"}
+        )
+        await context.add_message(
+            {"role": "assistant", "content": f"response {i} with some padding content"}
+        )
 
     # Record message count before compaction
     messages_before = len(context.messages)
@@ -93,12 +166,12 @@ async def test_percentage_based_target():
     assert len(compacted_messages) < messages_before, (
         f"Compacted messages ({len(compacted_messages)}) should be fewer than original ({messages_before})"
     )
-    
+
     # Original messages should be unchanged (ephemeral compaction)
     assert len(context.messages) == messages_before, (
         "Original messages should be preserved (ephemeral compaction)"
     )
-    
+
     # Compacted messages should fit within budget
     # Estimate: ~4 chars per token, each message ~40 chars = ~10 tokens
     # 500 token budget / 10 tokens per message ≈ 50 messages max
@@ -143,7 +216,7 @@ async def test_protected_recent_messages():
 @pytest.mark.asyncio
 async def test_first_user_message_always_preserved():
     """First user message (original task/request) is always protected from removal.
-    
+
     This is important because the first user message often contains the original
     task or request, and losing it causes the AI to lose context about what was
     originally asked.
@@ -158,18 +231,26 @@ async def test_first_user_message_always_preserved():
     # First user message - this should always be protected
     first_user_content = "FIRST_USER_MESSAGE_ORIGINAL_TASK"
     await context.add_message({"role": "user", "content": first_user_content})
-    await context.add_message({"role": "assistant", "content": "I'll help you with that."})
+    await context.add_message(
+        {"role": "assistant", "content": "I'll help you with that."}
+    )
 
     # Add many more messages to push the first message into the "old" zone
     for i in range(20):
-        await context.add_message({"role": "user", "content": f"follow up message {i} with padding"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with padding content"})
+        await context.add_message(
+            {"role": "user", "content": f"follow up message {i} with padding"}
+        )
+        await context.add_message(
+            {"role": "assistant", "content": f"response {i} with padding content"}
+        )
 
     # Trigger compaction
     messages = await context.get_messages_for_request()
 
     # First user message must be preserved
-    first_user_messages = [m for m in messages if m.get("content") == first_user_content]
+    first_user_messages = [
+        m for m in messages if m.get("content") == first_user_content
+    ]
     assert len(first_user_messages) == 1, (
         f"First user message should be preserved after compaction. "
         f"Got {len(first_user_messages)} matches in {len(messages)} messages."
@@ -200,17 +281,19 @@ async def test_system_messages_always_preserved():
     # System message must be preserved
     system_messages = [m for m in messages if m.get("role") == "system"]
     assert len(system_messages) == 1, "System message should be preserved"
-    assert system_messages[0]["content"] == system_content, "System content should be unchanged"
+    assert system_messages[0]["content"] == system_content, (
+        "System content should be unchanged"
+    )
 
 
 @pytest.mark.asyncio
 async def test_system_messages_preserved_under_extreme_pressure():
     """System messages are NEVER removed even under extreme compaction pressure.
-    
+
     This test simulates the scenario that caused the original bug where a ~143KB
     system prompt was completely dropped during compaction, causing the agent to
     lose its identity and instructions mid-conversation.
-    
+
     The fix extracts system messages BEFORE compaction and re-inserts them AFTER,
     guaranteeing they are always preserved regardless of compaction level.
     """
@@ -229,18 +312,30 @@ async def test_system_messages_preserved_under_extreme_pressure():
 
     # Add many messages with large tool results to create extreme pressure
     for i in range(30):
-        await context.add_message({"role": "user", "content": f"request {i} with extra content"})
-        await context.add_message({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"tool_{i}", "type": "function", "function": {"name": "read"}}],
-        })
+        await context.add_message(
+            {"role": "user", "content": f"request {i} with extra content"}
+        )
+        await context.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"tool_{i}",
+                        "type": "function",
+                        "function": {"name": "read"},
+                    }
+                ],
+            }
+        )
         # Large tool result
-        await context.add_message({
-            "role": "tool",
-            "tool_call_id": f"tool_{i}",
-            "content": "result " + ("y" * 200),
-        })
+        await context.add_message(
+            {
+                "role": "tool",
+                "tool_call_id": f"tool_{i}",
+                "content": "result " + ("y" * 200),
+            }
+        )
         await context.add_message({"role": "assistant", "content": f"response {i}"})
 
     # Trigger compaction - this should hit Level 7 or 8 due to extreme pressure
@@ -257,7 +352,7 @@ async def test_system_messages_preserved_under_extreme_pressure():
         "System message content was modified during compaction! "
         "System messages must be preserved exactly as-is."
     )
-    
+
     # Verify system message is at the beginning
     assert messages[0].get("role") == "system", (
         "System message must be at the beginning of the message list"
@@ -280,7 +375,9 @@ async def test_truncation_marker_prevents_re_truncation():
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "toolu_1", "type": "function", "function": {"name": "test"}}],
+            "tool_calls": [
+                {"id": "toolu_1", "type": "function", "function": {"name": "test"}}
+            ],
         }
     )
     await context.add_message(
@@ -308,7 +405,9 @@ async def test_truncation_marker_prevents_re_truncation():
     if tool_results:
         content = tool_results[0].get("content", "")
         # Should not have double truncation markers
-        assert content.count("[truncated:") == 1, "Should not re-truncate already truncated content"
+        assert content.count("[truncated:") == 1, (
+            "Should not re-truncate already truncated content"
+        )
 
 
 @pytest.mark.asyncio
@@ -327,11 +426,15 @@ async def test_configurable_truncate_chars():
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "toolu_1", "type": "function", "function": {"name": "test"}}],
+            "tool_calls": [
+                {"id": "toolu_1", "type": "function", "function": {"name": "test"}}
+            ],
         }
     )
     original_content = "A" * 500  # 500 chars
-    await context.add_message({"role": "tool", "tool_call_id": "toolu_1", "content": original_content})
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "toolu_1", "content": original_content}
+    )
 
     # Add more to trigger compaction
     for i in range(15):
@@ -341,13 +444,16 @@ async def test_configurable_truncate_chars():
     await context.get_messages_for_request()
 
     # Find truncated tool result
-    tool_result = next((m for m in context.messages if m.get("tool_call_id") == "toolu_1"), None)
+    tool_result = next(
+        (m for m in context.messages if m.get("tool_call_id") == "toolu_1"), None
+    )
 
     if tool_result and tool_result.get("_truncated"):
         content = tool_result["content"]
         # Should contain ~100 A's from original (plus truncation marker)
         assert "A" * 100 in content, "Should preserve first 100 chars"
-        assert len(content) < 200, "Total length should be small"
+        # Content = summary header (first/last lines up to 100 chars) + 100 char preview
+        assert len(content) < 600, "Total length should be reasonable"
 
 
 @pytest.mark.asyncio
@@ -367,10 +473,18 @@ async def test_tool_pairs_preserved_during_removal():
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": f"toolu_{i}", "type": "function", "function": {"name": "test"}}],
+                "tool_calls": [
+                    {
+                        "id": f"toolu_{i}",
+                        "type": "function",
+                        "function": {"name": "test"},
+                    }
+                ],
             }
         )
-        await context.add_message({"role": "tool", "tool_call_id": f"toolu_{i}", "content": f"result {i}"})
+        await context.add_message(
+            {"role": "tool", "tool_call_id": f"toolu_{i}", "content": f"result {i}"}
+        )
 
     # Add more messages to trigger aggressive compaction
     for i in range(10):
@@ -401,4 +515,6 @@ async def test_tool_pairs_preserved_during_removal():
 
     # Every tool_use should have matching results (may have multiple per assistant)
     # This is harder to check precisely, but at minimum counts should be reasonable
-    assert len(tool_call_ids_in_results) <= len(tool_call_ids_in_assistants) * 6, "More tool results than tool calls"
+    assert len(tool_call_ids_in_results) <= len(tool_call_ids_in_assistants) * 6, (
+        "More tool results than tool calls"
+    )

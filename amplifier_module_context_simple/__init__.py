@@ -1024,6 +1024,10 @@ class SimpleContextManager:
         """
         Truncate a tool result message to reduce token count.
 
+        Includes a summary (first + last lines) so that after compaction the
+        agent retains a "bookmark" of what this result contained and does not
+        need to re-call the tool to recover that context.
+
         Returns a NEW dict - does not modify the original.
         """
         content = msg.get("content", "")
@@ -1031,9 +1035,16 @@ class SimpleContextManager:
             return msg
 
         original_tokens = len(content) // 4
+        tool_name = msg.get("name", "tool")
+
+        lines = content.splitlines()
+        first_line = lines[0][:100] if lines else ""
+        last_line = next((line[:100] for line in reversed(lines) if line.strip()), "")
+
+        summary = f"[Compacted tool result from '{tool_name}': ~{original_tokens:,} tokens. First: {first_line!r}... Last: {last_line!r}...]"
         return {
             **msg,
-            "content": f"[truncated: ~{original_tokens:,} tokens - call tool again if needed] {content[: self.truncate_chars]}...",
+            "content": f"{summary} {content[: self.truncate_chars]}...",
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
