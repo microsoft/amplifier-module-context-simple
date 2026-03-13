@@ -100,7 +100,7 @@ async def test_percentage_based_target():
     )
     
     # Compacted messages should fit within budget
-    # Estimate: ~4 chars per token, each message ~40 chars = ~10 tokens
+    # Estimate: ~3 chars per token, each message ~40 chars = ~13 tokens
     # 500 token budget / 10 tokens per message ≈ 50 messages max
     assert len(compacted_messages) <= 60, (
         f"Compacted messages should fit within budget, got {len(compacted_messages)}"

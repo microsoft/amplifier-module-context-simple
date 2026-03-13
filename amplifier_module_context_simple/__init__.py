@@ -1203,5 +1203,13 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         return self.max_tokens
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        """Rough token estimation (chars / 4)."""
-        return sum(len(str(msg)) // 4 for msg in messages)
+        """Conservative token estimation (chars / 3).
+
+        Uses chars/3 rather than chars/4 to avoid undercounting in tool-heavy
+        sessions where JSON and structured content have a higher token-to-character
+        ratio than natural language.  The previous chars/4 heuristic could
+        undercount by 40-60% for sessions with large tool results, causing
+        compaction to trigger too late (or not at all) and the resulting API
+        request to exceed the model's context window.
+        """
+        return sum(len(str(msg)) // 3 for msg in messages)
