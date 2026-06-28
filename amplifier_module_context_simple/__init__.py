@@ -55,6 +55,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     config = config or {}
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
+        # Track whether max_tokens was *explicitly* set. When it is, we treat it
+        # as a hard ceiling on the provider-derived budget (see _calculate_budget).
+        max_tokens_explicit="max_tokens" in config,
         compact_threshold=config.get("compact_threshold", 0.92),
         target_usage=config.get("target_usage", 0.50),
         protected_recent=config.get("protected_recent", 0.30),
@@ -111,6 +114,7 @@ class SimpleContextManager:
     def __init__(
         self,
         max_tokens: int = 200_000,
+        max_tokens_explicit: bool = False,
         compact_threshold: float = 0.92,
         target_usage: float = 0.50,
         protected_recent: float = 0.30,
@@ -127,7 +131,14 @@ class SimpleContextManager:
         Initialize the context manager.
 
         Args:
-            max_tokens: Maximum context size in tokens
+            max_tokens: Maximum context size in tokens. When max_tokens_explicit
+                is True this also acts as a hard ceiling on any provider-derived
+                budget (see _calculate_budget).
+            max_tokens_explicit: True when max_tokens was explicitly configured by
+                the user (as opposed to the default). When True, the effective
+                budget is capped at max_tokens even if the provider advertises a
+                larger context window. Defaults to False to preserve the historical
+                "provider window wins" behavior for callers that do not set it.
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
@@ -144,6 +155,7 @@ class SimpleContextManager:
         """
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
+        self.max_tokens_explicit = max_tokens_explicit
         self.compact_threshold = compact_threshold
         self.target_usage = target_usage
         self.protected_recent = protected_recent
@@ -1154,6 +1166,27 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 "- If context is critical, consider asking user to clarify their current goal"
             )
 
+    def _apply_max_tokens_cap(self, budget: int) -> int:
+        """Cap a provider-derived budget at the explicitly configured max_tokens.
+
+        When max_tokens was set explicitly (max_tokens_explicit=True), it acts as a
+        hard ceiling: the effective budget is min(provider_budget, max_tokens). This
+        lets an operator bound context growth even on providers that advertise a very
+        large context window (e.g. a 1M-token model), where the provider-derived
+        budget would otherwise be hundreds of thousands of tokens and compaction
+        would effectively never trigger.
+
+        When max_tokens was not set explicitly, the provider budget is returned
+        unchanged, preserving the historical "provider window wins" behavior.
+        """
+        if self.max_tokens_explicit and budget > self.max_tokens:
+            logger.info(
+                f"Capping provider-derived budget {budget:,} to explicitly "
+                f"configured max_tokens {self.max_tokens:,}"
+            )
+            return self.max_tokens
+        return budget
+
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.
 
@@ -1162,6 +1195,12 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         2. Provider model info (context_window - reserved_output - safety_margin)
         3. Provider defaults (legacy: some providers may put limits here)
         4. Configured max_tokens fallback
+
+        Provider-derived budgets (cases 2 and 3) are additionally capped at the
+        configured max_tokens when max_tokens was set explicitly (see
+        _apply_max_tokens_cap). This lets an operator bound context growth even
+        when the provider advertises a much larger window (e.g. a 1M-token model),
+        which is otherwise impossible because max_tokens is only a fallback.
 
         Note: We reserve only 50% of max_output_tokens since most responses are
         much smaller than the maximum. This prevents over-conservative budgets
@@ -1193,7 +1232,7 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                                 f"(context={context_window:,}, reserved_output={reserved_output:,} "
                                 f"[{output_reserve_fraction:.0%} of {max_output:,}])"
                             )
-                            return budget
+                            return self._apply_max_tokens_cap(budget)
 
                 # Check provider info defaults (legacy approach)
                 info = provider.get_info()
@@ -1209,7 +1248,7 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                         f"(context={context_window:,}, reserved_output={reserved_output:,} "
                         f"[{output_reserve_fraction:.0%} of {max_output_tokens:,}])"
                     )
-                    return budget
+                    return self._apply_max_tokens_cap(budget)
                 else:
                     logger.debug(
                         f"Provider defaults missing context_window ({context_window}) "
