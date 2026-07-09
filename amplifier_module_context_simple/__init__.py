@@ -245,10 +245,24 @@ class SimpleContextManager:
         effective_budget = budget
         if self.compaction_notice_enabled:
             effective_budget = budget - self.compaction_notice_token_reserve
-            logger.debug(
-                f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
-                f"(effective budget: {effective_budget:,})"
-            )
+            if effective_budget <= 0:
+                # Misconfiguration guard: if the reserve consumes the entire budget
+                # (or more), _should_compact's `budget > 0` check would silently
+                # force usage to 0, disabling compaction entirely rather than
+                # loudly failing. Fall back to the full budget instead of a
+                # non-positive effective budget - a reserve that swallows the
+                # whole context is not a valid state to compact against.
+                logger.warning(
+                    f"compaction_notice_token_reserve ({self.compaction_notice_token_reserve:,}) "
+                    f">= budget ({budget:,}); ignoring reserve for this request to avoid "
+                    f"silently disabling compaction (effective budget would be {effective_budget:,})"
+                )
+                effective_budget = budget
+            else:
+                logger.debug(
+                    f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
+                    f"(effective budget: {effective_budget:,})"
+                )
 
         # Determine working messages based on whether factory is set
         if self._system_prompt_factory:
@@ -730,8 +744,20 @@ class SimpleContextManager:
         Truncate a wave of tool results, stopping when target is reached.
 
         Returns (truncated_count, new_token_count).
+
+        Performance note: the original implementation called
+        `self._estimate_tokens(messages)` (a full O(n) rescan of every message)
+        after each individual truncation, making this O(n) per truncation
+        candidate -> O(n^2) per wave. Since only ONE message changes per
+        truncation, we instead compute the true total ONCE, lazily, the first
+        time we actually mutate a message in this call, then maintain it via
+        O(1) per-message deltas for every subsequent truncation. This produces
+        numerically identical results to the original (which only ever
+        recomputed `current_tokens` at the moment of an actual mutation) at
+        O(n) total cost for the whole wave instead of O(n * truncated).
         """
         truncated = 0
+        true_total: int | None = None
         for i in indices:
             if current_tokens <= target_tokens:
                 break
@@ -743,9 +769,17 @@ class SimpleContextManager:
             if msg.get("role") != "tool":  # Verify it's still a tool message
                 continue
             if not msg.get("_truncated"):
+                if true_total is None:
+                    # First mutation in this call: establish the true baseline
+                    # once (matches what _estimate_tokens(messages) would have
+                    # returned immediately before this mutation).
+                    true_total = self._estimate_tokens(messages)
+                old_len = len(str(msg)) // 4
                 messages[i] = self._truncate_tool_result(msg)
+                new_len = len(str(messages[i])) // 4
+                true_total += new_len - old_len
                 truncated += 1
-                current_tokens = self._estimate_tokens(messages)
+                current_tokens = true_total
         return truncated, current_tokens
 
     def _remove_messages_with_protection(
@@ -803,41 +837,74 @@ class SimpleContextManager:
             if i not in protected_indices and i not in user_message_indices
         ]
 
+        # Precompute per-message token counts and a tool_call_id -> indices map
+        # ONCE per call (i.e. once per compaction level), instead of rescanning
+        # the full message list for every removal candidate. `messages` is not
+        # mutated until the final `result` list is built below, so both of
+        # these stay valid for the entire loop.
+        #
+        # Performance note: the original implementation recomputed
+        # `self._estimate_tokens(messages)` (full O(n) rescan) on every
+        # removal candidate even though `messages` never changes during this
+        # loop -- that call always returned the same value. It also resummed
+        # the ENTIRE (growing) `indices_to_remove` set from scratch every
+        # iteration. Both were O(n) work repeated O(n) times -> O(n^2). Since
+        # `messages` is constant here, the base total only needs computing
+        # once, and the removed-token total only needs an O(1) delta per
+        # newly-removed index.
+        token_lens = [len(str(msg)) // 4 for msg in messages]
+        tool_call_id_to_indices: dict[str, list[int]] = {}
+        for idx, m in enumerate(messages):
+            tcid = m.get("tool_call_id")
+            if tcid:
+                tool_call_id_to_indices.setdefault(tcid, []).append(idx)
+
         # Remove messages until under target, preserving tool pairs
-        indices_to_remove = set()
-        current_tokens = self._estimate_tokens(messages)
+        indices_to_remove: set[int] = set()
+        removed_tokens_total = 0
+        base_tokens = self._estimate_tokens(
+            messages
+        )  # computed once; messages is constant here
+        current_tokens = base_tokens
 
         for i in removal_candidates:
             if current_tokens <= target_tokens:
                 break
 
             msg = messages[i]
+            newly_removed: list[int] = []
 
             # Handle tool result - must remove with its tool_use pair
             if msg.get("role") == "tool":
-                pair_removed = self._try_remove_tool_pair_from_result(
-                    messages, i, protected_indices, indices_to_remove
+                pair_removed, newly_removed = self._try_remove_tool_pair_from_result(
+                    messages, i, protected_indices, tool_call_id_to_indices
                 )
                 if not pair_removed:
                     continue  # Can't remove this one, skip
 
             # Handle assistant with tool_calls - must remove with all its tool results
             elif msg.get("role") == "assistant" and msg.get("tool_calls"):
-                pair_removed = self._try_remove_tool_pair_from_assistant(
-                    messages, i, msg, protected_indices, indices_to_remove
+                pair_removed, tool_result_indices = (
+                    self._try_remove_tool_pair_from_assistant(
+                        msg, protected_indices, tool_call_id_to_indices
+                    )
                 )
                 if not pair_removed:
                     continue  # Can't remove this one, skip
+                newly_removed = [i, *tool_result_indices]
 
             # Regular message - just mark for removal
             else:
-                indices_to_remove.add(i)
+                newly_removed = [i]
 
-            # Update token estimate after each removal decision
-            removed_tokens = sum(
-                len(str(messages[idx])) // 4 for idx in indices_to_remove
-            )
-            current_tokens = self._estimate_tokens(messages) - removed_tokens
+            # Update running totals in O(1) per newly-removed index instead of
+            # resumming the whole (growing) indices_to_remove set every time.
+            for idx in newly_removed:
+                if idx not in indices_to_remove:
+                    indices_to_remove.add(idx)
+                    removed_tokens_total += token_lens[idx]
+
+            current_tokens = base_tokens - removed_tokens_total
 
         # After removals, stub intermediate user messages if still over target
         # At normal levels (1-7), still protect first/last from stubbing
@@ -883,70 +950,77 @@ class SimpleContextManager:
         messages: list[dict[str, Any]],
         result_idx: int,
         protected_indices: set[int],
-        indices_to_remove: set[int],
-    ) -> bool:
-        """Try to remove a tool result and its paired assistant. Returns True if successful."""
+        tool_call_id_to_indices: dict[str, list[int]],
+    ) -> tuple[bool, list[int]]:
+        """Try to remove a tool result and its paired assistant.
+
+        Returns (success, newly_removed_indices). Does NOT mutate any shared
+        state -- the caller is responsible for adding the returned indices to
+        its removal set and accounting for their token cost.
+        """
         # Find the assistant with tool_calls
         for j in range(result_idx - 1, -1, -1):
             check_msg = messages[j]
             if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
                 if j in protected_indices:
-                    return False  # Can't remove protected assistant
+                    return False, []  # Can't remove protected assistant
 
                 # Check if ALL tool_results for this assistant can be removed
                 all_removable, tool_result_indices = self._check_tool_pair_removable(
-                    messages, check_msg, protected_indices
+                    check_msg, protected_indices, tool_call_id_to_indices
                 )
 
                 if all_removable:
-                    indices_to_remove.add(j)
-                    for k in tool_result_indices:
-                        indices_to_remove.add(k)
-                    return True
-                return False
+                    return True, [j, *tool_result_indices]
+                return False, []
             if check_msg.get("role") != "tool":
                 break
-        return False
+        return False, []
 
     def _try_remove_tool_pair_from_assistant(
         self,
-        messages: list[dict[str, Any]],
-        assistant_idx: int,
         assistant_msg: dict[str, Any],
         protected_indices: set[int],
-        indices_to_remove: set[int],
-    ) -> bool:
-        """Try to remove an assistant with tool_calls and all its results. Returns True if successful."""
+        tool_call_id_to_indices: dict[str, list[int]],
+    ) -> tuple[bool, list[int]]:
+        """Try to remove an assistant with tool_calls and all its results.
+
+        Returns (success, newly_removed_indices) -- the assistant's own index
+        is not known to this helper, so the caller must include it separately
+        if desired (see call site: it prepends the assistant's own index).
+        """
         all_removable, tool_result_indices = self._check_tool_pair_removable(
-            messages, assistant_msg, protected_indices
+            assistant_msg, protected_indices, tool_call_id_to_indices
         )
 
         if all_removable:
-            indices_to_remove.add(assistant_idx)
-            for k in tool_result_indices:
-                indices_to_remove.add(k)
-            return True
-        return False
+            return True, tool_result_indices
+        return False, []
 
     def _check_tool_pair_removable(
         self,
-        messages: list[dict[str, Any]],
         assistant_msg: dict[str, Any],
         protected_indices: set[int],
+        tool_call_id_to_indices: dict[str, list[int]],
     ) -> tuple[bool, list[int]]:
-        """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices)."""
+        """Check if all tool results for an assistant can be removed. Returns (all_removable, result_indices).
+
+        Performance note: uses a precomputed tool_call_id -> message-index map
+        (built once per removal pass, see `_remove_messages_with_protection`)
+        instead of scanning the full message list for every tool_call_id on
+        every removal candidate.
+        """
         all_removable = True
         tool_result_indices = []
 
         for tc in assistant_msg.get("tool_calls", []):
             tc_id = tc.get("id") or tc.get("tool_call_id")
             if tc_id:
-                for k, m in enumerate(messages):
-                    if m.get("tool_call_id") == tc_id:
-                        if k in protected_indices:
-                            all_removable = False
-                        else:
-                            tool_result_indices.append(k)
+                for k in tool_call_id_to_indices.get(tc_id, []):
+                    if k in protected_indices:
+                        all_removable = False
+                    else:
+                        tool_result_indices.append(k)
 
         return all_removable, tool_result_indices
 

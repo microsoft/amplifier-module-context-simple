@@ -24,6 +24,10 @@ async def test_tool_result_truncation_phase1():
         truncate_chars=50,
         protected_recent=0.3,  # Protect recent messages but allow truncation of old tool
         protected_tool_results=2,  # Only protect last 2 tool results
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 300 - 800 = -700, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add a tool pair early (will be in truncate zone)
@@ -32,17 +36,29 @@ async def test_tool_result_truncation_phase1():
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "toolu_early", "type": "function", "function": {"name": "read_file"}}],
+            "tool_calls": [
+                {
+                    "id": "toolu_early",
+                    "type": "function",
+                    "function": {"name": "read_file"},
+                }
+            ],
         }
     )
     # Add a large tool result - this will push us over the threshold
     large_content = "x" * 500  # 500 chars = ~125 tokens
-    await context.add_message({"role": "tool", "tool_call_id": "toolu_early", "content": large_content})
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "toolu_early", "content": large_content}
+    )
 
     # Add more messages to push tool pair into truncate zone (first 50%)
     for i in range(10):
-        await context.add_message({"role": "user", "content": f"message {i} with extra padding"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with extra padding"})
+        await context.add_message(
+            {"role": "user", "content": f"message {i} with extra padding"}
+        )
+        await context.add_message(
+            {"role": "assistant", "content": f"response {i} with extra padding"}
+        )
 
     # Trigger compaction
     messages = await context.get_messages_for_request()
@@ -59,13 +75,15 @@ async def test_tool_result_truncation_phase1():
         content = tool_result.get("content", "")
         assert "[truncated:" in content, "Tool result should be truncated"
         assert tool_result.get("_truncated") is True, "Should have _truncated marker"
-        assert len(content) < 200, f"Truncated content should be small, got {len(content)}"
+        assert len(content) < 200, (
+            f"Truncated content should be small, got {len(content)}"
+        )
 
 
 @pytest.mark.asyncio
 async def test_percentage_based_target():
     """Compaction reduces returned messages to fit within target_usage percentage.
-    
+
     Note: context-simple uses EPHEMERAL compaction - get_messages_for_request()
     returns a compacted VIEW without modifying internal state. The full history
     is always preserved in self.messages.
@@ -80,8 +98,12 @@ async def test_percentage_based_target():
 
     # Add messages until we exceed threshold
     for i in range(50):
-        await context.add_message({"role": "user", "content": f"message {i} with some padding content"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with some padding content"})
+        await context.add_message(
+            {"role": "user", "content": f"message {i} with some padding content"}
+        )
+        await context.add_message(
+            {"role": "assistant", "content": f"response {i} with some padding content"}
+        )
 
     # Record message count before compaction
     messages_before = len(context.messages)
@@ -93,12 +115,12 @@ async def test_percentage_based_target():
     assert len(compacted_messages) < messages_before, (
         f"Compacted messages ({len(compacted_messages)}) should be fewer than original ({messages_before})"
     )
-    
+
     # Original messages should be unchanged (ephemeral compaction)
     assert len(context.messages) == messages_before, (
         "Original messages should be preserved (ephemeral compaction)"
     )
-    
+
     # Compacted messages should fit within budget
     # Estimate: ~4 chars per token, each message ~40 chars = ~10 tokens
     # 500 token budget / 10 tokens per message ≈ 50 messages max
@@ -115,6 +137,10 @@ async def test_protected_recent_messages():
         compact_threshold=0.5,
         target_usage=0.3,
         protected_recent=0.2,  # Protect last 20%
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 500 - 800 = -300, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add 20 messages
@@ -132,6 +158,9 @@ async def test_protected_recent_messages():
     # Trigger compaction
     messages = await context.get_messages_for_request()
 
+    # Verify compaction actually ran (guards against the vacuous-config bug).
+    assert context._last_compaction_stats is not None, "Compaction should have fired"
+
     # Verify protected messages are still there
     message_contents = [m.get("content", "") for m in messages]
     for protected_content in last_messages_content:
@@ -143,7 +172,7 @@ async def test_protected_recent_messages():
 @pytest.mark.asyncio
 async def test_first_user_message_always_preserved():
     """First user message (original task/request) is always protected from removal.
-    
+
     This is important because the first user message often contains the original
     task or request, and losing it causes the AI to lose context about what was
     originally asked.
@@ -153,23 +182,38 @@ async def test_first_user_message_always_preserved():
         compact_threshold=0.5,
         target_usage=0.3,
         protected_recent=0.1,  # Only protect 10% of recent messages
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 500 - 800 = -300, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # First user message - this should always be protected
     first_user_content = "FIRST_USER_MESSAGE_ORIGINAL_TASK"
     await context.add_message({"role": "user", "content": first_user_content})
-    await context.add_message({"role": "assistant", "content": "I'll help you with that."})
+    await context.add_message(
+        {"role": "assistant", "content": "I'll help you with that."}
+    )
 
     # Add many more messages to push the first message into the "old" zone
     for i in range(20):
-        await context.add_message({"role": "user", "content": f"follow up message {i} with padding"})
-        await context.add_message({"role": "assistant", "content": f"response {i} with padding content"})
+        await context.add_message(
+            {"role": "user", "content": f"follow up message {i} with padding"}
+        )
+        await context.add_message(
+            {"role": "assistant", "content": f"response {i} with padding content"}
+        )
 
     # Trigger compaction
     messages = await context.get_messages_for_request()
 
+    # Verify compaction actually ran (guards against the vacuous-config bug).
+    assert context._last_compaction_stats is not None, "Compaction should have fired"
+
     # First user message must be preserved
-    first_user_messages = [m for m in messages if m.get("content") == first_user_content]
+    first_user_messages = [
+        m for m in messages if m.get("content") == first_user_content
+    ]
     assert len(first_user_messages) == 1, (
         f"First user message should be preserved after compaction. "
         f"Got {len(first_user_messages)} matches in {len(messages)} messages."
@@ -183,6 +227,10 @@ async def test_system_messages_always_preserved():
         max_tokens=200,
         compact_threshold=0.5,
         target_usage=0.3,
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 200 - 800 = -600, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add system message
@@ -197,20 +245,25 @@ async def test_system_messages_always_preserved():
     # Trigger compaction
     messages = await context.get_messages_for_request()
 
+    # Verify compaction actually ran (guards against the vacuous-config bug).
+    assert context._last_compaction_stats is not None, "Compaction should have fired"
+
     # System message must be preserved
     system_messages = [m for m in messages if m.get("role") == "system"]
     assert len(system_messages) == 1, "System message should be preserved"
-    assert system_messages[0]["content"] == system_content, "System content should be unchanged"
+    assert system_messages[0]["content"] == system_content, (
+        "System content should be unchanged"
+    )
 
 
 @pytest.mark.asyncio
 async def test_system_messages_preserved_under_extreme_pressure():
     """System messages are NEVER removed even under extreme compaction pressure.
-    
+
     This test simulates the scenario that caused the original bug where a ~143KB
     system prompt was completely dropped during compaction, causing the agent to
     lose its identity and instructions mid-conversation.
-    
+
     The fix extracts system messages BEFORE compaction and re-inserts them AFTER,
     guaranteeing they are always preserved regardless of compaction level.
     """
@@ -221,6 +274,12 @@ async def test_system_messages_preserved_under_extreme_pressure():
         truncate_chars=20,  # Aggressive truncation
         protected_recent=0.1,  # Minimal protection to maximize pressure
         protected_tool_results=1,  # Only protect 1 tool result
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 100 - 800 = -700, which silently disables
+        # compaction entirely (see test_budget_guard.py). This test is the
+        # regression test for the original historical bug (system prompt
+        # dropped during compaction) -- it must actually exercise compaction.
+        compaction_notice_enabled=False,
     )
 
     # Add a large system message (simulating the ~143KB system prompt scenario)
@@ -229,18 +288,30 @@ async def test_system_messages_preserved_under_extreme_pressure():
 
     # Add many messages with large tool results to create extreme pressure
     for i in range(30):
-        await context.add_message({"role": "user", "content": f"request {i} with extra content"})
-        await context.add_message({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{"id": f"tool_{i}", "type": "function", "function": {"name": "read"}}],
-        })
+        await context.add_message(
+            {"role": "user", "content": f"request {i} with extra content"}
+        )
+        await context.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": f"tool_{i}",
+                        "type": "function",
+                        "function": {"name": "read"},
+                    }
+                ],
+            }
+        )
         # Large tool result
-        await context.add_message({
-            "role": "tool",
-            "tool_call_id": f"tool_{i}",
-            "content": "result " + ("y" * 200),
-        })
+        await context.add_message(
+            {
+                "role": "tool",
+                "tool_call_id": f"tool_{i}",
+                "content": "result " + ("y" * 200),
+            }
+        )
         await context.add_message({"role": "assistant", "content": f"response {i}"})
 
     # Trigger compaction - this should hit Level 7 or 8 due to extreme pressure
@@ -257,7 +328,7 @@ async def test_system_messages_preserved_under_extreme_pressure():
         "System message content was modified during compaction! "
         "System messages must be preserved exactly as-is."
     )
-    
+
     # Verify system message is at the beginning
     assert messages[0].get("role") == "system", (
         "System message must be at the beginning of the message list"
@@ -272,6 +343,10 @@ async def test_truncation_marker_prevents_re_truncation():
         compact_threshold=0.5,
         target_usage=0.4,
         truncate_chars=50,
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 500 - 800 = -300, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add a pre-truncated tool result
@@ -280,7 +355,9 @@ async def test_truncation_marker_prevents_re_truncation():
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "toolu_1", "type": "function", "function": {"name": "test"}}],
+            "tool_calls": [
+                {"id": "toolu_1", "type": "function", "function": {"name": "test"}}
+            ],
         }
     )
     await context.add_message(
@@ -308,7 +385,9 @@ async def test_truncation_marker_prevents_re_truncation():
     if tool_results:
         content = tool_results[0].get("content", "")
         # Should not have double truncation markers
-        assert content.count("[truncated:") == 1, "Should not re-truncate already truncated content"
+        assert content.count("[truncated:") == 1, (
+            "Should not re-truncate already truncated content"
+        )
 
 
 @pytest.mark.asyncio
@@ -319,6 +398,10 @@ async def test_configurable_truncate_chars():
         compact_threshold=0.5,
         target_usage=0.3,
         truncate_chars=100,  # Keep 100 chars
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 500 - 800 = -300, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add tool result with known content
@@ -327,11 +410,15 @@ async def test_configurable_truncate_chars():
         {
             "role": "assistant",
             "content": "",
-            "tool_calls": [{"id": "toolu_1", "type": "function", "function": {"name": "test"}}],
+            "tool_calls": [
+                {"id": "toolu_1", "type": "function", "function": {"name": "test"}}
+            ],
         }
     )
     original_content = "A" * 500  # 500 chars
-    await context.add_message({"role": "tool", "tool_call_id": "toolu_1", "content": original_content})
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "toolu_1", "content": original_content}
+    )
 
     # Add more to trigger compaction
     for i in range(15):
@@ -341,7 +428,9 @@ async def test_configurable_truncate_chars():
     await context.get_messages_for_request()
 
     # Find truncated tool result
-    tool_result = next((m for m in context.messages if m.get("tool_call_id") == "toolu_1"), None)
+    tool_result = next(
+        (m for m in context.messages if m.get("tool_call_id") == "toolu_1"), None
+    )
 
     if tool_result and tool_result.get("_truncated"):
         content = tool_result["content"]
@@ -358,6 +447,10 @@ async def test_tool_pairs_preserved_during_removal():
         compact_threshold=0.5,
         target_usage=0.3,
         protected_recent=0.1,
+        # Without this, the default 800-token notice reserve makes
+        # effective_budget = 300 - 800 = -500, which silently disables
+        # compaction entirely (see test_budget_guard.py).
+        compaction_notice_enabled=False,
     )
 
     # Add several tool pairs
@@ -367,10 +460,18 @@ async def test_tool_pairs_preserved_during_removal():
             {
                 "role": "assistant",
                 "content": "",
-                "tool_calls": [{"id": f"toolu_{i}", "type": "function", "function": {"name": "test"}}],
+                "tool_calls": [
+                    {
+                        "id": f"toolu_{i}",
+                        "type": "function",
+                        "function": {"name": "test"},
+                    }
+                ],
             }
         )
-        await context.add_message({"role": "tool", "tool_call_id": f"toolu_{i}", "content": f"result {i}"})
+        await context.add_message(
+            {"role": "tool", "tool_call_id": f"toolu_{i}", "content": f"result {i}"}
+        )
 
     # Add more messages to trigger aggressive compaction
     for i in range(10):
@@ -401,4 +502,6 @@ async def test_tool_pairs_preserved_during_removal():
 
     # Every tool_use should have matching results (may have multiple per assistant)
     # This is harder to check precisely, but at minimum counts should be reasonable
-    assert len(tool_call_ids_in_results) <= len(tool_call_ids_in_assistants) * 6, "More tool results than tool calls"
+    assert len(tool_call_ids_in_results) <= len(tool_call_ids_in_assistants) * 6, (
+        "More tool results than tool calls"
+    )
