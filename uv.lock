@@ -18,21 +18,19 @@ dependencies = [
 name = "amplifier-module-context-simple"
 version = "1.0.0"
 source = { editable = "." }
-dependencies = [
-    { name = "amplifier-core" },
-]
 
 [package.dev-dependencies]
 dev = [
+    { name = "amplifier-core" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "amplifier-core", git = "https://github.com/microsoft/amplifier-core?branch=main" }]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "amplifier-core", git = "https://github.com/microsoft/amplifier-core?branch=main" },
     { name = "pytest", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", specifier = ">=0.23.0" },
 ]
