@@ -34,7 +34,7 @@ allow-direct-references = true
 amplifier-core = { git = "https://github.com/microsoft/amplifier-core", branch = "main" }
 
 [dependency-groups]
-dev = ["amplifier-core", "pytest>=8.0.0", "pytest-asyncio>=0.23.0"]
+dev = ["amplifier-core", "pytest>=9.0.3", "pytest-asyncio>=0.23.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
