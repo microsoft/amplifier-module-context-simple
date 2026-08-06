@@ -1,13 +1,14 @@
 """
 Simple context manager module.
 
-Implements an in-memory context manager with EPHEMERAL compaction:
-  • Messages stored in memory (self.messages is the source of truth)
-  • Compaction NEVER modifies self.messages
-  • get_messages_for_request() returns compacted VIEW (new list)
-  • get_messages() returns FULL history (for transcripts/session persistence)
+Implements an in-memory context manager with two explicit compaction modes:
+  • Messages are stored in memory (self.messages is the source of truth)
+  • get_messages_for_request() returns an ephemeral compacted VIEW (new list)
+  • compact() explicitly persists compaction back to self.messages
+  • get_messages() returns the currently stored history
 
-This design ensures conversation history is never lost, even during compaction.
+Request-time compaction never changes stored history. Callers that invoke compact()
+opt in to permanently shrinking the stored history and future transcripts.
 For persistent storage across sessions, use context-persistent instead.
 
 Dynamic System Prompt Support:
@@ -90,15 +91,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 class SimpleContextManager:
     """
-    In-memory context manager with EPHEMERAL compaction.
+    In-memory context manager with ephemeral and explicit persistent compaction.
 
-    Key Principle: self.messages is the source of truth and is NEVER modified
-    by compaction. Compaction only returns a compacted VIEW for the current
-    LLM request.
+    ``self.messages`` is the source of truth. Automatic request-time compaction
+    only returns a compacted view and leaves it unchanged; ``compact()`` is the
+    explicit operation that commits a compacted result back to stored history.
 
     Owns memory policy: orchestrators ask for messages via get_messages_for_request(),
-    and this context manager decides how to fit them within limits. Compaction is
-    handled internally and ephemerally - the original history is always preserved.
+    and this context manager decides how to fit them within limits. Normal request
+    preparation is ephemeral; persistent compaction happens only when a caller
+    explicitly invokes ``compact()``.
 
     Compaction Strategy (Progressive Interleaved):
     Triggered when usage >= compact_threshold (default 92%), target is target_usage (default 50%).
@@ -239,11 +241,11 @@ class SimpleContextManager:
         bundle instructions to be re-processed each turn.
 
         Applies EPHEMERAL compaction if needed - returns a NEW list without
-        modifying self.messages. The original history is always preserved.
+        modifying self.messages.
 
         If compaction occurs and notice is enabled, a system-reminder is inserted
-        at position 1 (after main system message) to inform the LLM about what
-        was compacted.
+        after any leading system messages and before the conversation. This avoids
+        separating an assistant tool call from its immediately following results.
 
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
@@ -320,9 +322,18 @@ class SimpleContextManager:
                 if level >= self.compaction_notice_min_level:
                     notice = self._format_compaction_notice()
                     if notice:
-                        # Insert at position 1 (after main system message at position 0)
+                        # Insert after leading system messages, before the first
+                        # conversation message. A fixed index can split an
+                        # assistant tool-call message from its following result
+                        # when there is no leading system message.
+                        notice_index = 0
+                        while (
+                            notice_index < len(compacted)
+                            and compacted[notice_index].get("role") == "system"
+                        ):
+                            notice_index += 1
                         compacted.insert(
-                            1,
+                            notice_index,
                             {
                                 "role": "system",
                                 "content": notice,
@@ -333,7 +344,7 @@ class SimpleContextManager:
                             },
                         )
                         logger.debug(
-                            f"Inserted compaction notice at position 1 (level {level}, "
+                            f"Inserted compaction notice at position {notice_index} (level {level}, "
                             f"verbosity: {self.compaction_notice_verbosity})"
                         )
 
@@ -343,10 +354,10 @@ class SimpleContextManager:
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
-        Get ALL messages (full history, never compacted) for transcripts/debugging.
+        Get the currently stored messages for transcripts/debugging.
 
-        This returns the complete, unmodified history - suitable for saving
-        to transcript files for session persistence.
+        Request-time compaction does not affect this list. An earlier explicit
+        ``compact()`` call may have persistently reduced it.
         """
         return list(self.messages)
 
@@ -463,19 +474,28 @@ class SimpleContextManager:
         # Emit pre-compact (best effort).
         await self._emit(_EVT_PRE_COMPACT, {"before_tokens": before_tokens, "budget": budget})
 
-        # Reuse the progressive strategy, then commit the result.
+        # Reuse the progressive strategy, then commit only an actual reduction.
         compacted = await self._compact_ephemeral(budget, working)
-        self.messages = compacted
-
         stats = dict(self._last_compaction_stats or {})
-        stats["compacted"] = True
-        stats.setdefault("before_tokens", before_tokens)
-        stats.setdefault("after_tokens", self._estimate_tokens(compacted))
-        stats.setdefault("before_messages", before_messages)
-        stats.setdefault("after_messages", len(compacted))
+        after_tokens = self._estimate_tokens(compacted)
+        after_messages = len(compacted)
+        stats["before_tokens"] = before_tokens
+        stats["after_tokens"] = after_tokens
+        stats["before_messages"] = before_messages
+        stats["after_messages"] = after_messages
         stats["persistent"] = True
         stats["forced"] = force
 
+        if after_tokens >= before_tokens and after_messages >= before_messages:
+            stats["compacted"] = False
+            stats["reason"] = "no_reduction"
+            logger.info(
+                "Persistent compaction made no reduction; stored history left unchanged"
+            )
+            return stats
+
+        self.messages = compacted
+        stats["compacted"] = True
         await self._emit(_EVT_POST_COMPACT, stats)
         logger.info(
             f"Persistent compaction committed: {before_messages} -> {len(compacted)} messages, "
@@ -1316,7 +1336,7 @@ What was preserved:
 What may be affected:
 {affected}
 
-Note: This compaction is ephemeral (affects only this request). Full history is preserved in session transcript.
+Note: This compaction is ephemeral (affects only this request). Stored history is unchanged by this request.
 </system-reminder>"""
 
         return notice
