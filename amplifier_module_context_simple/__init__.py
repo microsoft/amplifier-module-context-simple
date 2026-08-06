@@ -29,6 +29,20 @@ from amplifier_core import ModuleCoordinator
 
 logger = logging.getLogger(__name__)
 
+# Compaction observability events. Prefer the canonical constants from
+# amplifier_core.events; fall back to the string literals if unavailable so the
+# module keeps working standalone (e.g. in isolated unit tests).
+try:  # pragma: no cover - trivial import guard
+    from amplifier_core.events import (
+        CONTEXT_COMPACTION as _EVT_COMPACTION,
+        CONTEXT_POST_COMPACT as _EVT_POST_COMPACT,
+        CONTEXT_PRE_COMPACT as _EVT_PRE_COMPACT,
+    )
+except Exception:  # pragma: no cover
+    _EVT_PRE_COMPACT = "context:pre_compact"
+    _EVT_POST_COMPACT = "context:post_compact"
+    _EVT_COMPACTION = "context:compaction"
+
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
@@ -346,23 +360,137 @@ class SimpleContextManager:
         self.messages = []
         logger.info("Context cleared")
 
-    async def should_compact(self) -> bool:
-        """Check if context should be compacted.
+    async def should_compact(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+    ) -> bool:
+        """Check whether the stored context is over the compaction threshold.
 
-        Note: This module uses ephemeral compaction during get_messages_for_request(),
-        so this always returns False. The actual compaction check happens internally.
-        This method exists to satisfy the ContextManager protocol.
+        Unlike ``get_messages_for_request`` (which compacts ephemerally every
+        request without touching stored state), this reports on the *persistent*
+        history in ``self.messages`` - i.e. whether an explicit/persistent
+        ``compact()`` would have anything to do.
+
+        Args:
+            provider: Optional provider for dynamic budget calculation.
+            token_budget: Optional explicit budget override.
+
+        Returns:
+            True if stored context usage >= compact_threshold.
         """
-        return False
+        report = self.usage_report(provider=provider, token_budget=token_budget)
+        return report["tokens"] >= report["threshold_tokens"]
 
-    async def compact(self) -> None:
-        """Compact the context.
+    def usage_report(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a snapshot of current context token usage vs budget.
 
-        Note: This module uses ephemeral compaction during get_messages_for_request(),
-        so this is a no-op. Compaction happens automatically when getting messages.
-        This method exists to satisfy the ContextManager protocol.
+        Intended for status displays and for deciding whether to compact.
+        Uses the same heuristic estimator and budget calculation as compaction.
         """
-        pass
+        budget = self._calculate_budget(token_budget, provider)
+        tokens = self._estimate_tokens(list(self.messages))
+        pct = (tokens / budget) if budget > 0 else 0.0
+        return {
+            "tokens": tokens,
+            "budget": budget,
+            "pct": pct,
+            "threshold": self.compact_threshold,
+            "threshold_tokens": int(budget * self.compact_threshold),
+            "target_tokens": int(budget * self.target_usage),
+            "messages": len(self.messages),
+        }
+
+    async def compact(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Persistently compact the stored conversation history.
+
+        This is distinct from the ephemeral compaction applied inside
+        ``get_messages_for_request()``: it runs the same progressive strategy
+        but COMMITS the result back to ``self.messages``, permanently shrinking
+        the stored history (and therefore future transcripts and every
+        subsequent request). System messages are always preserved.
+
+        Args:
+            provider: Optional provider for dynamic budget calculation.
+            token_budget: Optional explicit budget override.
+            force: When True, compact even if below the trigger threshold
+                (used by the explicit ``/compact`` command). Even when forced,
+                nothing is removed if the history is already at/under the target.
+
+        Returns:
+            A stats dict. ``compacted`` is False (with a ``reason``) when no
+            work was done; otherwise it carries before/after token and message
+            counts plus the strategy level reached.
+        """
+        budget = self._calculate_budget(token_budget, provider)
+        working = list(self.messages)
+        before_tokens = self._estimate_tokens(working)
+        before_messages = len(working)
+        target_tokens = int(budget * self.target_usage)
+
+        # Nothing to do: below threshold (unless forced) or already at target.
+        if not force and not self._should_compact(before_tokens, budget):
+            return {
+                "compacted": False,
+                "reason": "below_threshold",
+                "before_tokens": before_tokens,
+                "after_tokens": before_tokens,
+                "before_messages": before_messages,
+                "after_messages": before_messages,
+                "budget": budget,
+            }
+        if before_tokens <= target_tokens:
+            return {
+                "compacted": False,
+                "reason": "already_compact",
+                "before_tokens": before_tokens,
+                "after_tokens": before_tokens,
+                "before_messages": before_messages,
+                "after_messages": before_messages,
+                "budget": budget,
+                "target_tokens": target_tokens,
+            }
+
+        # Emit pre-compact (best effort).
+        await self._emit(_EVT_PRE_COMPACT, {"before_tokens": before_tokens, "budget": budget})
+
+        # Reuse the progressive strategy, then commit the result.
+        compacted = await self._compact_ephemeral(budget, working)
+        self.messages = compacted
+
+        stats = dict(self._last_compaction_stats or {})
+        stats["compacted"] = True
+        stats.setdefault("before_tokens", before_tokens)
+        stats.setdefault("after_tokens", self._estimate_tokens(compacted))
+        stats.setdefault("before_messages", before_messages)
+        stats.setdefault("after_messages", len(compacted))
+        stats["persistent"] = True
+        stats["forced"] = force
+
+        await self._emit(_EVT_POST_COMPACT, stats)
+        logger.info(
+            f"Persistent compaction committed: {before_messages} -> {len(compacted)} messages, "
+            f"{before_tokens:,} -> {stats['after_tokens']:,} tokens"
+        )
+        return stats
+
+    async def _emit(self, event: str, payload: dict[str, Any]) -> None:
+        """Emit a hook event if a hooks bus is available (best effort)."""
+        if self._hooks is None:
+            return
+        try:
+            await self._hooks.emit(event, payload)
+        except Exception as e:  # pragma: no cover - observability must never break flow
+            logger.warning(f"Could not emit {event} event: {e}")
 
     def _should_compact(self, token_count: int, budget: int) -> bool:
         """Check if context should be compacted."""
@@ -1086,11 +1214,7 @@ class SimpleContextManager:
         self._last_compaction_stats = stats
 
         # Emit event if hooks available
-        if self._hooks is not None:
-            try:
-                await self._hooks.emit("context:compaction", stats)
-            except Exception as e:
-                logger.warning(f"Could not emit compaction event: {e}")
+        await self._emit(_EVT_COMPACTION, stats)
 
         return final_messages
 
