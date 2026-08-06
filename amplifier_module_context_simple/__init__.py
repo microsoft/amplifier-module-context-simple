@@ -24,6 +24,7 @@ __amplifier_module_type__ = "context"
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from math import ceil
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -56,7 +57,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compact_threshold: Trigger compaction at this usage (default: 0.92)
             - target_usage: Compact down to this usage (default: 0.50)
             - protected_recent: Always protect last N% of messages (default: 0.30)
-            - protected_tool_results: Always protect last N tool results (default: 5)
+            - protected_tool_results: Protect last N recent tool results (default: 5)
             - truncate_chars: Characters to keep when truncating tool results (default: 250)
             - compaction_notice_enabled: Enable compaction notice (default: True)
             - compaction_notice_token_reserve: Tokens to reserve for notice (default: 800)
@@ -120,7 +121,7 @@ class SimpleContextManager:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
     - Respecting configured protected_recent as baseline, only relaxing under pressure
-    - Always protecting: system messages, last user message, last N tool results, tool pairs
+    - Always protecting: system messages, last user message, recent tool results, valid tool pairs
     - First user message: stubbable at Level 8, but never fully removed
     """
 
@@ -147,7 +148,7 @@ class SimpleContextManager:
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
-            protected_tool_results: Always protect last N tool results from truncation
+            protected_tool_results: Protect last N results in the recent-history zone
             truncate_chars: Characters to keep when truncating tool results
             compaction_notice_enabled: Enable compaction notice injection
             compaction_notice_token_reserve: Tokens to reserve for notice
@@ -255,30 +256,21 @@ class SimpleContextManager:
         Returns:
             Messages ready for LLM request, compacted if necessary.
         """
+        # The caller/configured value remains the governing request budget.
+        # A valid notice reserve may lower the conversation-compaction budget,
+        # but can never make it non-positive or replace the final request cap.
         budget = self._calculate_budget(token_budget, provider)
-
-        # Reserve token budget for potential compaction notice (if enabled)
-        effective_budget = budget
-        if self.compaction_notice_enabled:
-            effective_budget = budget - self.compaction_notice_token_reserve
-            if effective_budget <= 0:
-                # Misconfiguration guard: if the reserve consumes the entire budget
-                # (or more), _should_compact's `budget > 0` check would silently
-                # force usage to 0, disabling compaction entirely rather than
-                # loudly failing. Fall back to the full budget instead of a
-                # non-positive effective budget - a reserve that swallows the
-                # whole context is not a valid state to compact against.
-                logger.warning(
-                    f"compaction_notice_token_reserve ({self.compaction_notice_token_reserve:,}) "
-                    f">= budget ({budget:,}); ignoring reserve for this request to avoid "
-                    f"silently disabling compaction (effective budget would be {effective_budget:,})"
-                )
-                effective_budget = budget
-            else:
-                logger.debug(
-                    f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
-                    f"(effective budget: {effective_budget:,})"
-                )
+        compaction_budget = budget
+        if (
+            self.compaction_notice_enabled
+            and 0 < self.compaction_notice_token_reserve < budget
+        ):
+            compaction_budget = budget - self.compaction_notice_token_reserve
+            logger.debug(
+                f"Reserved {self.compaction_notice_token_reserve} tokens for "
+                f"potential notice (compaction budget: {compaction_budget:,}; "
+                f"governing budget: {budget:,})"
+            )
 
         # Determine working messages based on whether factory is set
         if self._system_prompt_factory:
@@ -306,11 +298,14 @@ class SimpleContextManager:
 
         token_count = self._estimate_tokens(working_messages)
 
-        # Check if compaction needed (using effective budget with notice reserve deducted)
-        if self._should_compact(token_count, effective_budget):
+        # Every threshold check uses the canonical integral boundary helper.
+        if self._should_compact(token_count, compaction_budget):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
-                effective_budget, working_messages
+                compaction_budget, working_messages
+            )
+            await self._emit(
+                _EVT_COMPACTION, dict(self._last_compaction_stats or {})
             )
             logger.info(
                 f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
@@ -332,21 +327,30 @@ class SimpleContextManager:
                             and compacted[notice_index].get("role") == "system"
                         ):
                             notice_index += 1
-                        compacted.insert(
-                            notice_index,
-                            {
-                                "role": "system",
-                                "content": notice,
-                                "metadata": {
-                                    "source": "context-compaction",
-                                    "ephemeral": True,
-                                },
+                        notice_message = {
+                            "role": "system",
+                            "content": notice,
+                            "metadata": {
+                                "source": "context-compaction",
+                                "ephemeral": True,
                             },
-                        )
-                        logger.debug(
-                            f"Inserted compaction notice at position {notice_index} (level {level}, "
-                            f"verbosity: {self.compaction_notice_verbosity})"
-                        )
+                        }
+                        with_notice = list(compacted)
+                        with_notice.insert(notice_index, notice_message)
+                        with_notice_tokens = self._estimate_tokens(with_notice)
+                        if with_notice_tokens <= budget:
+                            compacted = with_notice
+                            logger.debug(
+                                f"Inserted compaction notice at position {notice_index} "
+                                f"(level {level}, verbosity: "
+                                f"{self.compaction_notice_verbosity})"
+                            )
+                        else:
+                            logger.info(
+                                "Omitting compaction notice because it would exceed "
+                                f"the governing budget ({with_notice_tokens:,} > "
+                                f"{budget:,} tokens)"
+                            )
 
             return compacted
 
@@ -391,7 +395,7 @@ class SimpleContextManager:
             True if stored context usage >= compact_threshold.
         """
         report = self.usage_report(provider=provider, token_budget=token_budget)
-        return report["tokens"] >= report["threshold_tokens"]
+        return self._should_compact(report["tokens"], report["budget"])
 
     def usage_report(
         self,
@@ -411,7 +415,7 @@ class SimpleContextManager:
             "budget": budget,
             "pct": pct,
             "threshold": self.compact_threshold,
-            "threshold_tokens": int(budget * self.compact_threshold),
+            "threshold_tokens": self._threshold_tokens(budget),
             "target_tokens": int(budget * self.target_usage),
             "messages": len(self.messages),
         }
@@ -489,6 +493,7 @@ class SimpleContextManager:
         if after_tokens >= before_tokens and after_messages >= before_messages:
             stats["compacted"] = False
             stats["reason"] = "no_reduction"
+            await self._emit(_EVT_COMPACTION, stats)
             logger.info(
                 "Persistent compaction made no reduction; stored history left unchanged"
             )
@@ -496,6 +501,8 @@ class SimpleContextManager:
 
         self.messages = compacted
         stats["compacted"] = True
+        stats.pop("reason", None)
+        await self._emit(_EVT_COMPACTION, stats)
         await self._emit(_EVT_POST_COMPACT, stats)
         logger.info(
             f"Persistent compaction committed: {before_messages} -> {len(compacted)} messages, "
@@ -513,15 +520,19 @@ class SimpleContextManager:
             logger.warning(f"Could not emit {event} event: {e}")
 
     def _should_compact(self, token_count: int, budget: int) -> bool:
-        """Check if context should be compacted."""
+        """Check compaction using the canonical integral threshold boundary."""
         usage = token_count / budget if budget > 0 else 0
-        should = usage >= self.compact_threshold
+        should = budget > 0 and token_count >= self._threshold_tokens(budget)
         if should:
             logger.info(
                 f"Context at {usage:.1%} capacity ({token_count:,}/{budget:,} tokens), "
                 f"threshold {self.compact_threshold:.0%} - compaction needed"
             )
         return should
+
+    def _threshold_tokens(self, budget: int) -> int:
+        """Return the first integral token count at or above the threshold."""
+        return ceil(budget * self.compact_threshold) if budget > 0 else 0
 
     async def _compact_ephemeral(
         self, budget: int, source_messages: list[dict[str, Any]] | None = None
@@ -591,15 +602,16 @@ class SimpleContextManager:
         ]
         total_tools = len(tool_result_indices)
 
-        # Always protect the last N tool results from truncation
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        # Protect the configured number of results in the recent-history zone.
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
 
-        # Calculate wave boundaries (25% chunks)
-        wave1_end = int(total_tools * 0.25)
-        wave2_end = int(total_tools * 0.50)
-        wave3_end = int(total_tools * 0.75)
+        # Ceiling keeps small histories progressive too: a single old tool
+        # result belongs to the first wave rather than bypassing truncation.
+        wave1_end = ceil(total_tools * 0.25)
+        wave2_end = ceil(total_tools * 0.50)
+        wave3_end = ceil(total_tools * 0.75)
 
         total_truncated = 0
         total_removed = 0
@@ -690,8 +702,8 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
         wave3_start = int(len(tool_result_indices) * 0.50)
         wave3_end = int(len(tool_result_indices) * 0.75)
@@ -753,8 +765,8 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
 
         truncated, current_tokens = self._truncate_tool_wave(
@@ -787,7 +799,10 @@ class SimpleContextManager:
         level7_protection = self.protected_recent * 0.3
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level7_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level7_protection,
+                allow_user_removal=True,
             )
         )
         total_removed += removed
@@ -930,16 +945,36 @@ class SimpleContextManager:
                 current_tokens = true_total
         return truncated, current_tokens
 
+    def _protected_tool_indices(
+        self,
+        messages: list[dict[str, Any]],
+        tool_result_indices: list[int],
+    ) -> set[int]:
+        """Protect recent tool results while leaving old results truncatable.
+
+        Count-based protection is constrained to the configured recent-history
+        zone. Otherwise a history containing only one very old tool result
+        would protect it forever and skip the least-destructive truncation phase.
+        """
+        if self.protected_tool_results <= 0:
+            return set()
+        recent_boundary = int(len(messages) * (1 - self.protected_recent))
+        recent_tools = [i for i in tool_result_indices if i >= recent_boundary]
+        return set(recent_tools[-self.protected_tool_results :])
+
     def _remove_messages_with_protection(
         self,
         messages: list[dict[str, Any]],
         target_tokens: int,
         protected_recent: float,
+        allow_user_removal: bool = False,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
 
-        User messages are NEVER removed - they may be stubbed if still over target.
+        User messages are preserved at normal levels. At the last-resort level,
+        intermediate user messages may be removed, while the first and last user
+        messages remain protected.
 
         Returns (new_messages, removed_count, stubbed_count, new_token_count).
         """
@@ -972,17 +1007,29 @@ class SimpleContextManager:
         # Always protect the LAST user message (current context)
         if last_user_idx is not None:
             protected_indices.add(last_user_idx)
+        if allow_user_removal and first_user_idx is not None:
+            protected_indices.add(first_user_idx)
 
         # Protect last N% of messages (using the passed protection level)
         protected_boundary = int(len(messages) * (1 - protected_recent))
         for i in range(protected_boundary, len(messages)):
             protected_indices.add(i)
 
-        # Removal candidates exclude ALL user messages (they can only be stubbed, not removed)
+        # Retain tool results that took the preferred truncation path. The pair
+        # helpers will then reject removing their corresponding tool calls.
+        protected_indices.update(
+            i
+            for i, msg in enumerate(messages)
+            if msg.get("role") == "tool" and msg.get("_truncated")
+        )
+
+        # Intermediate user messages become candidates only in the final
+        # last-resort pass. First and last user messages remain protected.
         removal_candidates = [
             i
             for i in range(len(messages))
-            if i not in protected_indices and i not in user_message_indices
+            if i not in protected_indices
+            and (i not in user_message_indices or allow_user_removal)
         ]
 
         # Precompute per-message token counts and a tool_call_id -> indices map
@@ -1232,9 +1279,6 @@ class SimpleContextManager:
             "protected_tool_results": self.protected_tool_results,
         }
         self._last_compaction_stats = stats
-
-        # Emit event if hooks available
-        await self._emit(_EVT_COMPACTION, stats)
 
         return final_messages
 
