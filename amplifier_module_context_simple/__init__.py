@@ -490,7 +490,7 @@ class SimpleContextManager:
         stats["persistent"] = True
         stats["forced"] = force
 
-        if after_tokens >= before_tokens and after_messages >= before_messages:
+        if after_tokens >= before_tokens:
             stats["compacted"] = False
             stats["reason"] = "no_reduction"
             await self._emit(_EVT_COMPACTION, stats)
@@ -932,14 +932,17 @@ class SimpleContextManager:
             if msg.get("role") != "tool":  # Verify it's still a tool message
                 continue
             if not msg.get("_truncated"):
+                replacement = self._truncate_tool_result(msg)
+                old_len = len(str(msg)) // 4
+                new_len = len(str(replacement)) // 4
+                if new_len >= old_len:
+                    continue
                 if true_total is None:
                     # First mutation in this call: establish the true baseline
                     # once (matches what _estimate_tokens(messages) would have
                     # returned immediately before this mutation).
                     true_total = self._estimate_tokens(messages)
-                old_len = len(str(msg)) // 4
-                messages[i] = self._truncate_tool_result(msg)
-                new_len = len(str(messages[i])) // 4
+                messages[i] = replacement
                 true_total += new_len - old_len
                 truncated += 1
                 current_tokens = true_total

@@ -129,3 +129,62 @@ async def test_usage_report_shape():
     assert report["tokens"] > 0
     assert 0.0 <= report["pct"]
     assert report["messages"] == len(context.messages)
+
+
+def test_tool_truncation_rejects_token_growth():
+    context = SimpleContextManager(truncate_chars=374)
+    message = {
+        "role": "tool",
+        "content": "x" * 411,
+        "tool_call_id": "call-1",
+    }
+    messages = [message]
+    before_tokens = context._estimate_tokens(messages)
+    candidate = context._truncate_tool_result(message)
+
+    assert before_tokens == 117
+    assert context._estimate_tokens([candidate]) == 133
+
+    truncated, after_tokens = context._truncate_tool_wave(
+        messages,
+        indices=[0],
+        protected_indices=set(),
+        target_tokens=0,
+        current_tokens=before_tokens,
+    )
+
+    assert truncated == 0
+    assert after_tokens == before_tokens
+    assert messages == [message]
+
+
+@pytest.mark.asyncio
+async def test_compact_rejects_fewer_messages_when_tokens_grow(monkeypatch):
+    hooks = _RecordingHooks()
+    context = SimpleContextManager(
+        max_tokens=10,
+        compact_threshold=0.9,
+        target_usage=0.5,
+        hooks=hooks,
+    )
+    context.messages = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "second"},
+    ]
+    original = list(context.messages)
+    candidate = [{"role": "user", "content": "x" * 200}]
+    assert len(candidate) < len(original)
+    assert context._estimate_tokens(candidate) > context._estimate_tokens(original)
+
+    async def growing_candidate(_budget, _messages):
+        return candidate
+
+    monkeypatch.setattr(context, "_compact_ephemeral", growing_candidate)
+
+    stats = await context.compact(force=True)
+
+    assert stats["compacted"] is False
+    assert stats["reason"] == "no_reduction"
+    assert stats["after_tokens"] > stats["before_tokens"]
+    assert context.messages == original
+    assert "context:post_compact" not in [event for event, _ in hooks.events]
