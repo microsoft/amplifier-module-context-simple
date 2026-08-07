@@ -1,13 +1,14 @@
 """
 Simple context manager module.
 
-Implements an in-memory context manager with EPHEMERAL compaction:
-  • Messages stored in memory (self.messages is the source of truth)
-  • Compaction NEVER modifies self.messages
-  • get_messages_for_request() returns compacted VIEW (new list)
-  • get_messages() returns FULL history (for transcripts/session persistence)
+Implements an in-memory context manager with two explicit compaction modes:
+  • Messages are stored in memory (self.messages is the source of truth)
+  • get_messages_for_request() returns an ephemeral compacted VIEW (new list)
+  • compact() explicitly persists compaction back to self.messages
+  • get_messages() returns the currently stored history
 
-This design ensures conversation history is never lost, even during compaction.
+Request-time compaction never changes stored history. Callers that invoke compact()
+opt in to permanently shrinking the stored history and future transcripts.
 For persistent storage across sessions, use context-persistent instead.
 
 Dynamic System Prompt Support:
@@ -23,11 +24,26 @@ __amplifier_module_type__ = "context"
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from math import ceil
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
 
 logger = logging.getLogger(__name__)
+
+# Compaction observability events. Prefer the canonical constants from
+# amplifier_core.events; fall back to the string literals if unavailable so the
+# module keeps working standalone (e.g. in isolated unit tests).
+try:  # pragma: no cover - trivial import guard
+    from amplifier_core.events import (
+        CONTEXT_COMPACTION as _EVT_COMPACTION,
+        CONTEXT_POST_COMPACT as _EVT_POST_COMPACT,
+        CONTEXT_PRE_COMPACT as _EVT_PRE_COMPACT,
+    )
+except Exception:  # pragma: no cover
+    _EVT_PRE_COMPACT = "context:pre_compact"
+    _EVT_POST_COMPACT = "context:post_compact"
+    _EVT_COMPACTION = "context:compaction"
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -41,7 +57,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compact_threshold: Trigger compaction at this usage (default: 0.92)
             - target_usage: Compact down to this usage (default: 0.50)
             - protected_recent: Always protect last N% of messages (default: 0.30)
-            - protected_tool_results: Always protect last N tool results (default: 5)
+            - protected_tool_results: Protect last N recent tool results (default: 5)
             - truncate_chars: Characters to keep when truncating tool results (default: 250)
             - compaction_notice_enabled: Enable compaction notice (default: True)
             - compaction_notice_token_reserve: Tokens to reserve for notice (default: 800)
@@ -76,15 +92,16 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
 
 class SimpleContextManager:
     """
-    In-memory context manager with EPHEMERAL compaction.
+    In-memory context manager with ephemeral and explicit persistent compaction.
 
-    Key Principle: self.messages is the source of truth and is NEVER modified
-    by compaction. Compaction only returns a compacted VIEW for the current
-    LLM request.
+    ``self.messages`` is the source of truth. Automatic request-time compaction
+    only returns a compacted view and leaves it unchanged; ``compact()`` is the
+    explicit operation that commits a compacted result back to stored history.
 
     Owns memory policy: orchestrators ask for messages via get_messages_for_request(),
-    and this context manager decides how to fit them within limits. Compaction is
-    handled internally and ephemerally - the original history is always preserved.
+    and this context manager decides how to fit them within limits. Normal request
+    preparation is ephemeral; persistent compaction happens only when a caller
+    explicitly invokes ``compact()``.
 
     Compaction Strategy (Progressive Interleaved):
     Triggered when usage >= compact_threshold (default 92%), target is target_usage (default 50%).
@@ -104,7 +121,7 @@ class SimpleContextManager:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
     - Respecting configured protected_recent as baseline, only relaxing under pressure
-    - Always protecting: system messages, last user message, last N tool results, tool pairs
+    - Always protecting: system messages, last user message, recent tool results, valid tool pairs
     - First user message: stubbable at Level 8, but never fully removed
     """
 
@@ -131,7 +148,7 @@ class SimpleContextManager:
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
-            protected_tool_results: Always protect last N tool results from truncation
+            protected_tool_results: Protect last N results in the recent-history zone
             truncate_chars: Characters to keep when truncating tool results
             compaction_notice_enabled: Enable compaction notice injection
             compaction_notice_token_reserve: Tokens to reserve for notice
@@ -225,11 +242,11 @@ class SimpleContextManager:
         bundle instructions to be re-processed each turn.
 
         Applies EPHEMERAL compaction if needed - returns a NEW list without
-        modifying self.messages. The original history is always preserved.
+        modifying self.messages.
 
         If compaction occurs and notice is enabled, a system-reminder is inserted
-        at position 1 (after main system message) to inform the LLM about what
-        was compacted.
+        after any leading system messages and before the conversation. This avoids
+        separating an assistant tool call from its immediately following results.
 
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
@@ -239,30 +256,21 @@ class SimpleContextManager:
         Returns:
             Messages ready for LLM request, compacted if necessary.
         """
+        # The caller/configured value remains the governing request budget.
+        # A valid notice reserve may lower the conversation-compaction budget,
+        # but can never make it non-positive or replace the final request cap.
         budget = self._calculate_budget(token_budget, provider)
-
-        # Reserve token budget for potential compaction notice (if enabled)
-        effective_budget = budget
-        if self.compaction_notice_enabled:
-            effective_budget = budget - self.compaction_notice_token_reserve
-            if effective_budget <= 0:
-                # Misconfiguration guard: if the reserve consumes the entire budget
-                # (or more), _should_compact's `budget > 0` check would silently
-                # force usage to 0, disabling compaction entirely rather than
-                # loudly failing. Fall back to the full budget instead of a
-                # non-positive effective budget - a reserve that swallows the
-                # whole context is not a valid state to compact against.
-                logger.warning(
-                    f"compaction_notice_token_reserve ({self.compaction_notice_token_reserve:,}) "
-                    f">= budget ({budget:,}); ignoring reserve for this request to avoid "
-                    f"silently disabling compaction (effective budget would be {effective_budget:,})"
-                )
-                effective_budget = budget
-            else:
-                logger.debug(
-                    f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
-                    f"(effective budget: {effective_budget:,})"
-                )
+        compaction_budget = budget
+        if (
+            self.compaction_notice_enabled
+            and 0 < self.compaction_notice_token_reserve < budget
+        ):
+            compaction_budget = budget - self.compaction_notice_token_reserve
+            logger.debug(
+                f"Reserved {self.compaction_notice_token_reserve} tokens for "
+                f"potential notice (compaction budget: {compaction_budget:,}; "
+                f"governing budget: {budget:,})"
+            )
 
         # Determine working messages based on whether factory is set
         if self._system_prompt_factory:
@@ -290,11 +298,14 @@ class SimpleContextManager:
 
         token_count = self._estimate_tokens(working_messages)
 
-        # Check if compaction needed (using effective budget with notice reserve deducted)
-        if self._should_compact(token_count, effective_budget):
+        # Every threshold check uses the canonical integral boundary helper.
+        if self._should_compact(token_count, compaction_budget):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
-                effective_budget, working_messages
+                compaction_budget, working_messages
+            )
+            await self._emit(
+                _EVT_COMPACTION, dict(self._last_compaction_stats or {})
             )
             logger.info(
                 f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
@@ -306,22 +317,40 @@ class SimpleContextManager:
                 if level >= self.compaction_notice_min_level:
                     notice = self._format_compaction_notice()
                     if notice:
-                        # Insert at position 1 (after main system message at position 0)
-                        compacted.insert(
-                            1,
-                            {
-                                "role": "system",
-                                "content": notice,
-                                "metadata": {
-                                    "source": "context-compaction",
-                                    "ephemeral": True,
-                                },
+                        # Insert after leading system messages, before the first
+                        # conversation message. A fixed index can split an
+                        # assistant tool-call message from its following result
+                        # when there is no leading system message.
+                        notice_index = 0
+                        while (
+                            notice_index < len(compacted)
+                            and compacted[notice_index].get("role") == "system"
+                        ):
+                            notice_index += 1
+                        notice_message = {
+                            "role": "system",
+                            "content": notice,
+                            "metadata": {
+                                "source": "context-compaction",
+                                "ephemeral": True,
                             },
-                        )
-                        logger.debug(
-                            f"Inserted compaction notice at position 1 (level {level}, "
-                            f"verbosity: {self.compaction_notice_verbosity})"
-                        )
+                        }
+                        with_notice = list(compacted)
+                        with_notice.insert(notice_index, notice_message)
+                        with_notice_tokens = self._estimate_tokens(with_notice)
+                        if with_notice_tokens <= budget:
+                            compacted = with_notice
+                            logger.debug(
+                                f"Inserted compaction notice at position {notice_index} "
+                                f"(level {level}, verbosity: "
+                                f"{self.compaction_notice_verbosity})"
+                            )
+                        else:
+                            logger.info(
+                                "Omitting compaction notice because it would exceed "
+                                f"the governing budget ({with_notice_tokens:,} > "
+                                f"{budget:,} tokens)"
+                            )
 
             return compacted
 
@@ -329,10 +358,10 @@ class SimpleContextManager:
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
-        Get ALL messages (full history, never compacted) for transcripts/debugging.
+        Get the currently stored messages for transcripts/debugging.
 
-        This returns the complete, unmodified history - suitable for saving
-        to transcript files for session persistence.
+        Request-time compaction does not affect this list. An earlier explicit
+        ``compact()`` call may have persistently reduced it.
         """
         return list(self.messages)
 
@@ -346,34 +375,164 @@ class SimpleContextManager:
         self.messages = []
         logger.info("Context cleared")
 
-    async def should_compact(self) -> bool:
-        """Check if context should be compacted.
+    async def should_compact(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+    ) -> bool:
+        """Check whether the stored context is over the compaction threshold.
 
-        Note: This module uses ephemeral compaction during get_messages_for_request(),
-        so this always returns False. The actual compaction check happens internally.
-        This method exists to satisfy the ContextManager protocol.
+        Unlike ``get_messages_for_request`` (which compacts ephemerally every
+        request without touching stored state), this reports on the *persistent*
+        history in ``self.messages`` - i.e. whether an explicit/persistent
+        ``compact()`` would have anything to do.
+
+        Args:
+            provider: Optional provider for dynamic budget calculation.
+            token_budget: Optional explicit budget override.
+
+        Returns:
+            True if stored context usage >= compact_threshold.
         """
-        return False
+        report = self.usage_report(provider=provider, token_budget=token_budget)
+        return self._should_compact(report["tokens"], report["budget"])
 
-    async def compact(self) -> None:
-        """Compact the context.
+    def usage_report(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+    ) -> dict[str, Any]:
+        """Return a snapshot of current context token usage vs budget.
 
-        Note: This module uses ephemeral compaction during get_messages_for_request(),
-        so this is a no-op. Compaction happens automatically when getting messages.
-        This method exists to satisfy the ContextManager protocol.
+        Intended for status displays and for deciding whether to compact.
+        Uses the same heuristic estimator and budget calculation as compaction.
         """
-        pass
+        budget = self._calculate_budget(token_budget, provider)
+        tokens = self._estimate_tokens(list(self.messages))
+        pct = (tokens / budget) if budget > 0 else 0.0
+        return {
+            "tokens": tokens,
+            "budget": budget,
+            "pct": pct,
+            "threshold": self.compact_threshold,
+            "threshold_tokens": self._threshold_tokens(budget),
+            "target_tokens": int(budget * self.target_usage),
+            "messages": len(self.messages),
+        }
+
+    async def compact(
+        self,
+        provider: Any | None = None,
+        token_budget: int | None = None,
+        force: bool = False,
+    ) -> dict[str, Any]:
+        """Persistently compact the stored conversation history.
+
+        This is distinct from the ephemeral compaction applied inside
+        ``get_messages_for_request()``: it runs the same progressive strategy
+        but COMMITS the result back to ``self.messages``, permanently shrinking
+        the stored history (and therefore future transcripts and every
+        subsequent request). System messages are always preserved.
+
+        Args:
+            provider: Optional provider for dynamic budget calculation.
+            token_budget: Optional explicit budget override.
+            force: When True, compact even if below the trigger threshold
+                (used by the explicit ``/compact`` command). Even when forced,
+                nothing is removed if the history is already at/under the target.
+
+        Returns:
+            A stats dict. ``compacted`` is False (with a ``reason``) when no
+            work was done; otherwise it carries before/after token and message
+            counts plus the strategy level reached.
+        """
+        budget = self._calculate_budget(token_budget, provider)
+        working = list(self.messages)
+        before_tokens = self._estimate_tokens(working)
+        before_messages = len(working)
+        target_tokens = int(budget * self.target_usage)
+
+        # Nothing to do: below threshold (unless forced) or already at target.
+        if not force and not self._should_compact(before_tokens, budget):
+            return {
+                "compacted": False,
+                "reason": "below_threshold",
+                "before_tokens": before_tokens,
+                "after_tokens": before_tokens,
+                "before_messages": before_messages,
+                "after_messages": before_messages,
+                "budget": budget,
+            }
+        if before_tokens <= target_tokens:
+            return {
+                "compacted": False,
+                "reason": "already_compact",
+                "before_tokens": before_tokens,
+                "after_tokens": before_tokens,
+                "before_messages": before_messages,
+                "after_messages": before_messages,
+                "budget": budget,
+                "target_tokens": target_tokens,
+            }
+
+        # Emit pre-compact (best effort).
+        await self._emit(_EVT_PRE_COMPACT, {"before_tokens": before_tokens, "budget": budget})
+
+        # Reuse the progressive strategy, then commit only an actual reduction.
+        compacted = await self._compact_ephemeral(budget, working)
+        stats = dict(self._last_compaction_stats or {})
+        after_tokens = self._estimate_tokens(compacted)
+        after_messages = len(compacted)
+        stats["before_tokens"] = before_tokens
+        stats["after_tokens"] = after_tokens
+        stats["before_messages"] = before_messages
+        stats["after_messages"] = after_messages
+        stats["persistent"] = True
+        stats["forced"] = force
+
+        if after_tokens >= before_tokens:
+            stats["compacted"] = False
+            stats["reason"] = "no_reduction"
+            await self._emit(_EVT_COMPACTION, stats)
+            logger.info(
+                "Persistent compaction made no reduction; stored history left unchanged"
+            )
+            return stats
+
+        self.messages = compacted
+        stats["compacted"] = True
+        stats.pop("reason", None)
+        await self._emit(_EVT_COMPACTION, stats)
+        await self._emit(_EVT_POST_COMPACT, stats)
+        logger.info(
+            f"Persistent compaction committed: {before_messages} -> {len(compacted)} messages, "
+            f"{before_tokens:,} -> {stats['after_tokens']:,} tokens"
+        )
+        return stats
+
+    async def _emit(self, event: str, payload: dict[str, Any]) -> None:
+        """Emit a hook event if a hooks bus is available (best effort)."""
+        if self._hooks is None:
+            return
+        try:
+            await self._hooks.emit(event, payload)
+        except Exception as e:  # pragma: no cover - observability must never break flow
+            logger.warning(f"Could not emit {event} event: {e}")
 
     def _should_compact(self, token_count: int, budget: int) -> bool:
-        """Check if context should be compacted."""
+        """Check compaction using the canonical integral threshold boundary."""
         usage = token_count / budget if budget > 0 else 0
-        should = usage >= self.compact_threshold
+        should = budget > 0 and token_count >= self._threshold_tokens(budget)
         if should:
             logger.info(
                 f"Context at {usage:.1%} capacity ({token_count:,}/{budget:,} tokens), "
                 f"threshold {self.compact_threshold:.0%} - compaction needed"
             )
         return should
+
+    def _threshold_tokens(self, budget: int) -> int:
+        """Return the first integral token count at or above the threshold."""
+        return ceil(budget * self.compact_threshold) if budget > 0 else 0
 
     async def _compact_ephemeral(
         self, budget: int, source_messages: list[dict[str, Any]] | None = None
@@ -443,15 +602,16 @@ class SimpleContextManager:
         ]
         total_tools = len(tool_result_indices)
 
-        # Always protect the last N tool results from truncation
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        # Protect the configured number of results in the recent-history zone.
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
 
-        # Calculate wave boundaries (25% chunks)
-        wave1_end = int(total_tools * 0.25)
-        wave2_end = int(total_tools * 0.50)
-        wave3_end = int(total_tools * 0.75)
+        # Ceiling keeps small histories progressive too: a single old tool
+        # result belongs to the first wave rather than bypassing truncation.
+        wave1_end = ceil(total_tools * 0.25)
+        wave2_end = ceil(total_tools * 0.50)
+        wave3_end = ceil(total_tools * 0.75)
 
         total_truncated = 0
         total_removed = 0
@@ -542,8 +702,8 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
         wave3_start = int(len(tool_result_indices) * 0.50)
         wave3_end = int(len(tool_result_indices) * 0.75)
@@ -605,8 +765,8 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
+        protected_tool_indices = self._protected_tool_indices(
+            working_messages, tool_result_indices
         )
 
         truncated, current_tokens = self._truncate_tool_wave(
@@ -639,7 +799,10 @@ class SimpleContextManager:
         level7_protection = self.protected_recent * 0.3
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level7_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level7_protection,
+                allow_user_removal=True,
             )
         )
         total_removed += removed
@@ -769,29 +932,52 @@ class SimpleContextManager:
             if msg.get("role") != "tool":  # Verify it's still a tool message
                 continue
             if not msg.get("_truncated"):
+                replacement = self._truncate_tool_result(msg)
+                old_len = len(str(msg)) // 4
+                new_len = len(str(replacement)) // 4
+                if new_len >= old_len:
+                    continue
                 if true_total is None:
                     # First mutation in this call: establish the true baseline
                     # once (matches what _estimate_tokens(messages) would have
                     # returned immediately before this mutation).
                     true_total = self._estimate_tokens(messages)
-                old_len = len(str(msg)) // 4
-                messages[i] = self._truncate_tool_result(msg)
-                new_len = len(str(messages[i])) // 4
+                messages[i] = replacement
                 true_total += new_len - old_len
                 truncated += 1
                 current_tokens = true_total
         return truncated, current_tokens
+
+    def _protected_tool_indices(
+        self,
+        messages: list[dict[str, Any]],
+        tool_result_indices: list[int],
+    ) -> set[int]:
+        """Protect recent tool results while leaving old results truncatable.
+
+        Count-based protection is constrained to the configured recent-history
+        zone. Otherwise a history containing only one very old tool result
+        would protect it forever and skip the least-destructive truncation phase.
+        """
+        if self.protected_tool_results <= 0:
+            return set()
+        recent_boundary = int(len(messages) * (1 - self.protected_recent))
+        recent_tools = [i for i in tool_result_indices if i >= recent_boundary]
+        return set(recent_tools[-self.protected_tool_results :])
 
     def _remove_messages_with_protection(
         self,
         messages: list[dict[str, Any]],
         target_tokens: int,
         protected_recent: float,
+        allow_user_removal: bool = False,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
 
-        User messages are NEVER removed - they may be stubbed if still over target.
+        User messages are preserved at normal levels. At the last-resort level,
+        intermediate user messages may be removed, while the first and last user
+        messages remain protected.
 
         Returns (new_messages, removed_count, stubbed_count, new_token_count).
         """
@@ -824,17 +1010,29 @@ class SimpleContextManager:
         # Always protect the LAST user message (current context)
         if last_user_idx is not None:
             protected_indices.add(last_user_idx)
+        if allow_user_removal and first_user_idx is not None:
+            protected_indices.add(first_user_idx)
 
         # Protect last N% of messages (using the passed protection level)
         protected_boundary = int(len(messages) * (1 - protected_recent))
         for i in range(protected_boundary, len(messages)):
             protected_indices.add(i)
 
-        # Removal candidates exclude ALL user messages (they can only be stubbed, not removed)
+        # Retain tool results that took the preferred truncation path. The pair
+        # helpers will then reject removing their corresponding tool calls.
+        protected_indices.update(
+            i
+            for i, msg in enumerate(messages)
+            if msg.get("role") == "tool" and msg.get("_truncated")
+        )
+
+        # Intermediate user messages become candidates only in the final
+        # last-resort pass. First and last user messages remain protected.
         removal_candidates = [
             i
             for i in range(len(messages))
-            if i not in protected_indices and i not in user_message_indices
+            if i not in protected_indices
+            and (i not in user_message_indices or allow_user_removal)
         ]
 
         # Precompute per-message token counts and a tool_call_id -> indices map
@@ -1085,13 +1283,6 @@ class SimpleContextManager:
         }
         self._last_compaction_stats = stats
 
-        # Emit event if hooks available
-        if self._hooks is not None:
-            try:
-                await self._hooks.emit("context:compaction", stats)
-            except Exception as e:
-                logger.warning(f"Could not emit compaction event: {e}")
-
         return final_messages
 
     def _truncate_tool_result(self, msg: dict[str, Any]) -> dict[str, Any]:
@@ -1192,7 +1383,7 @@ What was preserved:
 What may be affected:
 {affected}
 
-Note: This compaction is ephemeral (affects only this request). Full history is preserved in session transcript.
+Note: This compaction is ephemeral (affects only this request). Stored history is unchanged by this request.
 </system-reminder>"""
 
         return notice

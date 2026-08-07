@@ -66,7 +66,7 @@ Not suitable for:
 
 ## Compaction Strategy
 
-The SimpleContextManager uses **ephemeral compaction** - `get_messages_for_request()` returns a compacted VIEW without modifying the internal message history. The full history is always preserved in memory.
+The SimpleContextManager uses **ephemeral request-time compaction**: `get_messages_for_request()` returns a compacted view without modifying the internal message history. Call `compact()` explicitly to persistently replace the stored history with a compacted version; subsequent transcripts then reflect that reduced history.
 
 Compaction triggers when token usage reaches the configured threshold (default: 92% of max_tokens):
 
