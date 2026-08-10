@@ -158,6 +158,26 @@ class SimpleContextManager:
         self._last_compaction_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
 
+        # --- Sticky compaction decision state ---
+        # Compaction decisions (remove / truncate / stub) are keyed by a
+        # stable per-message sequence id (metadata["_seq"], assigned in
+        # add_message()) rather than by list index, because indices shift
+        # as history grows and as the ephemeral view is rebuilt every call.
+        # Once a message's fate is decided, it is NEVER reconsidered -- this
+        # is what keeps the returned view's shared prefix byte-stable across
+        # calls where the underlying history only grew by a turn or two,
+        # instead of the whole compaction decision being re-derived (and
+        # potentially shifting) on every single get_messages_for_request()
+        # call. See _apply_sticky_decisions() / _compact_ephemeral().
+        self._next_seq: int = 0
+        self._removed_seqs: set[int] = set()
+        self._truncated_seqs: set[int] = set()
+        self._stubbed_seqs: set[int] = set()
+        # Cumulative highest progressive strategy level (1-8) ever reached.
+        # Reported in compaction stats / notice so the LLM sees the total
+        # accumulated effect, not just the most recent escalation step.
+        self._sticky_level: int = 0
+
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
@@ -180,6 +200,15 @@ class SimpleContextManager:
                     "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds"),
                 },
             }
+
+        # Assign a stable sequence id used as the identity key for sticky
+        # compaction decisions (see _apply_sticky_decisions). Every message
+        # gets exactly one, assigned once, never reused/reassigned.
+        message = {
+            **message,
+            "metadata": {**(message.get("metadata") or {}), "_seq": self._next_seq},
+        }
+        self._next_seq += 1
 
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
@@ -300,32 +329,132 @@ class SimpleContextManager:
                 f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
             )
 
-            # Insert compaction notice if enabled and level threshold met
+            # Append compaction notice at the TAIL if enabled and level threshold met.
+            #
+            # CRITICAL (prompt cache stability): this notice must never be inserted
+            # into the prefix. Two things make the tail the only safe placement:
+            #
+            # 1. role: previously this was "system", which -- for the Anthropic
+            #    provider -- gets extracted OUT of the conversation entirely and
+            #    merged into the single top-level system content block (see
+            #    provider-anthropic's `_complete_chat_request`: `system_msgs = [m
+            #    for m in request.messages if m.role == "system"]`, combined by
+            #    `_format_system_with_cache`). That means a "system"-role notice
+            #    inserted anywhere -- even at the tail -- would change the system
+            #    block's text on every compaction, busting the SYSTEM cache
+            #    breakpoint too, not just the conversation-region one. Using
+            #    "user" keeps this message in the conversation region, where the
+            #    provider's ephemeral-exclusion logic can see and skip it.
+            # 2. metadata.ephemeral=True + tail position: the Anthropic provider's
+            #    `_count_trailing_ephemeral_messages` walks backward from the end
+            #    of the conversation and excludes trailing messages carrying
+            #    `metadata.ephemeral=True` from cache-breakpoint placement. A
+            #    "system"-role message is excluded from that walk entirely (it
+            #    never reaches the conversation list), and content anywhere
+            #    other than the tail is not "trailing" and would still corrupt
+            #    the cached prefix. Tail + ephemeral=True + role != "system" is
+            #    the only combination the existing provider fix recognizes.
+            #
+            # The notice content itself only changes when a NEW compaction
+            # escalation actually occurs (see _compact_ephemeral's sticky decision
+            # state) -- so on calls between escalations, this tail addition is
+            # byte-identical, and everything before it (the real prefix) is
+            # completely undisturbed either way.
             if self.compaction_notice_enabled and self._last_compaction_stats:
                 level = self._last_compaction_stats.get("strategy_level", 0)
-                if level >= self.compaction_notice_min_level:
+                # GUARD: never append into an unanswered tool_calls turn.
+                #
+                # Appending at the tail is what makes the notice cache-safe
+                # (above), but the tail is not always a safe place to stand: if
+                # the view ends with an assistant message carrying tool_calls,
+                # its tool results have not been added yet, and a user-role
+                # notice would land BETWEEN the tool call and its results.
+                # Providers reject or mishandle that interleaving -- the same
+                # tool_use/tool_result atomicity the compaction levels work hard
+                # to preserve. (This is new exposure from the move to the tail;
+                # the old index-1 insert could never land here.)
+                #
+                # Skip rather than reposition: placing it before the assistant
+                # message would put it back INSIDE the prefix, re-introducing
+                # exactly the cache-busting this fix exists to prevent. Skipping
+                # costs nothing -- the notice is derived from sticky stats that
+                # persist, so it reappears on the very next request once the
+                # tool results have arrived and the tail is a safe place again.
+                if compacted and compacted[-1].get("tool_calls"):
+                    logger.debug(
+                        "Skipping compaction notice this request: view ends with "
+                        "an assistant message with unanswered tool_calls; the "
+                        "notice would interleave between tool_use and tool_result. "
+                        "It will be appended on the next request instead."
+                    )
+                elif level >= self.compaction_notice_min_level:
                     notice = self._format_compaction_notice()
                     if notice:
-                        # Insert at position 1 (after main system message at position 0)
-                        compacted.insert(
-                            1,
+                        compacted.append(
                             {
-                                "role": "system",
+                                "role": "user",
                                 "content": notice,
                                 "metadata": {
                                     "source": "context-compaction",
                                     "ephemeral": True,
                                 },
-                            },
+                            }
                         )
                         logger.debug(
-                            f"Inserted compaction notice at position 1 (level {level}, "
+                            f"Appended compaction notice at tail (level {level}, "
                             f"verbosity: {self.compaction_notice_verbosity})"
                         )
 
-            return compacted
+            # Strip internal bookkeeping at the module boundary -- everything
+            # above this point (sticky decisions, token accounting) still runs
+            # on messages carrying `_seq`; only what leaves has it removed.
+            return self._strip_internal_metadata(compacted)
 
-        return working_messages
+        return self._strip_internal_metadata(working_messages)
+
+    # Metadata keys that are internal bookkeeping only and must never cross
+    # the module boundary into a provider-facing view. `_seq` is sticky
+    # compaction identity (see _extract_seq): meaningless to a provider, and --
+    # because _estimate_tokens stringifies the whole message dict -- it also
+    # inflates the token estimate of every message carrying it.
+    _INTERNAL_METADATA_KEYS = frozenset({"_seq"})
+
+    def _strip_internal_metadata(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return a provider-facing view with internal-only metadata removed.
+
+        CRITICAL: stored history must KEEP `_seq` -- the sticky decision store
+        is keyed on it, so losing it would silently break stickiness (and with
+        it, prefix stability). The returned view can share dict objects with
+        `self.messages`: the no-compaction path returns stored dicts directly,
+        and even the compacted path's `dict(msg)` shallow copies share the SAME
+        nested metadata dict. So this NEVER mutates in place -- any message
+        needing a strip is rebuilt as a new dict with a new metadata dict, and
+        the stored original is left untouched.
+
+        Messages with nothing to strip pass through by identity (no copy),
+        which keeps this deterministic and byte-stable call over call.
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            meta = msg.get("metadata")
+            if not isinstance(meta, dict) or self._INTERNAL_METADATA_KEYS.isdisjoint(
+                meta
+            ):
+                result.append(msg)
+                continue
+            result.append(
+                {
+                    **msg,
+                    "metadata": {
+                        k: v
+                        for k, v in meta.items()
+                        if k not in self._INTERNAL_METADATA_KEYS
+                    },
+                }
+            )
+        return result
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
@@ -337,13 +466,40 @@ class SimpleContextManager:
         return list(self.messages)
 
     async def set_messages(self, messages: list[dict[str, Any]]) -> None:
-        """Set messages from a saved transcript (for session resume)."""
-        self.messages = list(messages)
+        """Set messages from a saved transcript (for session resume).
+
+        Sticky compaction decisions live only in this instance's memory (they
+        are never persisted alongside the transcript), so a resumed session
+        necessarily starts with a clean decision slate -- there is no stale
+        state to reconcile against the incoming messages. Sequence ids are
+        re-stamped deterministically (0..N-1, in transcript order) rather than
+        trusting any `_seq` that might already be present in the incoming
+        metadata, so identity stays internally consistent regardless of what
+        produced the transcript.
+        """
+        restamped: list[dict[str, Any]] = []
+        for i, msg in enumerate(messages):
+            meta = dict(msg.get("metadata") or {})
+            meta["_seq"] = i
+            restamped.append({**msg, "metadata": meta})
+        self.messages = restamped
+        self._next_seq = len(restamped)
+        self._removed_seqs = set()
+        self._truncated_seqs = set()
+        self._stubbed_seqs = set()
+        self._sticky_level = 0
+        self._last_compaction_stats = None
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:
         """Clear all messages."""
         self.messages = []
+        self._next_seq = 0
+        self._removed_seqs = set()
+        self._truncated_seqs = set()
+        self._stubbed_seqs = set()
+        self._sticky_level = 0
+        self._last_compaction_stats = None
         logger.info("Context cleared")
 
     async def should_compact(self) -> bool:
@@ -374,6 +530,85 @@ class SimpleContextManager:
                 f"threshold {self.compact_threshold:.0%} - compaction needed"
             )
         return should
+
+    # --- Sticky compaction decision helpers ---
+    #
+    # These give every compaction decision (remove / truncate / stub) a
+    # permanent, stable identity keyed on metadata["_seq"] (assigned once per
+    # message in add_message()) instead of list index. Indices shift on every
+    # call as history grows and the ephemeral view is rebuilt from scratch;
+    # seq ids do not. This is the mechanism that makes the returned view's
+    # shared prefix byte-stable across calls where history only grew by a
+    # turn or two, instead of re-deriving (and potentially shifting) the
+    # entire compaction decision on every single get_messages_for_request()
+    # call.
+
+    @staticmethod
+    def _extract_seq(msg: dict[str, Any]) -> int | None:
+        """Return a message's stable sequence id, or None if it has none.
+
+        Messages without a seq (e.g. a freshly-generated system prompt from
+        set_system_prompt_factory(), which never goes through add_message())
+        simply cannot participate in sticky tracking -- they are always
+        system-role and therefore never candidates for compaction anyway, so
+        this is a non-issue in practice, not a silent gap.
+        """
+        return (msg.get("metadata") or {}).get("_seq")
+
+    def _record_removed(self, msg: dict[str, Any]) -> None:
+        """Permanently record that a message has been removed by compaction."""
+        seq = self._extract_seq(msg)
+        if seq is not None:
+            self._removed_seqs.add(seq)
+            # A message can only be in one terminal state; removal supersedes
+            # any earlier truncate/stub decision for the same seq.
+            self._truncated_seqs.discard(seq)
+            self._stubbed_seqs.discard(seq)
+
+    def _record_truncated(self, msg: dict[str, Any]) -> None:
+        """Permanently record that a tool result has been truncated."""
+        seq = self._extract_seq(msg)
+        if seq is not None:
+            self._truncated_seqs.add(seq)
+
+    def _record_stubbed(self, msg: dict[str, Any]) -> None:
+        """Permanently record that a user message has been stubbed."""
+        seq = self._extract_seq(msg)
+        if seq is not None:
+            self._stubbed_seqs.add(seq)
+
+    def _apply_sticky_decisions(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Cheaply (O(n), no search) re-apply every previously-recorded
+        compaction decision to a fresh copy of `messages`.
+
+        Returns a NEW list -- `messages` (which may be `self.messages`
+        itself, or a filtered view of it) is never mutated. Messages with no
+        recorded decision are shallow-copied so downstream in-place mutation
+        (there is none today, but this matches the discipline the rest of
+        this module already follows) can never leak back into stored
+        history.
+
+        This is deterministic given the same input: the exact same messages
+        are dropped/truncated/stubbed every time, in the same way, regardless
+        of how many times this is called. Only messages with NO recorded
+        decision (i.e. newly appended since the last escalation) pass
+        through unchanged -- which is exactly the "only the tail grows"
+        behavior prefix stability depends on.
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            seq = self._extract_seq(msg)
+            if seq is not None and seq in self._removed_seqs:
+                continue
+            if seq is not None and seq in self._truncated_seqs:
+                result.append(self._truncate_tool_result(msg))
+            elif seq is not None and seq in self._stubbed_seqs:
+                result.append(self._stub_user_message(msg))
+            else:
+                result.append(dict(msg))
+        return result
 
     async def _compact_ephemeral(
         self, budget: int, source_messages: list[dict[str, Any]] | None = None
@@ -411,11 +646,6 @@ class SimpleContextManager:
         old_count = len(messages_to_compact)
         old_tokens = self._estimate_tokens(messages_to_compact)
 
-        logger.info(
-            f"Compacting context: {len(messages_to_compact)} messages, {old_tokens:,} tokens "
-            f"(target: {target_tokens:,} tokens, {self.target_usage:.0%} of {budget:,})"
-        )
-
         # === CRITICAL: Extract system messages FIRST - they are NEVER compacted ===
         # System messages contain the agent's identity and instructions. Losing them
         # causes the agent to lose its persona and capabilities mid-conversation.
@@ -426,16 +656,89 @@ class SimpleContextManager:
             msg for msg in messages_to_compact if msg.get("role") != "system"
         ]
 
+        # UNITS CONVENTION (see the block comment below): every "are we under
+        # target yet?" comparison in this method and its helpers is TOTAL vs
+        # TOTAL. System messages are extracted from `working_messages` but are
+        # still part of the request, so this fixed, un-reducible floor must be
+        # added back to every token count derived from `working_messages`.
+        # Computed once here -- `system_messages` is never modified during
+        # compaction, so this value is constant for the whole call.
+        system_tokens = self._estimate_tokens(system_messages)
+
         if system_messages:
-            system_tokens = self._estimate_tokens(system_messages)
-            logger.info(
+            logger.debug(
                 f"Preserving {len(system_messages)} system message(s) ({system_tokens:,} tokens) - "
                 f"these are NEVER compacted"
             )
 
-        # Work on non-system messages only - system messages bypass all compaction
-        working_messages = [dict(msg) for msg in non_system_messages]
-        current_tokens = old_tokens
+        # === STEP 1: cheaply apply decisions already made in a PRIOR escalation ===
+        # No search, no candidate selection -- just filter out previously-removed
+        # seqs and re-apply previously-recorded truncate/stub transforms. This is
+        # the path taken on the vast majority of calls once at least one
+        # escalation has happened: deterministic given the same input messages,
+        # so it reproduces exactly what was returned last time for anything not
+        # newly appended -- which is what keeps the shared prefix byte-stable.
+        working_messages = self._apply_sticky_decisions(non_system_messages)
+
+        # === UNITS CONVENTION: TOTAL vs TOTAL, everywhere in this path ===
+        #
+        # `target_tokens` above is derived from the TOTAL budget
+        # (budget * target_usage), so EVERY "are we under threshold/target
+        # yet?" comparison below -- the escalation trigger, each level's
+        # termination check, and the checks inside the helpers this method
+        # calls -- must put a TOTAL (system + conversation) token count on the
+        # left-hand side. System tokens are a fixed, un-reducible floor: they
+        # cannot be compacted away, but they DO consume budget.
+        #
+        # This is deliberately one convention applied uniformly rather than
+        # two. The alternative (non-system vs `target - system_tokens`) is
+        # numerically equivalent, but it would put a number in the logs and
+        # stats that differs from the configured knob, and it yields a
+        # negative target whenever the system prompt alone exceeds the
+        # target. Total-vs-total keeps the compared number identical to the
+        # reported number (`after_tokens` / `target_tokens` in the stats and
+        # the compaction notice).
+        #
+        # Mixing the two is a real bug this code has had twice, in two
+        # different places:
+        #   1. the escalation TRIGGER below silently dropped system tokens,
+        #      so with a large system prompt compaction never fired (see
+        #      test_large_system_message_counts_toward_compaction_trigger);
+        #   2. each level's TERMINATION check compared the NON-SYSTEM total
+        #      (which is what the helpers naturally compute, since
+        #      `working_messages` excludes system messages) against the
+        #      TOTAL-budget target -- so compaction could declare victory at
+        #      Level 1 after truncating one small tool result and never
+        #      escalate again, silently turning the effective cap into
+        #      `target_usage * budget + system_estimate` (see
+        #      test_escalation_does_not_stall_at_level_1_with_large_system_message).
+        # Hence: `system_tokens` is threaded into every helper that derives a
+        # token count from `working_messages`.
+        non_system_tokens = self._estimate_tokens(working_messages)
+        current_tokens = system_tokens + non_system_tokens
+
+        needs_escalation = (
+            budget > 0 and (current_tokens / budget) >= self.compact_threshold
+        )
+        if not needs_escalation:
+            # Sticky state alone already keeps us under the threshold that
+            # triggered compaction in the first place -- nothing NEW needs
+            # deciding this call. Return the already-decided view unchanged;
+            # _last_compaction_stats (and therefore the notice) is left as-is
+            # from the last real escalation, so its content stays stable too.
+            final_messages = system_messages + working_messages
+            logger.debug(
+                f"Sticky compaction view: {len(final_messages)} messages, "
+                f"{current_tokens:,} tokens "
+                f"(no new decisions this call; cumulative level so far: {self._sticky_level})"
+            )
+            return final_messages
+
+        logger.info(
+            f"Compacting context (new escalation): {old_count} raw messages, {old_tokens:,} raw tokens "
+            f"-> {len(working_messages)} messages, {current_tokens:,} tokens after sticky state "
+            f"(target: {target_tokens:,} tokens, {self.target_usage:.0%} of {budget:,})"
+        )
 
         # Get all tool result indices for wave-based truncation
         tool_result_indices = [
@@ -465,6 +768,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -490,6 +794,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -514,7 +819,10 @@ class SimpleContextManager:
         level3_protection = self.protected_recent  # Use configured value
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level3_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level3_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -554,6 +862,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -578,7 +887,10 @@ class SimpleContextManager:
         level5_protection = self.protected_recent * 0.6
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level5_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level5_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -615,6 +927,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -639,7 +952,10 @@ class SimpleContextManager:
         level7_protection = self.protected_recent * 0.3
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level7_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level7_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -675,6 +991,8 @@ class SimpleContextManager:
                         working_messages[first_user_idx] = self._stub_user_message(
                             first_msg
                         )
+                        # Sticky: record before `first_msg` var is superseded.
+                        self._record_stubbed(first_msg)
                         total_stubbed += 1
                         savings = (len(content) - 70) // 4
                         current_tokens -= savings
@@ -705,6 +1023,9 @@ class SimpleContextManager:
                     current_tokens -= 18  # Stub is ~70 chars = ~18 tokens
 
                 if indices_to_remove:
+                    # Sticky: record before filtering the list out from under them.
+                    for i in indices_to_remove:
+                        self._record_removed(working_messages[i])
                     working_messages = [
                         msg
                         for i, msg in enumerate(working_messages)
@@ -739,11 +1060,22 @@ class SimpleContextManager:
         protected_indices: set[int],
         target_tokens: int,
         current_tokens: int,
+        system_tokens: int,
     ) -> tuple[int, int]:
         """
         Truncate a wave of tool results, stopping when target is reached.
 
         Returns (truncated_count, new_token_count).
+
+        UNITS: `target_tokens`, `current_tokens`, and the returned token count
+        are all TOTAL (system + conversation) counts, matching the
+        total-budget target computed in `_compact_ephemeral`. `messages` here
+        is the NON-SYSTEM working list, so `system_tokens` -- the fixed,
+        un-reducible system floor -- must be added to anything derived from
+        it. Without that, this would return a non-system count that the
+        caller then compares against a total-budget target, and truncating one
+        small tool result could make compaction declare victory while total
+        usage is still far over budget.
 
         Performance note: the original implementation called
         `self._estimate_tokens(messages)` (a full O(n) rescan of every message)
@@ -773,13 +1105,20 @@ class SimpleContextManager:
                     # First mutation in this call: establish the true baseline
                     # once (matches what _estimate_tokens(messages) would have
                     # returned immediately before this mutation).
-                    true_total = self._estimate_tokens(messages)
+                    # UNITS: + system_tokens keeps this a TOTAL, so the
+                    # `current_tokens <= target_tokens` check above stays
+                    # total-vs-total after this first mutation replaces the
+                    # caller-supplied (already total) seed value.
+                    true_total = self._estimate_tokens(messages) + system_tokens
                 old_len = len(str(msg)) // 4
                 messages[i] = self._truncate_tool_result(msg)
                 new_len = len(str(messages[i])) // 4
                 true_total += new_len - old_len
                 truncated += 1
                 current_tokens = true_total
+                # Sticky: record this decision by the message's stable seq id
+                # so it is never re-derived (or reversed) on a later call.
+                self._record_truncated(msg)
         return truncated, current_tokens
 
     def _remove_messages_with_protection(
@@ -787,6 +1126,7 @@ class SimpleContextManager:
         messages: list[dict[str, Any]],
         target_tokens: int,
         protected_recent: float,
+        system_tokens: int,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -794,6 +1134,15 @@ class SimpleContextManager:
         User messages are NEVER removed - they may be stubbed if still over target.
 
         Returns (new_messages, removed_count, stubbed_count, new_token_count).
+
+        UNITS: `target_tokens` and the returned token count are TOTAL (system
+        + conversation) counts, matching the total-budget target computed in
+        `_compact_ephemeral`. `messages` is the NON-SYSTEM working list, so
+        `system_tokens` -- the fixed, un-reducible system floor -- is added to
+        every count derived from it. Without that, this returns a non-system
+        count the caller compares against a total-budget target, and removal
+        stops early (or never starts) whenever the system prompt is a large
+        fraction of the budget.
         """
         # Determine protected indices
         protected_indices = set()
@@ -862,8 +1211,9 @@ class SimpleContextManager:
         # Remove messages until under target, preserving tool pairs
         indices_to_remove: set[int] = set()
         removed_tokens_total = 0
-        base_tokens = self._estimate_tokens(
-            messages
+        # UNITS: + system_tokens makes this a TOTAL, matching `target_tokens`.
+        base_tokens = (
+            self._estimate_tokens(messages) + system_tokens
         )  # computed once; messages is constant here
         current_tokens = base_tokens
 
@@ -931,6 +1281,17 @@ class SimpleContextManager:
                 savings = (len(content) - 70) // 4  # Stub is ~70 chars
                 current_tokens -= savings
 
+        # Sticky: record these NEW decisions by stable seq id before building
+        # the result, so they are never re-derived (or reversed) on a later
+        # call. `indices_to_remove`/`indices_to_stub` here only ever contain
+        # candidates that weren't already decided (removed messages are
+        # already absent from `messages` by the time this runs; stub
+        # candidates explicitly exclude already-`_stubbed` messages above).
+        for i in indices_to_remove:
+            self._record_removed(messages[i])
+        for i in indices_to_stub:
+            self._record_stubbed(messages[i])
+
         # Build result with stubs
         result = []
         for i, msg in enumerate(messages):
@@ -941,7 +1302,9 @@ class SimpleContextManager:
             else:
                 result.append(msg)
 
-        final_tokens = self._estimate_tokens(result)
+        # UNITS: + system_tokens so the caller receives a TOTAL to compare
+        # against its total-budget `target_tokens`.
+        final_tokens = self._estimate_tokens(result) + system_tokens
 
         return result, len(indices_to_remove), len(indices_to_stub), final_tokens
 
@@ -1067,17 +1430,64 @@ class SimpleContextManager:
                 f"This indicates a bug in compaction logic."
             )
 
-        # Build and store stats for observability
+        # === BUDGET GUARD: compaction finished, but the view is STILL over budget ===
+        # Compaction can only shrink the CONVERSATION. System messages are an
+        # un-reducible floor (see the units convention in _compact_ephemeral),
+        # so once the system share alone exceeds the target, the target is
+        # arithmetically unreachable -- no escalation level can ever get there.
+        # That state previously ended here in total silence: an over-budget
+        # view returned with no signal at all, which is the one failure mode
+        # this module cannot afford, since it manages every session's memory.
+        # Say it out loud, and name the system share as the floor so the
+        # operator knows which knob actually moves (shrink the system prompt,
+        # or raise the budget -- compacting harder will not help).
+        system_tokens = self._estimate_tokens(system_messages)
+        if budget > 0 and final_tokens > budget:
+            if system_tokens > target_tokens:
+                cause = (
+                    f"the system prompt ALONE is {system_tokens:,} tokens, which already "
+                    f"exceeds the compaction target of {target_tokens:,} tokens. System "
+                    f"messages are never compacted, so this is an un-reducible floor: NO "
+                    f"amount of conversation compaction can reach the target. Reduce the "
+                    f"system prompt or raise the budget"
+                )
+            else:
+                cause = (
+                    f"the un-compactable system floor is {system_tokens:,} tokens against "
+                    f"a target of {target_tokens:,}; the rest is protected content (last "
+                    f"user message, last {self.protected_tool_results} tool results, "
+                    f"tool_use/tool_result pairs) that compaction is not permitted to drop"
+                )
+            logger.warning(
+                f"Compaction finished OVER BUDGET at level {max_level_reached}: "
+                f"{final_tokens:,} tokens against a budget of {budget:,} "
+                f"({final_tokens / budget:.0%} of budget, target {target_tokens:,}) -- "
+                f"{cause}."
+            )
+
+        # Cumulative high-water mark across ALL escalations ever, not just
+        # this one -- monotonic, never goes backward. This is what feeds the
+        # compaction notice, so its content only changes when a genuinely
+        # NEW escalation happens, keeping it stable across the (much more
+        # common) calls where sticky state alone was already sufficient.
+        self._sticky_level = max(self._sticky_level, max_level_reached)
+
+        # Build and store stats for observability. Removed/truncated/stubbed
+        # counts are read from the sticky decision store itself (cumulative
+        # totals across every escalation this context manager has ever made),
+        # not the per-call deltas passed in -- this reports the total
+        # accumulated effect on the conversation, which is what the notice
+        # and any observability consumer actually wants to know.
         stats = {
             "before_tokens": old_tokens,
             "after_tokens": final_tokens,
             "before_messages": old_count,
             "after_messages": len(final_messages),
-            "messages_removed": total_removed,
-            "messages_truncated": total_truncated,
-            "user_messages_stubbed": total_stubbed,
+            "messages_removed": len(self._removed_seqs),
+            "messages_truncated": len(self._truncated_seqs),
+            "user_messages_stubbed": len(self._stubbed_seqs),
             "system_messages_preserved": system_count,
-            "strategy_level": max_level_reached,
+            "strategy_level": self._sticky_level,
             "budget": budget,
             "target_tokens": target_tokens,
             "protected_recent": self.protected_recent,
