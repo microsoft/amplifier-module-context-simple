@@ -23,6 +23,7 @@ the test that would have caught the original bug (notice at index 1 + fully
 re-derived compaction on every call).
 """
 
+import logging
 from typing import Any
 
 import pytest
@@ -590,3 +591,351 @@ async def test_get_messages_returns_full_uncompacted_history():
     # only ever appear on the ephemeral VIEW, never on stored history.
     assert not any(m.get("_truncated") for m in full_history)
     assert not any(m.get("_stubbed") for m in full_history)
+
+
+# ---------------------------------------------------------------------------
+# (c) Over-budget signal: an unreachable target must never be returned silently
+# ---------------------------------------------------------------------------
+
+MODULE_LOGGER = "amplifier_module_context_simple"
+
+
+def _over_budget_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:
+    """Every WARNING emitted by the over-budget guard in this test's run."""
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno >= logging.WARNING and "OVER BUDGET" in r.getMessage()
+    ]
+
+
+@pytest.mark.asyncio
+async def test_warns_when_system_share_makes_budget_unreachable(
+    caplog: pytest.LogCaptureFixture,
+):
+    """Regression test: when the system prompt ALONE exceeds the compaction
+    target, the target is arithmetically unreachable -- system messages are
+    never compacted, so no escalation level can ever get under it.
+
+    Before this fix that state was returned in TOTAL SILENCE: an over-budget
+    view (the reviewer measured 2,519 tokens against a 1,000 budget -- 252%)
+    with zero WARNING records. Silent degradation is the one failure mode this
+    module cannot afford, since it manages every session's memory. The warning
+    must fire AND must name the system share as the floor, so an operator
+    knows the actionable knob is the system prompt (or the budget), not more
+    aggressive compaction.
+    """
+    budget = 1_000
+    # ~2,000 tokens of system prompt against a 1,000 token budget: the
+    # reviewer's scenario shape -- system share alone is 2x the whole budget.
+    context = SimpleContextManager(
+        max_tokens=budget,
+        compact_threshold=0.92,
+        target_usage=0.50,
+        protected_recent=0.20,
+        protected_tool_results=1,
+        truncate_chars=100,
+        compaction_notice_enabled=False,
+    )
+    await context.add_message({"role": "system", "content": "S" * 8_000})
+    for i in range(8):
+        await context.add_message({"role": "user", "content": f"task {i}"})
+        await context.add_message({"role": "assistant", "content": "ack " * 20})
+
+    # The un-compactable floor, measured exactly as the module measures it
+    # (on STORED messages, which still carry `_seq`).
+    system_tokens = _estimate(
+        [m for m in context.messages if m.get("role") == "system"]
+    )
+
+    with caplog.at_level(logging.WARNING, logger=MODULE_LOGGER):
+        view = await context.get_messages_for_request()
+
+    stats = context._last_compaction_stats
+    assert stats is not None, "Test setup must actually trigger compaction"
+    assert _estimate(view) > budget, (
+        "Test setup must actually end up over budget for this test to mean "
+        f"anything (got {_estimate(view):,} against budget {budget:,})"
+    )
+
+    warnings = _over_budget_warnings(caplog)
+    assert warnings, (
+        "Compaction returned an over-budget view with NO warning -- this is "
+        "the silent degradation the fix exists to eliminate. "
+        f"View is {_estimate(view):,} tokens against a budget of {budget:,}."
+    )
+    message = warnings[0]
+
+    # The warning must name the SYSTEM SHARE as the floor -- that is the
+    # actionable part. A bare "over budget" line tells an operator nothing
+    # about which knob moves.
+    assert "system prompt ALONE" in message and "floor" in message, (
+        f"Warning does not name the system share as the un-reducible floor: {message}"
+    )
+
+    # All four numbers an operator needs to act must be present.
+    assert f"{stats['after_tokens']:,}" in message, f"final_tokens missing: {message}"
+    assert f"{budget:,}" in message, f"budget missing: {message}"
+    assert f"{system_tokens:,}" in message, (
+        f"system_tokens ({system_tokens:,}) missing: {message}"
+    )
+    assert f"{stats['target_tokens']:,}" in message, f"target_tokens missing: {message}"
+
+
+@pytest.mark.asyncio
+async def test_no_over_budget_warning_when_compaction_lands_under_budget(
+    caplog: pytest.LogCaptureFixture,
+):
+    """The counterpart to the test above: a HEALTHY compaction -- one that
+    actually reaches its target -- must stay quiet. A guard that fires on
+    every successful compaction is noise, and noise is how real warnings get
+    ignored.
+    """
+    budget = 10_000
+    context = await _build_large_system_scenario(
+        budget=budget,
+        system_tokens=2_000,  # ~20% of budget -- target stays reachable
+        turns=20,
+        tool_result_chars=1_400,
+    )
+
+    with caplog.at_level(logging.WARNING, logger=MODULE_LOGGER):
+        view = await context.get_messages_for_request()
+
+    assert context._last_compaction_stats is not None, (
+        "Test setup must actually trigger compaction"
+    )
+    assert _estimate(view) <= budget, (
+        "Test setup must actually land under budget for this test to be "
+        "checking what it claims to check"
+    )
+    assert not _over_budget_warnings(caplog), (
+        "A healthy, under-budget compaction emitted an over-budget warning: "
+        f"{_over_budget_warnings(caplog)}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (d) Tail notice must never split an unanswered tool_use / tool_result pair
+# ---------------------------------------------------------------------------
+
+
+def _notices(messages: list[dict]) -> list[dict]:
+    return [
+        m
+        for m in messages
+        if (m.get("metadata") or {}).get("source") == "context-compaction"
+    ]
+
+
+@pytest.mark.asyncio
+async def test_notice_skipped_when_tail_has_unanswered_tool_calls():
+    """Appending the notice at the TAIL is what makes it cache-safe, but the
+    tail is not always a safe place to stand.
+
+    If the view ends with an assistant message carrying tool_calls, the tool
+    results have not arrived yet -- appending a user-role notice there lands
+    it BETWEEN the tool_use and its tool_result, which providers reject or
+    mishandle. This exposure is new with the move to the tail (the old
+    index-1 insert could never land here), so it needs its own guard.
+    """
+    context = _make_context()
+    await _fill_until_compacted(context)
+
+    # Establish that compaction (and therefore the notice) is active at all.
+    baseline = await context.get_messages_for_request()
+    assert context._last_compaction_stats is not None, (
+        "Test setup must actually trigger compaction"
+    )
+    assert _notices(baseline), (
+        "Baseline must carry a notice, otherwise the skip below proves nothing"
+    )
+
+    # Now end the conversation on an assistant turn with PENDING tool_calls.
+    await context.add_message({"role": "user", "content": "run the tool " + "y" * 80})
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_pending", "type": "function", "function": {"name": "do"}}
+            ],
+        }
+    )
+
+    view = await context.get_messages_for_request()
+
+    assert view[-1].get("tool_calls"), (
+        "Test setup must actually leave an unanswered tool_calls message at "
+        "the tail for this test to be meaningful"
+    )
+    assert not _notices(view), (
+        "Compaction notice was appended after an assistant message with "
+        "unanswered tool_calls -- this interleaves a user-role message "
+        "between tool_use and tool_result, which providers reject."
+    )
+
+
+@pytest.mark.asyncio
+async def test_notice_returns_once_tool_results_arrive():
+    """Skipping is safe precisely because it is temporary: the notice is
+    derived from sticky stats that persist, so it must come back on the very
+    next request once the tool results land and the tail is safe again.
+
+    (This is what makes "skip" the right call over "reposition before the
+    assistant message" -- repositioning would put the notice back INSIDE the
+    prefix, re-introducing the cache-busting this whole fix exists to prevent.)
+    """
+    context = _make_context()
+    await _fill_until_compacted(context)
+    await context.get_messages_for_request()
+    assert context._last_compaction_stats is not None
+
+    await context.add_message({"role": "user", "content": "run the tool " + "y" * 80})
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_pending", "type": "function", "function": {"name": "do"}}
+            ],
+        }
+    )
+    skipped_view = await context.get_messages_for_request()
+    assert not _notices(skipped_view), "Precondition: notice skipped at pending tail"
+
+    # The tool result arrives -- the pair is complete, the tail is safe again.
+    await context.add_message(
+        {
+            "role": "tool",
+            "tool_call_id": "call_pending",
+            "content": "the tool result " * 10,
+        }
+    )
+    resumed_view = await context.get_messages_for_request()
+
+    notices = _notices(resumed_view)
+    assert len(notices) == 1, (
+        "Notice did not reappear after the tool results arrived -- skipping "
+        "must be a one-request deferral, not a permanent loss of the notice."
+    )
+    assert resumed_view[-1] is notices[0], (
+        "The restored notice must still be at the TAIL (cache-stable placement)"
+    )
+    assert not resumed_view[-2].get("tool_calls"), (
+        "Notice must not sit directly after an unanswered tool_calls message"
+    )
+
+
+# ---------------------------------------------------------------------------
+# (e) `_seq` is internal bookkeeping and must not cross the module boundary
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_seq_stripped_from_returned_view_but_retained_in_stored_history():
+    """`_seq` is sticky-compaction identity: internal bookkeeping that is
+    meaningless to a provider, and (because _estimate_tokens stringifies the
+    whole message dict) it inflates the token estimate of every message
+    carrying it. Strip it from the RETURNED view only.
+
+    The stored history must keep it -- the sticky decision store is keyed on
+    it, so losing it would silently break stickiness and, with it, prefix
+    stability.
+    """
+    context = _make_context()
+    await _fill_until_compacted(context, turns=40)
+
+    view = await context.get_messages_for_request()
+
+    assert all("_seq" not in (m.get("metadata") or {}) for m in view), (
+        "`_seq` leaked into the provider-facing view: "
+        f"{[m for m in view if '_seq' in (m.get('metadata') or {})][:2]}"
+    )
+    assert context.messages, "Test setup must have stored messages"
+    assert all("_seq" in (m.get("metadata") or {}) for m in context.messages), (
+        "Stripping the returned view destroyed `_seq` in STORED history -- "
+        "sticky compaction decisions are keyed on it and would break."
+    )
+
+
+@pytest.mark.asyncio
+async def test_stripping_seq_never_mutates_stored_messages():
+    """The returned view is NOT reliably built from deep copies: the
+    no-compaction path returns stored dicts directly, and even the compacted
+    path's `dict(msg)` shallow copies share the SAME nested metadata dict. So
+    stripping must rebuild rather than mutate -- an in-place `pop("_seq")`
+    here would silently corrupt the sticky decision store.
+
+    Covers BOTH return paths (compaction and no-compaction), since they differ
+    in exactly how much sharing there is with stored state.
+    """
+    context = _make_context()
+
+    # --- Path 1: no compaction (view shares dict objects with storage) ---
+    await context.add_message({"role": "user", "content": "small"})
+    stored_msg = context.messages[0]
+    stored_meta = stored_msg["metadata"]
+    seq_before = stored_meta["_seq"]
+
+    view = await context.get_messages_for_request()
+    assert context._last_compaction_stats is None, "Path 1 must not compact"
+    assert all("_seq" not in (m.get("metadata") or {}) for m in view)
+    assert stored_meta["_seq"] == seq_before, (
+        "Stripping mutated the STORED message's metadata dict in place "
+        "(no-compaction path)"
+    )
+    assert context.messages[0]["metadata"] is stored_meta, (
+        "Stored message's metadata dict was replaced -- stripping must only "
+        "affect the returned view"
+    )
+
+    # --- Path 2: compaction (view built from shallow copies sharing metadata) ---
+    await _fill_until_compacted(context, turns=40)
+    stored_metas = [m["metadata"] for m in context.messages]
+    seqs_before = [meta["_seq"] for meta in stored_metas]
+
+    compacted_view = await context.get_messages_for_request()
+    assert context._last_compaction_stats is not None, "Path 2 must compact"
+
+    assert all("_seq" not in (m.get("metadata") or {}) for m in compacted_view)
+    assert [meta["_seq"] for meta in stored_metas] == seqs_before, (
+        "Stripping mutated stored metadata dicts in place (compaction path) -- "
+        "the shallow-copy sharing hazard this rebuild exists to avoid."
+    )
+
+
+@pytest.mark.asyncio
+async def test_prefix_stability_survives_notice_guard_and_seq_stripping():
+    """The core property must still hold after both the tail-notice guard and
+    `_seq` stripping: two consecutive calls with history grown by one turn
+    still produce a byte-identical shared prefix.
+
+    Both changes are deterministic per message (strip is pure; the guard only
+    affects the trailing notice), so neither may introduce per-call churn.
+    This re-asserts the property specifically downstream of them rather than
+    trusting that the original regression test still covers it.
+    """
+    context = _make_context()
+    await _fill_until_compacted(context)
+
+    call1 = await context.get_messages_for_request()
+    assert context._last_compaction_stats is not None
+
+    await context.add_message(_padded(7001, "user"))
+    await context.add_message(_padded(7001, "assistant"))
+    call2 = await context.get_messages_for_request()
+
+    def body(messages: list[dict]) -> list[dict]:
+        if messages and (messages[-1].get("metadata") or {}).get("ephemeral"):
+            return messages[:-1]
+        return messages
+
+    prefix1, prefix2 = body(call1), body(call2)
+    assert prefix2[: len(prefix1)] == prefix1, (
+        "Shared prefix changed between two calls where history grew by only "
+        "one turn -- the notice guard or `_seq` stripping introduced churn."
+    )
+    # And the strip really is applied on this path (guards against the test
+    # passing vacuously if stripping were removed).
+    assert all("_seq" not in (m.get("metadata") or {}) for m in prefix2)

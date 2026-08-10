@@ -362,7 +362,32 @@ class SimpleContextManager:
             # completely undisturbed either way.
             if self.compaction_notice_enabled and self._last_compaction_stats:
                 level = self._last_compaction_stats.get("strategy_level", 0)
-                if level >= self.compaction_notice_min_level:
+                # GUARD: never append into an unanswered tool_calls turn.
+                #
+                # Appending at the tail is what makes the notice cache-safe
+                # (above), but the tail is not always a safe place to stand: if
+                # the view ends with an assistant message carrying tool_calls,
+                # its tool results have not been added yet, and a user-role
+                # notice would land BETWEEN the tool call and its results.
+                # Providers reject or mishandle that interleaving -- the same
+                # tool_use/tool_result atomicity the compaction levels work hard
+                # to preserve. (This is new exposure from the move to the tail;
+                # the old index-1 insert could never land here.)
+                #
+                # Skip rather than reposition: placing it before the assistant
+                # message would put it back INSIDE the prefix, re-introducing
+                # exactly the cache-busting this fix exists to prevent. Skipping
+                # costs nothing -- the notice is derived from sticky stats that
+                # persist, so it reappears on the very next request once the
+                # tool results have arrived and the tail is a safe place again.
+                if compacted and compacted[-1].get("tool_calls"):
+                    logger.debug(
+                        "Skipping compaction notice this request: view ends with "
+                        "an assistant message with unanswered tool_calls; the "
+                        "notice would interleave between tool_use and tool_result. "
+                        "It will be appended on the next request instead."
+                    )
+                elif level >= self.compaction_notice_min_level:
                     notice = self._format_compaction_notice()
                     if notice:
                         compacted.append(
@@ -380,9 +405,56 @@ class SimpleContextManager:
                             f"verbosity: {self.compaction_notice_verbosity})"
                         )
 
-            return compacted
+            # Strip internal bookkeeping at the module boundary -- everything
+            # above this point (sticky decisions, token accounting) still runs
+            # on messages carrying `_seq`; only what leaves has it removed.
+            return self._strip_internal_metadata(compacted)
 
-        return working_messages
+        return self._strip_internal_metadata(working_messages)
+
+    # Metadata keys that are internal bookkeeping only and must never cross
+    # the module boundary into a provider-facing view. `_seq` is sticky
+    # compaction identity (see _extract_seq): meaningless to a provider, and --
+    # because _estimate_tokens stringifies the whole message dict -- it also
+    # inflates the token estimate of every message carrying it.
+    _INTERNAL_METADATA_KEYS = frozenset({"_seq"})
+
+    def _strip_internal_metadata(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return a provider-facing view with internal-only metadata removed.
+
+        CRITICAL: stored history must KEEP `_seq` -- the sticky decision store
+        is keyed on it, so losing it would silently break stickiness (and with
+        it, prefix stability). The returned view can share dict objects with
+        `self.messages`: the no-compaction path returns stored dicts directly,
+        and even the compacted path's `dict(msg)` shallow copies share the SAME
+        nested metadata dict. So this NEVER mutates in place -- any message
+        needing a strip is rebuilt as a new dict with a new metadata dict, and
+        the stored original is left untouched.
+
+        Messages with nothing to strip pass through by identity (no copy),
+        which keeps this deterministic and byte-stable call over call.
+        """
+        result: list[dict[str, Any]] = []
+        for msg in messages:
+            meta = msg.get("metadata")
+            if not isinstance(meta, dict) or self._INTERNAL_METADATA_KEYS.isdisjoint(
+                meta
+            ):
+                result.append(msg)
+                continue
+            result.append(
+                {
+                    **msg,
+                    "metadata": {
+                        k: v
+                        for k, v in meta.items()
+                        if k not in self._INTERNAL_METADATA_KEYS
+                    },
+                }
+            )
+        return result
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
@@ -1356,6 +1428,41 @@ class SimpleContextManager:
             logger.error(
                 f"CRITICAL: System message count mismatch! Expected {system_count}, got {result_system_count}. "
                 f"This indicates a bug in compaction logic."
+            )
+
+        # === BUDGET GUARD: compaction finished, but the view is STILL over budget ===
+        # Compaction can only shrink the CONVERSATION. System messages are an
+        # un-reducible floor (see the units convention in _compact_ephemeral),
+        # so once the system share alone exceeds the target, the target is
+        # arithmetically unreachable -- no escalation level can ever get there.
+        # That state previously ended here in total silence: an over-budget
+        # view returned with no signal at all, which is the one failure mode
+        # this module cannot afford, since it manages every session's memory.
+        # Say it out loud, and name the system share as the floor so the
+        # operator knows which knob actually moves (shrink the system prompt,
+        # or raise the budget -- compacting harder will not help).
+        system_tokens = self._estimate_tokens(system_messages)
+        if budget > 0 and final_tokens > budget:
+            if system_tokens > target_tokens:
+                cause = (
+                    f"the system prompt ALONE is {system_tokens:,} tokens, which already "
+                    f"exceeds the compaction target of {target_tokens:,} tokens. System "
+                    f"messages are never compacted, so this is an un-reducible floor: NO "
+                    f"amount of conversation compaction can reach the target. Reduce the "
+                    f"system prompt or raise the budget"
+                )
+            else:
+                cause = (
+                    f"the un-compactable system floor is {system_tokens:,} tokens against "
+                    f"a target of {target_tokens:,}; the rest is protected content (last "
+                    f"user message, last {self.protected_tool_results} tool results, "
+                    f"tool_use/tool_result pairs) that compaction is not permitted to drop"
+                )
+            logger.warning(
+                f"Compaction finished OVER BUDGET at level {max_level_reached}: "
+                f"{final_tokens:,} tokens against a budget of {budget:,} "
+                f"({final_tokens / budget:.0%} of budget, target {target_tokens:,}) -- "
+                f"{cause}."
             )
 
         # Cumulative high-water mark across ALL escalations ever, not just
