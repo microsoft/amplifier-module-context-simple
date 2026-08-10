@@ -301,6 +301,164 @@ async def test_large_system_message_counts_toward_compaction_trigger():
     )
 
 
+def _estimate(messages: list[dict]) -> int:
+    """Mirror of SimpleContextManager._estimate_tokens for test-side assertions."""
+    return sum(len(str(m)) // 4 for m in messages)
+
+
+async def _build_large_system_scenario(
+    budget: int,
+    system_tokens: int,
+    turns: int,
+    tool_result_chars: int,
+    **overrides: Any,
+) -> SimpleContextManager:
+    """Large system prompt + a tool-heavy conversation that is over threshold.
+
+    The conversation is deliberately made mostly of tool results so there is
+    ample compactable (truncatable, then removable) non-system material -- the
+    scenario tests the ESCALATION comparison, not the protections.
+    """
+    config: dict[str, Any] = {
+        "max_tokens": budget,
+        "compact_threshold": 0.92,
+        "target_usage": 0.50,
+        "protected_recent": 0.20,
+        "protected_tool_results": 1,
+        "truncate_chars": 100,
+        # Disabled so effective_budget == budget (no notice reserve) and the
+        # returned view carries no trailing notice -- keeps the token math in
+        # these assertions exact and about compaction only.
+        "compaction_notice_enabled": False,
+    }
+    config.update(overrides)
+    context = SimpleContextManager(**config)
+
+    await context.add_message({"role": "system", "content": "S" * (4 * system_tokens)})
+    for i in range(turns):
+        await context.add_message({"role": "user", "content": f"task {i}"})
+        await context.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {"id": f"c{i}", "type": "function", "function": {"name": "f"}}
+                ],
+            }
+        )
+        await context.add_message(
+            {
+                "role": "tool",
+                "tool_call_id": f"c{i}",
+                "content": "R" * tool_result_chars,
+            }
+        )
+    return context
+
+
+@pytest.mark.asyncio
+async def test_escalation_does_not_stall_at_level_1_with_large_system_message():
+    """Regression test: the per-level escalation/termination comparisons must
+    compare like with like -- TOTAL (system + conversation) usage against the
+    TOTAL-budget target.
+
+    This guards the same class of bug as
+    `test_large_system_message_counts_toward_compaction_trigger`, but in a
+    different place: that one covers the TRIGGER check, this one covers the
+    per-level ESCALATION/termination checks inside _compact_ephemeral and the
+    helpers it delegates to (_truncate_tool_wave,
+    _remove_messages_with_protection).
+
+    The bug: `target_tokens` is computed from the TOTAL budget
+    (budget * target_usage), but `current_tokens` collapsed to the NON-SYSTEM
+    total as soon as any helper recomputed it from `working_messages` (which
+    excludes system messages). With a large system prompt, that means
+    compaction terminates at Level 1 after truncating a single tool result --
+    the non-system total is already under the total-budget target -- and never
+    escalates again. The effective cap silently becomes
+    `target_usage * budget + system_estimate` rather than the configured
+    `target_usage * budget`.
+    """
+    budget = 10_000
+    context = await _build_large_system_scenario(
+        budget=budget,
+        system_tokens=6_000,  # ~60% of budget
+        turns=20,
+        tool_result_chars=600,
+    )
+    target_tokens = int(budget * 0.50)
+
+    view = await context.get_messages_for_request()
+    stats = context._last_compaction_stats
+    assert stats is not None, "Test setup must actually trigger compaction"
+
+    level = stats["strategy_level"]
+    total_after = _estimate(view)
+
+    # (1) The stall signature: terminating at Level 1 while TOTAL usage is
+    # still above target means the termination check compared non-system
+    # tokens against a total-budget target.
+    assert not (level == 1 and total_after > target_tokens), (
+        f"Compaction stalled at Level {level} with total usage still "
+        f"{total_after:,} tokens (target {target_tokens:,}, "
+        f"{total_after / budget:.1%} of budget). The escalation check is "
+        f"comparing NON-SYSTEM tokens against a TOTAL-budget target."
+    )
+
+    # (2) Either we got under the total target, or escalation ran all the way
+    # to the last level and the protections (system messages, last user
+    # message, last N tool results) are what stopped us -- not a units bug.
+    assert total_after <= target_tokens or level >= 8, (
+        f"Compaction ended at Level {level} with {total_after:,} total tokens "
+        f"(target {target_tokens:,}) without exhausting the escalation ladder."
+    )
+
+    # (3) The specific broken cap: the buggy code converges to
+    # `target + system_estimate`, i.e. it can never go below the system floor
+    # plus a full target's worth of conversation. Assert the conversation
+    # portion alone is now well under target, not merely under it.
+    system_tokens_now = _estimate([m for m in view if m.get("role") == "system"])
+    non_system_after = total_after - system_tokens_now
+    assert non_system_after < target_tokens, (
+        f"Non-system portion ({non_system_after:,} tokens) was left right at "
+        f"the total-budget target ({target_tokens:,}) -- the signature of the "
+        f"effective cap degrading to `target + system_estimate`."
+    )
+
+
+@pytest.mark.asyncio
+async def test_compaction_reaches_total_budget_target_with_large_system_message():
+    """With a system prompt large enough to matter but small enough that the
+    total target is still reachable, compaction must actually land the FULL
+    request (system included) at or under `target_usage * budget`.
+
+    Under the units-mixing bug this settles at roughly
+    `target_usage * budget + system_estimate` instead -- i.e. it overshoots
+    the configured target by the entire size of the system prompt.
+    """
+    budget = 10_000
+    context = await _build_large_system_scenario(
+        budget=budget,
+        system_tokens=2_000,  # ~20% of budget -- target stays reachable
+        turns=20,
+        tool_result_chars=1_400,
+    )
+    target_tokens = int(budget * 0.50)
+
+    view = await context.get_messages_for_request()
+    stats = context._last_compaction_stats
+    assert stats is not None, "Test setup must actually trigger compaction"
+
+    total_after = _estimate(view)
+    assert total_after <= target_tokens, (
+        f"Compacted view is {total_after:,} tokens (target {target_tokens:,}, "
+        f"{total_after / budget:.1%} of budget) at Level "
+        f"{stats['strategy_level']}. The TOTAL returned view -- system message "
+        f"included -- must fit the configured target, not overshoot it by the "
+        f"size of the system prompt."
+    )
+
+
 @pytest.mark.asyncio
 async def test_no_escalation_when_sticky_view_already_under_threshold():
     """Adding a single small turn after an escalation should NOT trigger a new

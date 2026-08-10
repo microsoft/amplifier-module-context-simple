@@ -584,8 +584,16 @@ class SimpleContextManager:
             msg for msg in messages_to_compact if msg.get("role") != "system"
         ]
 
+        # UNITS CONVENTION (see the block comment below): every "are we under
+        # target yet?" comparison in this method and its helpers is TOTAL vs
+        # TOTAL. System messages are extracted from `working_messages` but are
+        # still part of the request, so this fixed, un-reducible floor must be
+        # added back to every token count derived from `working_messages`.
+        # Computed once here -- `system_messages` is never modified during
+        # compaction, so this value is constant for the whole call.
+        system_tokens = self._estimate_tokens(system_messages)
+
         if system_messages:
-            system_tokens = self._estimate_tokens(system_messages)
             logger.debug(
                 f"Preserving {len(system_messages)} system message(s) ({system_tokens:,} tokens) - "
                 f"these are NEVER compacted"
@@ -600,17 +608,42 @@ class SimpleContextManager:
         # newly appended -- which is what keeps the shared prefix byte-stable.
         working_messages = self._apply_sticky_decisions(non_system_messages)
 
-        # CRITICAL: the threshold check must be against the TOTAL (system +
-        # conversation) token count, matching the ORIGINAL semantics where
-        # `current_tokens` started at `old_tokens` (the full pre-split total)
-        # and only ever had non-system reductions subtracted from it. System
-        # tokens are a fixed, un-reducible floor -- omitting them here would
-        # silently under-count usage and could leave compaction perpetually
-        # un-triggered (or under-triggered) whenever the system prompt is a
-        # large fraction of the budget.
+        # === UNITS CONVENTION: TOTAL vs TOTAL, everywhere in this path ===
+        #
+        # `target_tokens` above is derived from the TOTAL budget
+        # (budget * target_usage), so EVERY "are we under threshold/target
+        # yet?" comparison below -- the escalation trigger, each level's
+        # termination check, and the checks inside the helpers this method
+        # calls -- must put a TOTAL (system + conversation) token count on the
+        # left-hand side. System tokens are a fixed, un-reducible floor: they
+        # cannot be compacted away, but they DO consume budget.
+        #
+        # This is deliberately one convention applied uniformly rather than
+        # two. The alternative (non-system vs `target - system_tokens`) is
+        # numerically equivalent, but it would put a number in the logs and
+        # stats that differs from the configured knob, and it yields a
+        # negative target whenever the system prompt alone exceeds the
+        # target. Total-vs-total keeps the compared number identical to the
+        # reported number (`after_tokens` / `target_tokens` in the stats and
+        # the compaction notice).
+        #
+        # Mixing the two is a real bug this code has had twice, in two
+        # different places:
+        #   1. the escalation TRIGGER below silently dropped system tokens,
+        #      so with a large system prompt compaction never fired (see
+        #      test_large_system_message_counts_toward_compaction_trigger);
+        #   2. each level's TERMINATION check compared the NON-SYSTEM total
+        #      (which is what the helpers naturally compute, since
+        #      `working_messages` excludes system messages) against the
+        #      TOTAL-budget target -- so compaction could declare victory at
+        #      Level 1 after truncating one small tool result and never
+        #      escalate again, silently turning the effective cap into
+        #      `target_usage * budget + system_estimate` (see
+        #      test_escalation_does_not_stall_at_level_1_with_large_system_message).
+        # Hence: `system_tokens` is threaded into every helper that derives a
+        # token count from `working_messages`.
         non_system_tokens = self._estimate_tokens(working_messages)
-        system_tokens_now = self._estimate_tokens(system_messages)
-        current_tokens = system_tokens_now + non_system_tokens
+        current_tokens = system_tokens + non_system_tokens
 
         needs_escalation = (
             budget > 0 and (current_tokens / budget) >= self.compact_threshold
@@ -663,6 +696,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -688,6 +722,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -712,7 +747,10 @@ class SimpleContextManager:
         level3_protection = self.protected_recent  # Use configured value
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level3_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level3_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -752,6 +790,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -776,7 +815,10 @@ class SimpleContextManager:
         level5_protection = self.protected_recent * 0.6
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level5_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level5_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -813,6 +855,7 @@ class SimpleContextManager:
             protected_tool_indices,
             target_tokens,
             current_tokens,
+            system_tokens,
         )
         total_truncated += truncated
         if current_tokens <= target_tokens:
@@ -837,7 +880,10 @@ class SimpleContextManager:
         level7_protection = self.protected_recent * 0.3
         working_messages, removed, stubbed, current_tokens = (
             self._remove_messages_with_protection(
-                working_messages, target_tokens, protected_recent=level7_protection
+                working_messages,
+                target_tokens,
+                protected_recent=level7_protection,
+                system_tokens=system_tokens,
             )
         )
         total_removed += removed
@@ -942,11 +988,22 @@ class SimpleContextManager:
         protected_indices: set[int],
         target_tokens: int,
         current_tokens: int,
+        system_tokens: int,
     ) -> tuple[int, int]:
         """
         Truncate a wave of tool results, stopping when target is reached.
 
         Returns (truncated_count, new_token_count).
+
+        UNITS: `target_tokens`, `current_tokens`, and the returned token count
+        are all TOTAL (system + conversation) counts, matching the
+        total-budget target computed in `_compact_ephemeral`. `messages` here
+        is the NON-SYSTEM working list, so `system_tokens` -- the fixed,
+        un-reducible system floor -- must be added to anything derived from
+        it. Without that, this would return a non-system count that the
+        caller then compares against a total-budget target, and truncating one
+        small tool result could make compaction declare victory while total
+        usage is still far over budget.
 
         Performance note: the original implementation called
         `self._estimate_tokens(messages)` (a full O(n) rescan of every message)
@@ -976,7 +1033,11 @@ class SimpleContextManager:
                     # First mutation in this call: establish the true baseline
                     # once (matches what _estimate_tokens(messages) would have
                     # returned immediately before this mutation).
-                    true_total = self._estimate_tokens(messages)
+                    # UNITS: + system_tokens keeps this a TOTAL, so the
+                    # `current_tokens <= target_tokens` check above stays
+                    # total-vs-total after this first mutation replaces the
+                    # caller-supplied (already total) seed value.
+                    true_total = self._estimate_tokens(messages) + system_tokens
                 old_len = len(str(msg)) // 4
                 messages[i] = self._truncate_tool_result(msg)
                 new_len = len(str(messages[i])) // 4
@@ -993,6 +1054,7 @@ class SimpleContextManager:
         messages: list[dict[str, Any]],
         target_tokens: int,
         protected_recent: float,
+        system_tokens: int,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -1000,6 +1062,15 @@ class SimpleContextManager:
         User messages are NEVER removed - they may be stubbed if still over target.
 
         Returns (new_messages, removed_count, stubbed_count, new_token_count).
+
+        UNITS: `target_tokens` and the returned token count are TOTAL (system
+        + conversation) counts, matching the total-budget target computed in
+        `_compact_ephemeral`. `messages` is the NON-SYSTEM working list, so
+        `system_tokens` -- the fixed, un-reducible system floor -- is added to
+        every count derived from it. Without that, this returns a non-system
+        count the caller compares against a total-budget target, and removal
+        stops early (or never starts) whenever the system prompt is a large
+        fraction of the budget.
         """
         # Determine protected indices
         protected_indices = set()
@@ -1068,8 +1139,9 @@ class SimpleContextManager:
         # Remove messages until under target, preserving tool pairs
         indices_to_remove: set[int] = set()
         removed_tokens_total = 0
-        base_tokens = self._estimate_tokens(
-            messages
+        # UNITS: + system_tokens makes this a TOTAL, matching `target_tokens`.
+        base_tokens = (
+            self._estimate_tokens(messages) + system_tokens
         )  # computed once; messages is constant here
         current_tokens = base_tokens
 
@@ -1158,7 +1230,9 @@ class SimpleContextManager:
             else:
                 result.append(msg)
 
-        final_tokens = self._estimate_tokens(result)
+        # UNITS: + system_tokens so the caller receives a TOTAL to compare
+        # against its total-budget `target_tokens`.
+        final_tokens = self._estimate_tokens(result) + system_tokens
 
         return result, len(indices_to_remove), len(indices_to_stub), final_tokens
 
