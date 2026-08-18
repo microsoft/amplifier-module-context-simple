@@ -1706,6 +1706,66 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         logger.info(f"Using fallback max_tokens budget: {self.max_tokens:,}")
         return self.max_tokens
 
+    # A non-text content block costs a flat approximation, never the length of
+    # its payload. A base64 image measured as len(payload)/4 reads as hundreds
+    # of thousands of tokens while actually costing ~1-2k, and because such a
+    # message is structurally protected from shrinking, the compactor's target
+    # becomes unreachable: it re-runs on every request, deleting real
+    # conversation to chase a number that cannot come down. Any fixed value in
+    # the low thousands is ~1000x closer to truth than the payload length.
+    _NON_TEXT_BLOCK_TOKENS = 1600
+    _NON_TEXT_BLOCK_TYPES = frozenset(
+        {
+            "image",
+            "image_url",
+            "input_image",
+            "input_audio",
+            "audio",
+            "video",
+            "document",
+            "file",
+        }
+    )
+
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        """Rough token estimation (chars / 4)."""
-        return sum(len(str(msg)) // 4 for msg in messages)
+        """Rough token estimation, content-aware.
+
+        Text is counted at chars/4. Non-text blocks are counted at a flat
+        per-block cost rather than the size of their encoded payload -- see
+        ``_NON_TEXT_BLOCK_TOKENS``.
+        """
+        return sum(self._estimate_message_tokens(msg) for msg in messages)
+
+    def _estimate_message_tokens(self, msg: dict[str, Any]) -> int:
+        """Estimate one message: envelope overhead plus content."""
+        if not isinstance(msg, dict):
+            return len(str(msg)) // 4
+        envelope = {key: value for key, value in msg.items() if key != "content"}
+        overhead = len(str(envelope)) // 4 if envelope else 0
+        return overhead + self._estimate_content_tokens(msg.get("content"))
+
+    def _estimate_content_tokens(self, content: Any) -> int:
+        """Estimate a content value, descending into structured blocks."""
+        if content is None:
+            return 0
+        if isinstance(content, str):
+            return len(content) // 4
+        if not isinstance(content, list):
+            return len(str(content)) // 4
+
+        total = 0
+        for block in content:
+            if not isinstance(block, dict):
+                total += len(str(block)) // 4
+                continue
+            if block.get("type") in self._NON_TEXT_BLOCK_TYPES:
+                total += self._NON_TEXT_BLOCK_TOKENS
+                continue
+            # A tool_result can carry blocks of its own, including images.
+            nested = block.get("content")
+            if isinstance(nested, (list, str)):
+                envelope = {k: v for k, v in block.items() if k != "content"}
+                total += len(str(envelope)) // 4 + self._estimate_content_tokens(nested)
+                continue
+            total += len(str(block)) // 4
+        return total

@@ -302,9 +302,20 @@ async def test_large_system_message_counts_toward_compaction_trigger():
     )
 
 
+# A probe instance: the estimator reads only class-level constants, so it needs
+# no constructed state.
+_ESTIMATOR_PROBE = SimpleContextManager.__new__(SimpleContextManager)
+
+
 def _estimate(messages: list[dict]) -> int:
-    """Mirror of SimpleContextManager._estimate_tokens for test-side assertions."""
-    return sum(len(str(m)) // 4 for m in messages)
+    """Delegate to the real estimator instead of mirroring it.
+
+    This was a hand-copied `sum(len(str(m)) // 4 ...)` mirror, which silently
+    went stale the moment estimation became content-aware -- the assertions
+    then compared production against a formula production no longer used.
+    Measuring "exactly as the module measures it" means calling the module.
+    """
+    return _ESTIMATOR_PROBE._estimate_tokens(messages)
 
 
 async def _build_large_system_scenario(
