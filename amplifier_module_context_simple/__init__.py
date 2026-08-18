@@ -1110,9 +1110,10 @@ class SimpleContextManager:
                     # total-vs-total after this first mutation replaces the
                     # caller-supplied (already total) seed value.
                     true_total = self._estimate_tokens(messages) + system_tokens
-                old_len = len(str(msg)) // 4
+                # UNITS: content-aware on both sides, matching `true_total`.
+                old_len = self._estimate_message_tokens(msg)
                 messages[i] = self._truncate_tool_result(msg)
-                new_len = len(str(messages[i])) // 4
+                new_len = self._estimate_message_tokens(messages[i])
                 true_total += new_len - old_len
                 truncated += 1
                 current_tokens = true_total
@@ -1201,7 +1202,13 @@ class SimpleContextManager:
         # `messages` is constant here, the base total only needs computing
         # once, and the removed-token total only needs an O(1) delta per
         # newly-removed index.
-        token_lens = [len(str(msg)) // 4 for msg in messages]
+        # UNITS: must match `base_tokens` below, which is content-aware. The
+        # old `len(str(msg)) // 4` counted a base64 payload as prose, so
+        # removing one image-bearing message credited ~100k tokens against a
+        # baseline that had counted it at ~1.6k -- `current_tokens` went hard
+        # negative, the loop exited on its first candidate, and compaction
+        # silently UNDER-shot. Deltas and baseline must come from one estimator.
+        token_lens = [self._estimate_message_tokens(msg) for msg in messages]
         tool_call_id_to_indices: dict[str, list[int]] = {}
         for idx, m in enumerate(messages):
             tcid = m.get("tool_call_id")
