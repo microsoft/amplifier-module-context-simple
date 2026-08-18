@@ -1522,27 +1522,67 @@ class SimpleContextManager:
             "_original_tokens": original_tokens,
         }
 
+    def _stub_text(self, content: str) -> str:
+        """The stub body: a 50-char preview of what was there."""
+        preview = content[:50].replace("\n", " ").strip()
+        if len(content) > 50:
+            preview += "..."
+        return f'[User message compacted - original: "{preview}"]'
+
     def _stub_user_message(self, msg: dict[str, Any]) -> dict[str, Any]:
         """
         Create a stub for a user message to preserve thread while reducing tokens.
 
+        Handles BOTH content shapes. A message whose content is a list of blocks
+        used to be returned unchanged, because the guard was
+        ``isinstance(content, str)`` -- so a multimodal message was structurally
+        exempt from the only mechanism that could shrink it, while a small
+        text-only message carrying the user's actual instructions could still be
+        stubbed. Protection ran by TYPE rather than by cost.
+
+        Non-text blocks are preserved rather than stubbed: they are counted at a
+        flat cost by ``_estimate_content_tokens``, so removing one buys almost
+        nothing and loses the attachment. Only the text is compacted.
+
         Returns a NEW dict - does not modify the original.
         """
         content = msg.get("content", "")
-        if not isinstance(content, str) or len(content) <= 80:
-            return msg  # Too short to stub
 
-        # Take first 50 chars, clean up for display
-        preview = content[:50].replace("\n", " ").strip()
-        if len(content) > 50:
-            preview += "..."
+        if isinstance(content, str):
+            if len(content) <= 80:
+                return msg  # Too short to stub
+            return {
+                **msg,
+                "content": self._stub_text(content),
+                "_stubbed": True,
+                "_original_length": len(content),
+            }
 
-        return {
-            **msg,
-            "content": f'[User message compacted - original: "{preview}"]',
-            "_stubbed": True,
-            "_original_length": len(content),
-        }
+        if isinstance(content, list):
+            text_blocks = [
+                block
+                for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            ]
+            joined = "".join(str(block.get("text", "")) for block in text_blocks)
+            if len(joined) <= 80:
+                return msg  # Nothing worth stubbing; attachments stay as they are
+            preserved = [
+                block
+                for block in content
+                if not (isinstance(block, dict) and block.get("type") == "text")
+            ]
+            return {
+                **msg,
+                "content": [
+                    {"type": "text", "text": self._stub_text(joined)},
+                    *preserved,
+                ],
+                "_stubbed": True,
+                "_original_length": len(joined),
+            }
+
+        return msg
 
     def _format_compaction_notice(self) -> str:
         """
