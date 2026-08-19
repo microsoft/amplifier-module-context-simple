@@ -170,7 +170,13 @@ class SimpleContextManager:
         # potentially shifting) on every single get_messages_for_request()
         # call. See _apply_sticky_decisions() / _compact_ephemeral().
         self._next_seq: int = 0
-        self._removed_seqs: set[int] = set()
+        # seq -> why it was removed. A bare set answered "was this removed?"
+        # but never "why", and every diagnosis during the incident
+        # investigation had to reconstruct intent from logs that no longer
+        # existed. Membership tests, `len()`, and iteration are identical on a
+        # dict, so this is prefix-neutral by construction: no compaction
+        # decision reads the reason.
+        self._removed_seqs: dict[int, str] = {}
         self._truncated_seqs: set[int] = set()
         self._stubbed_seqs: set[int] = set()
         # Cumulative highest progressive strategy level (1-8) ever reached.
@@ -500,7 +506,7 @@ class SimpleContextManager:
             restamped.append({**msg, "metadata": meta})
         self.messages = restamped
         self._next_seq = len(restamped)
-        self._removed_seqs = set()
+        self._removed_seqs = {}
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
         self._sticky_level = 0
@@ -515,7 +521,7 @@ class SimpleContextManager:
         """Clear all messages."""
         self.messages = []
         self._next_seq = 0
-        self._removed_seqs = set()
+        self._removed_seqs = {}
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
         self._sticky_level = 0
@@ -579,11 +585,16 @@ class SimpleContextManager:
         """
         return (msg.get("metadata") or {}).get("_seq")
 
-    def _record_removed(self, msg: dict[str, Any]) -> None:
-        """Permanently record that a message has been removed by compaction."""
+    def _record_removed(self, msg: dict[str, Any], reason: str = "unspecified") -> None:
+        """Permanently record that a message has been removed by compaction.
+
+        *reason* is diagnostic only -- nothing in the compaction path reads it.
+        It exists because "663 messages were removed" is not actionable and
+        "663 messages were removed chasing an unreachable target at level 8" is.
+        """
         seq = self._extract_seq(msg)
         if seq is not None:
-            self._removed_seqs.add(seq)
+            self._removed_seqs[seq] = reason
             # A message can only be in one terminal state; removal supersedes
             # any earlier truncate/stub decision for the same seq.
             self._truncated_seqs.discard(seq)
@@ -1140,7 +1151,10 @@ class SimpleContextManager:
                 if indices_to_remove:
                     # Sticky: record before filtering the list out from under them.
                     for i in indices_to_remove:
-                        self._record_removed(working_messages[i])
+                        self._record_removed(
+                            working_messages[i],
+                            f"level-{self._sticky_level} sweep of already-stubbed messages",
+                        )
                     working_messages = [
                         msg
                         for i, msg in enumerate(working_messages)
@@ -1451,7 +1465,10 @@ class SimpleContextManager:
         # already absent from `messages` by the time this runs; stub
         # candidates explicitly exclude already-`_stubbed` messages above).
         for i in indices_to_remove:
-            self._record_removed(messages[i])
+            self._record_removed(
+                messages[i],
+                f"level-{self._sticky_level} removal, target {target_tokens:,} tokens",
+            )
         for i in indices_to_stub:
             self._record_stubbed(messages[i])
 

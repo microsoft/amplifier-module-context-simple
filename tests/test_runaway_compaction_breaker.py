@@ -152,5 +152,9 @@ async def test_tripping_freezes_rather_than_re_deriving() -> None:
     await context.add_message({"role": "user", "content": "another turn " * 300})
     await context.get_messages_for_request()
 
-    assert context._removed_seqs == removed_at_trip, "kept deleting after the trip"
+    # Compare KEY SETS: `_removed_seqs` maps seq -> why it was removed, so a
+    # bare `== removed_at_trip` compares a dict against a set and is always
+    # False. The invariant under test is "no new removals", not "the reason
+    # strings are byte-identical".
+    assert set(context._removed_seqs) == removed_at_trip, "kept deleting after the trip"
     assert context._sticky_level == level_at_trip, "kept escalating after the trip"
