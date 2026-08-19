@@ -861,6 +861,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level3_protection,
                 system_tokens=system_tokens,
+                budget=budget,
             )
         )
         total_removed += removed
@@ -929,6 +930,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level5_protection,
                 system_tokens=system_tokens,
+                budget=budget,
             )
         )
         total_removed += removed
@@ -994,6 +996,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level7_protection,
                 system_tokens=system_tokens,
+                budget=budget,
             )
         )
         total_removed += removed
@@ -1166,6 +1169,7 @@ class SimpleContextManager:
         target_tokens: int,
         protected_recent: float,
         system_tokens: int,
+        budget: int = 0,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -1261,6 +1265,40 @@ class SimpleContextManager:
             self._estimate_tokens(messages) + system_tokens
         )  # computed once; messages is constant here
         current_tokens = base_tokens
+
+        # STOP CONDITION FEASIBILITY.
+        #
+        # The loop below exits when `current_tokens <= target_tokens`. If
+        # removing EVERY eligible candidate still cannot reach the target, that
+        # condition never becomes true, so the loop runs to exhaustion and
+        # deletes everything it is allowed to -- permanently, because
+        # `_removed_seqs` is re-applied on every later rebuild -- for no gain.
+        #
+        # The target is unreachable whenever un-compactable content alone
+        # exceeds it. System messages are one way (guarded earlier, before the
+        # level ladder) but NOT the only one: the last user message and the last
+        # `protected_tool_results` tool results are equally immune. One
+        # `read_file` on a large file puts an enormous tool result inside that
+        # protected window and arms this.
+        #
+        # Measured on this module before the clamp, with a 16-token system
+        # prompt and no images -- so the earlier system-floor guard cannot fire:
+        # a 64-message conversation collapsed to 6 messages on the FIRST call at
+        # maximum level, 58 messages removed permanently, and by the second call
+        # the view was 229 tokens against a 40,000 budget. The condition that
+        # caused it is TRANSIENT -- the blob leaves the protected tool window
+        # within a few turns and becomes truncatable -- but the removals are not.
+        #
+        # So: aim at the requirement that is actually achievable. `target_usage`
+        # is a hysteresis preference; fitting the budget is the contract. If even
+        # the budget is out of reach this changes nothing and the loop behaves
+        # exactly as before.
+        if budget > 0:
+            achievable_floor = base_tokens - sum(
+                token_lens[i] for i in removal_candidates
+            )
+            if achievable_floor > target_tokens:
+                target_tokens = max(target_tokens, budget)
 
         for i in removal_candidates:
             if current_tokens <= target_tokens:
