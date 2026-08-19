@@ -177,6 +177,9 @@ class SimpleContextManager:
         # Reported in compaction stats / notice so the LLM sees the total
         # accumulated effect, not just the most recent escalation step.
         self._sticky_level: int = 0
+        # Log-once latch for an arithmetically unreachable target. Reset with
+        # the rest of the sticky state so a genuinely new situation speaks up.
+        self._infeasible_target_reported: bool = False
 
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
@@ -488,6 +491,7 @@ class SimpleContextManager:
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
         self._sticky_level = 0
+        self._infeasible_target_reported = False
         self._last_compaction_stats = None
         logger.info(f"Restored {len(messages)} messages to context")
 
@@ -499,6 +503,7 @@ class SimpleContextManager:
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
         self._sticky_level = 0
+        self._infeasible_target_reported = False
         self._last_compaction_stats = None
         logger.info("Context cleared")
 
@@ -720,6 +725,39 @@ class SimpleContextManager:
         needs_escalation = (
             budget > 0 and (current_tokens / budget) >= self.compact_threshold
         )
+
+        # FEASIBILITY PRE-CHECK. System messages are never compacted, so once
+        # their share alone exceeds the target, the target is arithmetically
+        # unreachable -- no escalation level can ever get there. Escalating
+        # anyway does not fail; it deletes real conversation on every request to
+        # chase a number that cannot come down, pinned at maximum level, while
+        # `after_tokens` never moves.
+        #
+        # Measured on this module before the check existed, with a 12,153-token
+        # system prompt against a 40,000 budget (target 10,000) and NO images:
+        # level pinned at 8 from the fifth call, `after_tokens` stuck at ~14,776,
+        # and `_removed_seqs` ratcheting 6 -> 12 -> 18 -> 30 -> 42 -> 54 of 58
+        # messages ever added, the returned view sawtoothing 4 -> 8 -> 4 as
+        # history regrew and was destroyed again. Silently: the existing
+        # over-budget warning below is gated on `> budget`, and this state sits
+        # at 37% of budget.
+        #
+        # Only skip while the view still fits the ACTUAL budget. Over budget,
+        # a partial reduction beats none and we escalate as before.
+        target_unreachable = system_tokens > target_tokens
+        if needs_escalation and target_unreachable and current_tokens <= budget:
+            if not self._infeasible_target_reported:
+                logger.warning(
+                    f"Compaction target is unreachable and further escalation would only "
+                    f"destroy conversation: the system prompt alone is {system_tokens:,} "
+                    f"tokens against a target of {target_tokens:,}. System messages are "
+                    f"never compacted, so no level can reach the target. The view is "
+                    f"{current_tokens:,} tokens, still within the {budget:,} budget, so it "
+                    f"is being returned as-is. Reduce the system prompt or raise the budget."
+                )
+                self._infeasible_target_reported = True
+            needs_escalation = False
+
         if not needs_escalation:
             # Sticky state alone already keeps us under the threshold that
             # triggered compaction in the first place -- nothing NEW needs
@@ -1449,7 +1487,12 @@ class SimpleContextManager:
         # operator knows which knob actually moves (shrink the system prompt,
         # or raise the budget -- compacting harder will not help).
         system_tokens = self._estimate_tokens(system_messages)
-        if budget > 0 and final_tokens > budget:
+        # Fires on the DESTRUCTIVE condition, not only when over budget. A view
+        # can sit far under budget while compaction runs at maximum level and
+        # deletes on every request, which is the state that previously ended here
+        # in total silence -- the gate was `> budget` while the damage begins at
+        # `> target_tokens`.
+        if budget > 0 and (final_tokens > budget or system_tokens > target_tokens):
             if system_tokens > target_tokens:
                 cause = (
                     f"the system prompt ALONE is {system_tokens:,} tokens, which already "
