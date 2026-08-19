@@ -180,6 +180,12 @@ class SimpleContextManager:
         # Log-once latch for an arithmetically unreachable target. Reset with
         # the rest of the sticky state so a genuinely new situation speaks up.
         self._infeasible_target_reported: bool = False
+        # Runaway-compaction breaker. Counts CONSECUTIVE escalations that failed
+        # to meaningfully reduce the post-compaction token count. Frequency alone
+        # is the wrong signal -- see `_MAX_INEFFECTIVE_ESCALATIONS`.
+        self._ineffective_escalations: int = 0
+        self._last_after_tokens: int | None = None
+        self._escalation_breaker_reported: bool = False
 
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
@@ -323,6 +329,13 @@ class SimpleContextManager:
         token_count = self._estimate_tokens(working_messages)
 
         # Check if compaction needed (using effective budget with notice reserve deducted)
+        if not self._should_compact(token_count, effective_budget):
+            # No compaction needed at all: the strongest possible evidence that
+            # pressure is relieved, so the runaway breaker re-arms here too.
+            # Its bookkeeping otherwise lives inside `_compact_ephemeral`, which
+            # by definition does not run on this path -- leaving a stale count
+            # that could trip the breaker on an unrelated later burst.
+            self._ineffective_escalations = 0
         if self._should_compact(token_count, effective_budget):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
@@ -492,6 +505,9 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._infeasible_target_reported = False
+        self._ineffective_escalations = 0
+        self._last_after_tokens = None
+        self._escalation_breaker_reported = False
         self._last_compaction_stats = None
         logger.info(f"Restored {len(messages)} messages to context")
 
@@ -504,6 +520,9 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._infeasible_target_reported = False
+        self._ineffective_escalations = 0
+        self._last_after_tokens = None
+        self._escalation_breaker_reported = False
         self._last_compaction_stats = None
         logger.info("Context cleared")
 
@@ -756,6 +775,50 @@ class SimpleContextManager:
                     f"is being returned as-is. Reduce the system prompt or raise the budget."
                 )
                 self._infeasible_target_reported = True
+            needs_escalation = False
+
+        # RUNAWAY BREAKER.
+        #
+        # Every guard above tests whether THIS call's target is reachable. None
+        # of them notices that the same answer has been reached over and over.
+        # The incident ran 235 compactions across 266 model calls, every one at
+        # maximum level, `after_tokens` never moving -- and the only signal was
+        # an INFO line that fired 235 times and nobody saw.
+        #
+        # FREQUENCY IS THE WRONG SIGNAL, and that was the first design here.
+        # A session genuinely over budget must keep compacting on every call;
+        # freezing it there converts "destroying conversation" into "guaranteed
+        # provider rejection", which is worse. The test that caught this is
+        # `test_going_over_budget_still_escalates` -- under a frequency breaker
+        # the view grew to 61,190 tokens against a 40,000 budget.
+        #
+        # The signal that actually separates "this workload needs compacting"
+        # from "compaction is not working" is EFFECTIVENESS: in the incident
+        # `after_tokens` never once dropped below 1,797,300 across all 235
+        # passes. Zero improvement, 235 times.
+        #
+        # Freezing is PREFIX-SAFE by construction: the sticky decisions already
+        # made are re-applied unchanged, which is strictly more stable than
+        # re-deriving them. Same shape as the two guards above -- decide whether
+        # to escalate, never what the view contains.
+        if (
+            needs_escalation
+            and self._ineffective_escalations >= self._MAX_INEFFECTIVE_ESCALATIONS
+        ):
+            if not self._escalation_breaker_reported:
+                logger.error(
+                    f"Compaction has escalated {self._ineffective_escalations} "
+                    f"times in a row without reducing the result (currently "
+                    f"{current_tokens:,} tokens against a {budget:,} budget, "
+                    f"target {target_tokens:,}, cumulative level "
+                    f"{self._sticky_level}). Further escalation is deleting "
+                    f"conversation without moving the number, so it is being "
+                    f"stopped and the existing view returned. This is a "
+                    f"configuration or estimation problem, not a workload "
+                    f"problem: check the system prompt size, the token budget, "
+                    f"and whether any single message is larger than the target."
+                )
+                self._escalation_breaker_reported = True
             needs_escalation = False
 
         if not needs_escalation:
@@ -1583,9 +1646,37 @@ class SimpleContextManager:
         # not the per-call deltas passed in -- this reports the total
         # accumulated effect on the conversation, which is what the notice
         # and any observability consumer actually wants to know.
+        # EFFECTIVENESS BOOKKEEPING for the runaway breaker at the escalation
+        # gate. A pass that cannot move the result is the incident's signature:
+        # `after_tokens` never once dropped below 1,797,300 across all 235
+        # passes. Compare against the PREVIOUS result rather than this pass's
+        # own before/after, because the pathology is that successive passes all
+        # land on the same number.
+        # A pass is INEFFECTIVE when it finishes still over the real budget.
+        #
+        # Two earlier definitions were wrong, and each was caught by
+        # `test_going_over_budget_still_escalates` rather than by reasoning:
+        #
+        #   - "escalated N times in a row" punishes a session that is genuinely
+        #     over budget and must compact on every call.
+        #   - "did not reduce vs the previous pass" punishes compaction that is
+        #     correctly HOLDING THE LINE while new turns arrive. A result that
+        #     plateaus just under budget is compaction working, not failing.
+        #
+        # Landing over budget is the honest failure signal: the view being
+        # returned will not fit, so the pass did not accomplish the one thing it
+        # exists to do. In the incident every pass landed at ~1.84x the budget,
+        # 235 times running.
+        if budget > 0 and final_tokens > budget:
+            self._ineffective_escalations += 1
+        else:
+            self._ineffective_escalations = 0
+        self._last_after_tokens = final_tokens
+
         stats = {
             "before_tokens": old_tokens,
             "after_tokens": final_tokens,
+            "ineffective_escalations": self._ineffective_escalations,
             "before_messages": old_count,
             "after_messages": len(final_messages),
             "messages_removed": len(self._removed_seqs),
@@ -1626,6 +1717,21 @@ class SimpleContextManager:
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
+
+    _MAX_INEFFECTIVE_ESCALATIONS = 10
+    """Consecutive INEFFECTIVE escalations before the runaway breaker trips.
+
+    The incident ran **235 compactions across 266 model calls**, all pinned at
+    maximum strategy, with `after_tokens` never once dropping below 1,797,300.
+    Zero improvement, 235 times. Nothing anywhere counted, and the only signal
+    was an INFO line that fired 235 times and nobody saw.
+
+    Counting *frequency* was the obvious first design and it is wrong: a session
+    that is genuinely over budget must keep compacting every call, and freezing
+    it there converts "destroying conversation" into "guaranteed provider
+    rejection". Ineffectiveness is the signal that actually separates "this
+    workload needs compacting" from "compaction is not working".
+    """
 
     def _stub_text(self, content: str) -> str:
         """The stub body: a 50-char preview of what was there."""
