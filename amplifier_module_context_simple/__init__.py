@@ -1027,15 +1027,26 @@ class SimpleContextManager:
             if first_user_idx is not None and first_user_idx != last_user_idx:
                 first_msg = working_messages[first_user_idx]
                 if not first_msg.get("_stubbed"):
-                    content = first_msg.get("content", "")
-                    if isinstance(content, str) and len(content) > 80:
-                        working_messages[first_user_idx] = self._stub_user_message(
-                            first_msg
-                        )
+                    # Let `_stub_user_message` decide. An `isinstance(content,
+                    # str)` guard here would re-impose the shape-based exemption
+                    # that commit 56fecd6 removed FROM THE HELPER -- the helper
+                    # handles block content, and a guard at the call site makes
+                    # that branch unreachable from production.
+                    before_tokens = self._estimate_message_tokens(first_msg)
+                    stubbed_msg = self._stub_user_message(first_msg)
+                    if stubbed_msg is not first_msg:
+                        working_messages[first_user_idx] = stubbed_msg
                         # Sticky: record before `first_msg` var is superseded.
                         self._record_stubbed(first_msg)
                         total_stubbed += 1
-                        savings = (len(content) - 70) // 4
+                        # UNITS: measured, not derived from `len(content)`.
+                        # `len()` on block content is a BLOCK COUNT, so the old
+                        # `(len(content) - 70) // 4` was arithmetic on the wrong
+                        # quantity the moment the shape stopped being a string --
+                        # the same unit-mismatch class as ad7936a.
+                        savings = before_tokens - self._estimate_message_tokens(
+                            stubbed_msg
+                        )
                         current_tokens -= savings
                         logger.info(
                             f"Level 8: Stubbed first user message (saved ~{savings} tokens)"
@@ -1358,10 +1369,16 @@ class SimpleContextManager:
             if current_tokens <= target_tokens:
                 break
             msg = messages[i]
-            content = msg.get("content", "")
-            if isinstance(content, str) and len(content) > 80:
+            # Same reasoning as the Level 8 site above: the helper owns the
+            # "is there anything worth stubbing here" decision for BOTH content
+            # shapes, and savings are measured rather than derived from
+            # `len(content)`, which is a block count for block content.
+            stubbed_msg = self._stub_user_message(msg)
+            if stubbed_msg is not msg:
                 indices_to_stub.add(i)
-                savings = (len(content) - 70) // 4  # Stub is ~70 chars
+                savings = self._estimate_message_tokens(
+                    msg
+                ) - self._estimate_message_tokens(stubbed_msg)
                 current_tokens -= savings
 
         # Sticky: record these NEW decisions by stable seq id before building
