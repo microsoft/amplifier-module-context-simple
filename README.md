@@ -168,10 +168,31 @@ a corresponding quality regression.
 
 ## Summary compaction strategy (`compaction_strategy`)
 
-> **Status: opt-in, gated on a T0/T1 DTU eval.** Ships behind
-> `compaction_strategy: "progressive"` (default, byte-identical to this
-> module's behavior before this feature existed). Do not flip the default
-> until the eval clears.
+> ### :warning: Opt-in, experimental. Do not enable by default.
+>
+> Ships behind `compaction_strategy: "progressive"` (default,
+> byte-identical to this module's behavior before this feature existed).
+>
+> A T0/T1 evaluation has now run (n=3 vs. n=5 baselines, S5-CRAC
+> scenario). Its two headline results, stated plainly:
+>
+> - **No retention benefit is demonstrated.** T1 scored 94.0 mean vs.
+>   T0's 94.4 — statistically and practically indistinguishable, and on a
+>   metric that is **saturated**: both arms score a perfect 40/40 planted
+>   constraints and 20/20 post-compaction in *every* run, and have across
+>   20+ historical runs. The scenario cannot discriminate retention. This
+>   is *not* evidence that summaries retain worse — it is the absence of
+>   evidence either way. A discriminating scenario does not exist yet.
+> - **Measured +83% run cost** ($4.73 vs. $2.58) and **+84% compaction
+>   boundaries** (39.7 vs. 21.6) on a compaction-heavy workload, via a
+>   boundary-refire loop (see "Known issue" below). This **falsifies** the
+>   pre-registered prediction that cache economics would land in T0's
+>   band, in the worse direction.
+>
+> The mechanism itself is validated and correct (all four pre-registered
+> gates pass, including the two the donor design failed catastrophically).
+> This flag exists so the strategy can be studied further, not because it
+> is known to be better. **Do not enable it by default anywhere.**
 
 ### The idea, and where it comes from
 
@@ -268,17 +289,73 @@ config = {
 }
 ```
 
-### What this is -- and isn't -- expected to fix
+### What this was built to buy, and what the evaluation actually measured
 
-**Retention/quality play, not a cache-cost play.** Like the progressive
-ladder, this strategy still *shrinks* what the model sees each turn (via
-sticky removal) -- under a grow-only prompt cache, that is still a cold
-rebuild of the shared prefix at the moment of absorption, exactly like
-today's compaction. Summarization does not, by itself, reduce cache waste.
-What changes is *what survives*: a retained, if lossy, account of the
-absorbed span instead of nothing. If constraint retention doesn't measurably
-improve over the progressive baseline in the gating eval, this is a flag to
-turn off, not a design to keep by default.
+**The motivation** was retention: the progressive ladder is lossy, so an
+LLM summary that keeps a lossy-but-real account of an absorbed span
+*should* retain more than dropping it outright. That was and remains the
+reason to build this. It is **not** a cache-cost play — like the
+progressive ladder, this strategy still shrinks what the model sees each
+turn, which under a grow-only prompt cache is still a cold rebuild of the
+shared prefix at the moment of absorption.
+
+**What the T0/T1 evaluation measured** (n=3 T1 runs vs. n=5 reused T0
+baselines, S5-CRAC scenario, capture root
+`.amplifier/evaluation/treatment-validation/20260902-t0t1/`):
+
+| Gate | Requirement | Result |
+|---|---|---|
+| **G1 retention** | T1 S5 ≥ T0 band (92–95) | **PASS — but vacuous.** T1 [95, 95, 92] vs. T0 mean 94.4. See note below. |
+| **G2 tool-pairs** | zero `InvalidRequestError` | **PASS** — 0 across all runs (the donor design: 29/30 turns failed) |
+| **G3 system prompt** | agent `instructions` byte-stable | **PASS** — 1 hash per run, all 3 runs (the `role: "user"` fix holds under a real provider round trip; the donor's agent prompt moved 44,516 → 1,113 → 45,310 within one run) |
+| **G4 append-only** | no history re-minting | **PASS** — `ID_ONLY` divergences 0/0/0 |
+
+> **G1 passed but proves nothing about retention.** `b_constraints` is
+> 40/40 and `c_post_compaction` is 20/20 in **every run of both arms**,
+> and has been across 20+ historical runs. The only moving part is the
+> task score. S5-CRAC is at its ceiling: both strategies already hold
+> every planted constraint perfectly, so a "≥ baseline" check against a
+> saturated metric is a floor check, not a win. **No retention advantage
+> is demonstrated by this evaluation.** Establishing one requires a
+> scenario with headroom — one where the progressive baseline measurably
+> *loses* constraints. That scenario does not exist yet (TBD).
+
+Summaries do fire correctly and do carry the material: 63–95 requests per
+run carried a summary, all `role: "user"` (zero `role: "system"`), up to
+67 messages absorbed in a single round, and the emitted summaries restate
+all five planted constraints verbatim. The mechanism works. What is
+unproven is that the mechanism *helps*.
+
+### Known issue: boundary refire roughly doubles compaction cost
+
+Measured on the same evaluation, and **worse than the pre-registered
+prediction** (which expected cache economics in T0's band):
+
+| Metric | T0 (progressive) | T1 (summary) | Delta |
+|---|---:|---:|---:|
+| Cache waste | 29.0% | **53.9%** | **+24.9pp** (no overlap between arms) |
+| Cache-read share | 0.714 | **0.537** | −0.177 |
+| Run cost | $2.58 | **$4.73** | **+83%** |
+| Compaction boundaries | 21.6 | **39.7** | **+84%** |
+
+**Mechanism.** The summarizer itself is only 8–11% of run cost — it is
+not the driver. The dominant cost is the near-doubling of compaction
+boundaries, and every boundary is a guaranteed cold rebuild against a
+grow-only cache. Absorbing a span *shrinks* the request, which pulls
+usage back below `summary_trigger` (0.60) sooner, which fires another
+absorb/compact cycle sooner: a refire loop. Under an aggressive
+compaction config (the evaluation forced `max_tokens: 45000`) the early
+trigger — deliberately set well below `compact_threshold` to give the
+async call time to finish — drives the extra cycles.
+
+**Not fixed in this change, tracked honestly.** The obvious levers, none
+of which are implemented here: a post-absorb **cooldown** before the
+trigger may refire; an **absolute floor** on absorbed-span size so small
+absorptions cannot cycle; **hysteresis** on `summary_trigger` (arm at
+0.60, disarm only after usage falls below some lower band). Tuning
+`summary_trigger` upward is the cheapest first experiment. Any of these
+should be validated against the same cost metrics before this flag is
+enabled anywhere by default.
 
 ## Dependencies
 

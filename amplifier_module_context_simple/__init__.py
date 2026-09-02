@@ -54,10 +54,25 @@ Summary Compaction Strategy (opt-in, default off -- see config
   • The summary message is role="user" (never "system"), wrapped in a
     `<system-reminder source="context-summary">` envelope, and persists as
     stable history (not ephemeral, unlike the tail compaction notice).
-  • Retention/quality play, NOT a cache-cost play: like the progressive
-    ladder, this still shrinks what the model sees each turn (via sticky
-    removal), so it does not by itself reduce cache waste under a
-    grow-only cache. What changes is *what survives* compaction.
+  • MOTIVATED by retention (the progressive ladder is lossy; a summary
+    keeps a lossy-but-real account of the absorbed span). It is NOT a
+    cache-cost play: like the progressive ladder, this still shrinks what
+    the model sees each turn, which under a grow-only cache is still a
+    cold rebuild at the moment of absorption.
+  • MEASURED (T0/T1 eval, n=3 vs n=5, S5-CRAC -- see README "Summary
+    compaction strategy" for the full table): the mechanism is validated
+    (zero tool-pair errors; agent system prompt byte-stable, 1 hash/run;
+    append-only) but NO retention benefit is demonstrated -- 94.0 vs 94.4
+    on a SATURATED metric (both arms 40/40 constraints, 20/20
+    post-compaction, every run). Absence of evidence, not evidence of
+    parity-by-design; a discriminating scenario does not exist yet.
+  • KNOWN ISSUE, measured: +83% run cost and +84% compaction boundaries
+    vs the progressive baseline, via a boundary-refire loop (absorbing a
+    span shrinks the request below summary_trigger, so it refires
+    sooner). The summarizer itself is only 8-11% of run cost. Not fixed
+    here; see README for the candidate levers (cooldown / absolute floor
+    / trigger hysteresis). OPT-IN, EXPERIMENTAL -- do not enable by
+    default.
 """
 
 # Amplifier module metadata
@@ -173,7 +188,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               strategy starts an async background summarization call, well
               ahead of compact_threshold so it has time to finish before
               tokens must actually be shed (default: 0.60). Only consulted
-              when compaction_strategy == "summary".
+              when compaction_strategy == "summary". KNOWN ISSUE: because
+              absorbing a span shrinks the request back below this
+              fraction, an aggressive (low) trigger refires sooner and
+              measurably multiplies compaction boundaries -- +84%
+              boundaries / +83% run cost in the T0/T1 eval. Raising this
+              is the cheapest lever; see README "Known issue: boundary
+              refire".
             - summarization_model: Model identifier passed to the summarizer's
               ChatRequest (default: None, i.e. provider default).
             - summarization_prompt_path: Path to a file overriding
@@ -343,6 +364,11 @@ class SimpleContextManager:
             summary_trigger: Usage fraction (0.0-1.0) at which the summary
                 strategy kicks off an async background summarization call.
                 Only consulted when compaction_strategy == "summary".
+                KNOWN ISSUE (measured): a low trigger refires soon after
+                each absorption shrinks the request, multiplying
+                compaction boundaries (+84%) and run cost (+83%) -- see
+                module docstring and README "Known issue: boundary
+                refire".
             summarization_model: Model identifier for the summarizer's own
                 ChatRequest. None uses the provider's default model.
             summarization_prompt_path: Path to a file overriding
