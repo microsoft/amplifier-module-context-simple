@@ -142,6 +142,37 @@ Tool-result budget and spill (opt-in, default off -- see config
     mutate an already-cached prefix -- which, under a grow-only prompt
     cache, is a full cold rebuild. A failed write yields a pointer to a
     missing file (visible, recoverable) rather than a silent byte change.
+
+Last-User Replay After a Compaction Boundary (opt-in, default off -- see
+config `replay_last_user_on_compaction`):
+  • MOTIVATION (design lens): the highest-value retained tier is the
+    USER'S OWN VERBATIMS. A compaction boundary can leave the most recent
+    user instruction sitting far from the attention-strongest tail
+    position, behind a wall of tool results the ladder chose to keep.
+  • When enabled AND a compaction boundary actually occurs, this APPENDS
+    (never moves, never removes) a copy of the most recent real user
+    message as the last item before the dynamic tail (the compaction
+    notice), wrapped in a `<system-reminder source="context-replay">`
+    envelope so it reads as a reminder of a standing instruction and is
+    never mistaken for a NEW request.
+  • APPEND-ONLY BY CONSTRUCTION -- the measured cache-HIT shape. Nothing
+    before the append point moves, no `_seq` is consumed, no sticky
+    decision is touched, and `self.messages` is never modified. The
+    replay is ephemeral (metadata.ephemeral=True), so it joins the
+    compaction notice in the Anthropic provider's trailing-ephemeral
+    exclusion walk and does not displace the cache breakpoint.
+  • Tool-pair integrity untouched: it uses the SAME tail guard as the
+    compaction notice and skips entirely when the view ends on an
+    assistant message with unanswered tool_calls.
+  • FIRES ONCE PER BOUNDARY, not once per request: the boundary identity
+    is (sticky progressive level, summary-absorbed count), so a request
+    that merely re-applies an existing sticky decision does not re-emit.
+  • NOT MEASURED. This is a mechanism, shipped default-off, with NO
+    quality evidence behind it: the retention scenario that could
+    discriminate (S7) does not exist yet, and S5-CRAC is saturated
+    (40/40 constraints, 20/20 post-compaction in every arm of every
+    probe 1-6). Do not enable by default, and do not claim a quality
+    benefit, until a discriminating eval has run.
 """
 
 # Amplifier module metadata
@@ -221,6 +252,70 @@ _TOOL_RESULT_CHARS_PER_TOKEN = 4
 # messages (so they are never re-absorbed into a later summary).
 _SUMMARY_ENVELOPE_SOURCE = "context-summary"
 _SUMMARY_METADATA_TYPE = "context_summary"
+
+# The last-user-replay envelope's source tag and metadata source marker
+# (opt-in `replay_last_user_on_compaction`; see module docstring
+# "Last-User Replay After a Compaction Boundary").
+_REPLAY_ENVELOPE_SOURCE = "context-replay"
+
+# Any `<system-reminder ...>` opener, attributed or bare. See
+# _is_real_user_message for why the bare-tag check is not sufficient.
+_REMINDER_ENVELOPE_PREFIX = "<system-reminder"
+
+
+def _is_real_user_message(entry: dict[str, Any]) -> bool:
+    """Whether `entry` is a genuine human-authored user turn.
+
+    Mirrors `amplifier_foundation.session.is_real_user_message` (role is
+    "user", no `tool_call_id`, content not a reminder envelope), plus one
+    hardening clause.
+
+    VENDORED, NOT IMPORTED, on purpose: this module declares no runtime
+    dependencies (pyproject `dependencies = []`). A soft import of
+    foundation would make this predicate's behavior depend on whether an
+    undeclared package happens to be installed in the host environment --
+    two silently different code paths for the same config. Instead the
+    logic lives here and `tests/test_replay_last_user.py` asserts parity
+    against the real foundation function whenever foundation IS
+    importable, so drift is caught by a failing test rather than assumed
+    away.
+
+    HARDENING, and it is load-bearing: foundation 1.0.0
+    (session/messages.py:95, 103) rejects only content beginning with the
+    BARE `<system-reminder>` tag. An ATTRIBUTED envelope -- including this
+    module's own `<system-reminder source="context-summary">` summary
+    message and the `context-replay` message this feature emits -- does
+    NOT match that check and is classified by foundation as a real user
+    turn. (The comment at `_SUMMARY_ENVELOPE_SOURCE` and the docstring of
+    `_make_summary_message` both assert the opposite; they are wrong on
+    this point as of foundation 1.0.0.) Replaying a synthetic envelope as
+    if it were the user's own words -- or worse, replaying a replay -- is
+    precisely the failure this feature must never produce, so this
+    predicate rejects any content opening with `<system-reminder`
+    regardless of attributes. That makes it strictly STRONGER than
+    foundation's: every message foundation rejects, this rejects too.
+    """
+    if entry.get("role") != "user":
+        return False
+
+    if "tool_call_id" in entry:
+        return False
+
+    content = entry.get("content", "")
+
+    if isinstance(content, str):
+        if content.strip().startswith(_REMINDER_ENVELOPE_PREFIX):
+            return False
+    elif isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict):
+                text = block.get("text", "")
+                if isinstance(text, str) and text.strip().startswith(
+                    _REMINDER_ENVELOPE_PREFIX
+                ):
+                    return False
+
+    return True
 
 # Default 5-section summarization prompt, lifted near-verbatim from
 # amplifier-bundle-context-managed's modules/context-managed/__init__.py:71-97
@@ -331,6 +426,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               result into when it is truncated, so the truncated middle stays
               recoverable via the ordinary file tools (default: None = nothing
               is ever written and no pointer appears in any message).
+            - replay_last_user_on_compaction: bool (default: False). When
+              True, append a reminder-wrapped copy of the most recent real
+              user message at the tail once per compaction boundary. See
+              module docstring "Last-User Replay After a Compaction
+              Boundary". False is byte-identical to pre-existing behavior.
+              NOT MEASURED -- shipped default-off pending a discriminating
+              retention eval (S7).
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -383,6 +485,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         tool_result_budget_by_tool=config.get("tool_result_budget_by_tool"),
         tool_result_exempt_tools=config.get("tool_result_exempt_tools"),
         tool_result_spill_dir=config.get("tool_result_spill_dir"),
+        replay_last_user_on_compaction=bool(
+            config.get("replay_last_user_on_compaction", False)
+        ),
         hooks=getattr(coordinator, "hooks", None),
     )
 
@@ -469,6 +574,7 @@ class SimpleContextManager:
         tool_result_budget_by_tool: dict[str, int] | None = None,
         tool_result_exempt_tools: list[str] | None = None,
         tool_result_spill_dir: str | None = None,
+        replay_last_user_on_compaction: bool = False,
         hooks: Any = None,
     ):
         """
@@ -529,6 +635,11 @@ class SimpleContextManager:
                 truncated.
             tool_result_spill_dir: Directory the full original result is
                 written to when truncated. None (default) writes nothing.
+            replay_last_user_on_compaction: When True, append a
+                reminder-wrapped copy of the most recent real user message
+                at the tail once per compaction boundary (default: False,
+                byte-identical to pre-existing behavior). See module
+                docstring "Last-User Replay After a Compaction Boundary".
             hooks: Optional hooks instance for emitting observability events
                 and (always, when present) recording real usage for the
                 token meter via `llm:response` -- see `_on_llm_response`.
@@ -601,6 +712,14 @@ class SimpleContextManager:
         # re-written on every request (_apply_sticky_decisions re-derives the
         # replacement text for every sticky-truncated message, every call).
         self._spilled_paths: set[str] = set()
+        self.replay_last_user_on_compaction = replay_last_user_on_compaction
+        # Boundary identity of the most recent compaction boundary whose
+        # last-user replay was actually emitted, or None. Compared against
+        # the CURRENT boundary identity to make the replay fire once per
+        # BOUNDARY rather than once per request -- see
+        # _current_compaction_boundary / _maybe_append_last_user_replay.
+        # Never touched unless replay_last_user_on_compaction is True.
+        self._last_replayed_boundary: tuple[int, int] | None = None
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
         # --- Summary compaction strategy state (compaction_strategy == "summary") ---
@@ -916,6 +1035,21 @@ class SimpleContextManager:
             # state) -- so on calls between escalations, this tail addition is
             # byte-identical, and everything before it (the real prefix) is
             # completely undisturbed either way.
+            # Append the last-user replay BEFORE the compaction notice, so
+            # the notice stays the final item (the "dynamic tail"). Opt-in
+            # and a complete no-op when off -- see module docstring
+            # "Last-User Replay After a Compaction Boundary".
+            #
+            # Ordering note (deliberate, and it is the reason there is no
+            # interaction bug between the two tail appends): the replay
+            # applies the SAME unanswered-tool_calls tail guard the notice
+            # does, evaluated on the PRE-replay tail. So either both are
+            # suppressed (tail unsafe) or the replay lands first and the
+            # notice's own guard then sees the replay -- a plain user
+            # message with no tool_calls -- and proceeds correctly.
+            if self.replay_last_user_on_compaction:
+                self._maybe_append_last_user_replay(compacted, effective_budget)
+
             if self.compaction_notice_enabled and self._last_compaction_stats:
                 level = self._last_compaction_stats.get("strategy_level", 0)
                 # GUARD: never append into an unanswered tool_calls turn.
@@ -1057,6 +1191,7 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._last_replayed_boundary = None
         self._reset_summary_strategy_state()
         logger.info(f"Restored {len(messages)} messages to context")
 
@@ -1078,6 +1213,7 @@ class SimpleContextManager:
         # forked session may still hold a pointer to one; see README).
         self._tool_name_by_call_id = {}
         self._spilled_paths = set()
+        self._last_replayed_boundary = None
         self._reset_summary_strategy_state()
         logger.info("Context cleared")
 
@@ -2949,6 +3085,147 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 '- Some user messages may be stubbed as "[User message compacted...]"\n'
                 "- If context is critical, consider asking user to clarify their current goal"
             )
+
+    # ------------------------------------------------------------------
+    # Last-user replay (`replay_last_user_on_compaction: true`)
+    # ------------------------------------------------------------------
+    #
+    # Opt-in, default off, and a complete no-op when off: the ONLY call
+    # site is guarded by `if self.replay_last_user_on_compaction` inside
+    # the compaction branch of get_messages_for_request(), so in the
+    # default configuration none of the code below ever executes and the
+    # returned view is byte-identical to before this feature existed.
+
+    def _current_compaction_boundary(self) -> tuple[int, int]:
+        """Identity of the compaction boundary the view currently reflects.
+
+        A "boundary" is a real escalation of what has been shed, not a
+        request: the progressive ladder's cumulative sticky level, paired
+        with how many messages the summary strategy has absorbed. Both
+        are monotonic within a session and both already exist -- this
+        introduces no new state to keep in sync.
+
+        A request that merely re-applies existing sticky decisions leaves
+        both components unchanged, which is exactly what makes the replay
+        fire once per boundary instead of once per request.
+        """
+        return (self._sticky_level, self._summary_absorbed_count)
+
+    @staticmethod
+    def _replay_text(msg: dict[str, Any]) -> str:
+        """Plain text of a user message, for string and block-list content.
+
+        Returns "" when there is no text to replay (e.g. an image-only
+        block list), which the caller treats as "nothing to say, skip".
+        """
+        content = msg.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = [
+                block["text"]
+                for block in content
+                if isinstance(block, dict) and isinstance(block.get("text"), str)
+            ]
+            return "\n".join(part for part in parts if part)
+        return ""
+
+    def _maybe_append_last_user_replay(
+        self, compacted: list[dict[str, Any]], budget: int
+    ) -> None:
+        """Append one reminder-wrapped copy of the most recent real user
+        message to the tail of `compacted`, in place, if all guards pass.
+
+        Guards, and why each exists:
+
+        1. ONCE PER BOUNDARY -- skip when this boundary's replay already
+           went out (see _current_compaction_boundary).
+        2. TOOL-PAIR ATOMICITY -- skip when the view ends on an assistant
+           message with unanswered tool_calls, for exactly the reason the
+           compaction notice does: a user-role message landing between a
+           tool_use and its tool_result is rejected or mishandled by
+           providers. Skipping is free; the boundary stays unmarked and
+           the replay goes out on the next request instead.
+        3. NOT ALREADY THE TAIL -- if the last real user message IS the
+           final item, a copy would be a pure duplicate that says nothing
+           the model cannot already see in the strongest position.
+        4. NOTHING TO SAY -- no real user message in view, or no text in
+           it.
+        5. NOT A STUB -- a Level-8 stub (`_stubbed`) is not the user's
+           words, it is a placeholder REPLACING them. The envelope below
+           calls its payload "a verbatim copy of your most recent
+           instruction"; emitting a stub under that sentence would make
+           the envelope lie. DEFENCE IN DEPTH, and deliberately so: this
+           branch is UNREACHABLE as of this commit, because the ladder
+           protects the last user message from stubbing at every level
+           (`i != last_user_idx` in _remove_messages_with_protection, and
+           `first_user_idx != last_user_idx` at Level 8). The guard exists
+           so this feature's honesty does not silently depend on a
+           protection rule enforced 600 lines away in code it does not
+           own. tests/test_replay_last_user.py exercises it directly
+           rather than pretending a natural fixture reaches it.
+        6. BUDGET -- compaction has just finished shedding tokens to hit
+           `budget`; a large pasted user message (a file, a log) could
+           push the request straight back over it. Skip rather than
+           overshoot what compaction just paid for.
+
+        Sourced from the COMPACTED VIEW, not from self.messages, on
+        purpose: the view is post-sticky-decision, so this can never
+        resurrect content compaction deliberately shed (e.g. a Level-8
+        stub of a first-and-only user message replays as the stub, not as
+        the original text it replaced).
+
+        Mutates only the caller's local view list. self.messages, `_seq`
+        allocation, and every sticky decision set are untouched.
+        """
+        boundary = self._current_compaction_boundary()
+        if boundary == self._last_replayed_boundary:
+            return
+
+        if not compacted or compacted[-1].get("tool_calls"):
+            return
+
+        source = next(
+            (msg for msg in reversed(compacted) if _is_real_user_message(msg)), None
+        )
+        if source is None or source is compacted[-1] or source.get("_stubbed"):
+            return
+
+        text = self._replay_text(source)
+        if not text.strip():
+            return
+
+        replay = {
+            "role": "user",
+            "content": (
+                f'<system-reminder source="{_REPLAY_ENVELOPE_SOURCE}">\n'
+                "This is a verbatim copy of your most recent instruction, "
+                "repeated here because context compaction has moved it far "
+                "from the end of the conversation. It is NOT a new request "
+                "-- do not answer it again if it is already handled.\n\n"
+                f"{text}\n"
+                "</system-reminder>"
+            ),
+            "metadata": {
+                "source": _REPLAY_ENVELOPE_SOURCE,
+                "ephemeral": True,
+            },
+        }
+
+        projected = self._estimate_tokens(compacted) + self._estimate_tokens([replay])
+        if budget > 0 and projected > budget:
+            logger.debug(
+                "Skipping last-user replay this request: it would put the "
+                f"view at ~{projected:,} tokens against a {budget:,} budget "
+                "that compaction just shed tokens to reach"
+            )
+            return
+
+        compacted.append(replay)
+        self._last_replayed_boundary = boundary
+        logger.debug(
+            f"Appended last-user replay at tail for compaction boundary {boundary}"
+        )
 
     # ------------------------------------------------------------------
     # Summary compaction strategy (`compaction_strategy: "summary"`)

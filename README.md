@@ -638,6 +638,89 @@ computed by the new code.
   is the seam for it.
 - **A cleanup sweep.** See above.
 
+## Last-user replay (`replay_last_user_on_compaction`)
+
+**Opt-in. Default `false`. Default is byte-identical to the behavior
+before this feature existed. NOT MEASURED — see "Status" below.**
+
+```toml
+config = { replay_last_user_on_compaction = true }
+```
+
+### What it does
+
+The highest-value tier of retained context is the **user's own
+verbatims**. A compaction boundary can leave the most recent user
+instruction sitting far from the attention-strongest tail position,
+behind whatever tool results the ladder chose to keep.
+
+When this flag is on **and a compaction boundary actually occurs**, the
+module appends a copy of the most recent real user message as the last
+item before the dynamic tail (the compaction notice), wrapped in a
+`<system-reminder source="context-replay">` envelope that states
+explicitly that it is a repeat and not a new request:
+
+```
+[... compacted conversation ...]
+[replay ]  user, ephemeral: <system-reminder source="context-replay"> … </system-reminder>
+[notice ]  user, ephemeral: <system-reminder source="context-compaction"> … </system-reminder>
+```
+
+### Why it is shaped this way
+
+- **Append-only.** Nothing before the append point moves. No `_seq` is
+  consumed, no sticky decision is touched, `self.messages` is never
+  modified, and the message is ephemeral (view-only). Append is the
+  measured cache-**HIT** shape; a shrink or a reorder is a cold rebuild.
+- **Both tail items are `ephemeral: true`,** so the Anthropic provider's
+  trailing-ephemeral walk-back skips them and the cache breakpoint lands
+  in the same place it did before.
+- **Tool-pair integrity is untouched.** The replay applies the same
+  unanswered-`tool_calls` tail guard the compaction notice uses, and
+  skips rather than interleaving between a `tool_use` and its
+  `tool_result`.
+- **Once per boundary, not once per request.** The boundary identity is
+  `(sticky progressive level, summary-absorbed count)`; a request that
+  merely re-applies an existing sticky decision does not re-emit.
+
+### When it deliberately does nothing
+
+| Condition | Why |
+|---|---|
+| No compaction this request | No boundary, nothing was buried |
+| This boundary's replay already went out | Once per boundary |
+| View ends on unanswered `tool_calls` | Tool-pair atomicity; retries next request |
+| The last real user message is already the tail | A copy would be a pure duplicate |
+| The message is a Level-8 stub | A stub is not the user's words |
+| No real user message, or no text in it | Nothing to repeat |
+| The copy would exceed the budget | Compaction just shed tokens to reach it |
+
+### `_is_real_user_message` is vendored, not imported
+
+This module declares **no runtime dependencies**, so the predicate is
+implemented locally rather than imported from `amplifier-foundation` — a
+soft import would make behavior depend on whether an undeclared package
+happens to be installed.
+
+It is also deliberately **stronger** than foundation's. Measured against
+`amplifier-foundation` 1.0.0 (`session/messages.py`): foundation rejects
+only content beginning with the **bare** `<system-reminder>` tag, so an
+**attributed** envelope — including this module's own
+`<system-reminder source="context-summary">` summary message — passes
+foundation's check as a real user turn. Replaying a synthetic envelope as
+if it were the user's words is exactly what this feature must never do,
+so the local predicate rejects any `<system-reminder` opener regardless
+of attributes. The asymmetry is pinned by a test.
+
+### Status
+
+**Mechanism only. No quality evidence.** The retention scenario that
+could discriminate does not exist yet, and the scenario used for probes
+1–6 is saturated (40/40 constraints, 20/20 post-compaction in every arm
+of every run), so it cannot show a retention difference in either
+direction. Do not enable by default, and do not claim a quality benefit,
+until a discriminating eval has run.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
