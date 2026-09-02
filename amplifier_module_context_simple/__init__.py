@@ -15,6 +15,24 @@ Dynamic System Prompt Support:
   • get_messages_for_request() calls the factory on EVERY request
   • Enables @mentions and bundle instructions to be re-processed each turn
   • Static system messages (via add_message) are still supported as fallback
+
+Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
+  • The compaction trigger normally runs entirely off an uncalibrated
+    len(str)//4 estimator (see _estimate_tokens) that is never reconciled
+    against what the provider actually billed -- measured roughly 2x off
+    in production sessions.
+  • When hooks are available, this module always registers a listener on
+    the canonical `llm:response` event and records the provider's own
+    reported usage (see SimpleContextManager._on_llm_response) as an
+    observability signal, exposed via `_last_token_meter_stats`, so the
+    estimator-vs-real drift is visible even in the default mode.
+  • Set `token_meter: "actual"` in config to additionally have the
+    compaction trigger itself USE that real measurement once one has
+    arrived this session (falling back to the estimator before then, or
+    whenever hooks/events are unavailable). Default is `"estimate"`, which
+    keeps behavior byte-identical to before this feature existed.
+  • Ported from amplifier-module-context-handoff's proven `_on_llm_response`
+    meter. See README "Real-usage token meter" for the full rationale.
 """
 
 # Amplifier module metadata
@@ -28,6 +46,15 @@ from typing import Any
 from amplifier_core import ModuleCoordinator
 
 logger = logging.getLogger(__name__)
+
+# token_meter config values. "estimate" (default) preserves pre-existing
+# behavior exactly; "actual" lets a real llm:response measurement drive the
+# compaction trigger once one has arrived this session. See module
+# docstring "Real-Usage Token Meter" and
+# SimpleContextManager._measure_working_tokens.
+TOKEN_METER_ESTIMATE = "estimate"
+TOKEN_METER_ACTUAL = "actual"
+_VALID_TOKEN_METERS = (TOKEN_METER_ESTIMATE, TOKEN_METER_ACTUAL)
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -48,11 +75,30 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compaction_notice_verbosity: Notice detail level - "minimal", "normal", "verbose" (default: "normal")
             - compaction_notice_min_level: Only show notice if compaction level >= this (default: 1)
             - output_reserve_fraction: Fraction of max_output_tokens to reserve for responses (default: 0.5)
+            - token_meter: "estimate" (default) or "actual". "estimate" is
+              byte-identical to pre-existing behavior. "actual" drives the
+              compaction trigger from real provider usage (input_tokens +
+              cache_write_tokens, observed via the `llm:response` hook)
+              once at least one response has been observed this session,
+              falling back to the estimator before then. An unrecognized
+              value falls back to "estimate" with a logged warning rather
+              than crashing mount(). See module docstring.
 
     Returns:
-        Optional cleanup function
+        Cleanup callable that unregisters the token-meter hook (if one was
+        registered).
     """
     config = config or {}
+
+    token_meter = config.get("token_meter", TOKEN_METER_ESTIMATE)
+    if token_meter not in _VALID_TOKEN_METERS:
+        logger.warning(
+            f"context-simple: unknown token_meter {token_meter!r} (expected "
+            f"one of {_VALID_TOKEN_METERS!r}); falling back to "
+            f"{TOKEN_METER_ESTIMATE!r}"
+        )
+        token_meter = TOKEN_METER_ESTIMATE
+
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
@@ -67,11 +113,33 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         compaction_notice_verbosity=config.get("compaction_notice_verbosity", "normal"),
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
         output_reserve_fraction=config.get("output_reserve_fraction", 0.5),
+        token_meter=token_meter,
         hooks=getattr(coordinator, "hooks", None),
     )
+
+    # Always register the meter listener when hooks are available, regardless
+    # of token_meter mode: recording is a no-op on trigger behavior unless
+    # token_meter == "actual" consults it (see _measure_working_tokens), so
+    # this keeps the default ("estimate") mode's behavior byte-identical
+    # while still populating _last_token_meter_stats for observability.
+    unregister: Callable[[], None] | None = None
+    hooks = getattr(coordinator, "hooks", None)
+    if hooks is not None:
+        unregister = hooks.register(
+            "llm:response",
+            context._on_llm_response,
+            priority=50,
+            name="context-simple-meter",
+        )
+
     await coordinator.mount("context", context)
-    logger.info("Mounted SimpleContextManager")
-    return
+    logger.info(f"Mounted SimpleContextManager (token_meter={token_meter!r})")
+
+    async def cleanup() -> None:
+        if unregister is not None:
+            unregister()
+
+    return cleanup
 
 
 class SimpleContextManager:
@@ -121,6 +189,7 @@ class SimpleContextManager:
         compaction_notice_verbosity: str = "normal",
         compaction_notice_min_level: int = 1,
         output_reserve_fraction: float = 0.5,
+        token_meter: str = TOKEN_METER_ESTIMATE,
         hooks: Any = None,
     ):
         """
@@ -140,7 +209,15 @@ class SimpleContextManager:
             output_reserve_fraction: Fraction of max_output_tokens to reserve for
                 responses (0.0-1.0, default: 0.5). Lower values give more context
                 budget at the cost of less headroom for long responses.
+            token_meter: "estimate" (default, byte-identical to pre-existing
+                behavior) or "actual" (compaction trigger uses real provider
+                usage from the `llm:response` hook once observed this
+                session -- see module docstring "Real-Usage Token Meter").
+                An unrecognized value falls back to "estimate" with a
+                logged warning rather than raising.
             hooks: Optional hooks instance for emitting observability events
+                and (always, when present) recording real usage for the
+                token meter via `llm:response` -- see `_on_llm_response`.
         """
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
@@ -154,8 +231,27 @@ class SimpleContextManager:
         self.compaction_notice_verbosity = compaction_notice_verbosity
         self.compaction_notice_min_level = compaction_notice_min_level
         self.output_reserve_fraction = output_reserve_fraction
+        if token_meter not in _VALID_TOKEN_METERS:
+            logger.warning(
+                f"context-simple: unknown token_meter {token_meter!r} (expected "
+                f"one of {_VALID_TOKEN_METERS!r}); falling back to "
+                f"{TOKEN_METER_ESTIMATE!r}"
+            )
+            token_meter = TOKEN_METER_ESTIMATE
+        self.token_meter = token_meter
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
+        # Real-usage token meter state (see _on_llm_response /
+        # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
+        # most recent real usage observed via `llm:response`
+        # (input_tokens + cache_write_tokens), or None before the first one
+        # arrives this session. `_last_token_meter_stats` is the
+        # always-populated observability surface (updated on every
+        # get_messages_for_request() call, regardless of whether compaction
+        # fires) so evals can read estimator-vs-real drift even in
+        # "estimate" mode -- see README "Real-usage token meter".
+        self._last_measured_prompt_tokens: int | None = None
+        self._last_token_meter_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
 
         # --- Sticky compaction decision state ---
@@ -317,7 +413,18 @@ class SimpleContextManager:
             # Static mode: use messages as-is (may include stored system messages)
             working_messages = list(self.messages)
 
-        token_count = self._estimate_tokens(working_messages)
+        token_count, meter_source, estimated_tokens = self._measure_working_tokens(
+            working_messages
+        )
+        self._last_token_meter_stats = {
+            "mode": self.token_meter,
+            "source": meter_source,
+            "used_tokens": token_count,
+            "estimated_tokens": estimated_tokens,
+            "measured_tokens": self._last_measured_prompt_tokens,
+            "budget": effective_budget,
+            "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
+        }
 
         # Check if compaction needed (using effective budget with notice reserve deducted)
         if self._should_compact(token_count, effective_budget):
@@ -500,6 +607,8 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._last_measured_prompt_tokens = None
+        self._last_token_meter_stats = None
         logger.info("Context cleared")
 
     async def should_compact(self) -> bool:
@@ -530,6 +639,112 @@ class SimpleContextManager:
                 f"threshold {self.compact_threshold:.0%} - compaction needed"
             )
         return should
+
+    def _exceeds_threshold(self, estimated_tokens: int, budget: int) -> bool:
+        """Whether usage is at/above compact_threshold -- the shared gate
+        used both by the outer trigger (_should_compact, via
+        _measure_working_tokens) and by _compact_ephemeral's internal
+        escalation check.
+
+        In token_meter="actual" mode with a real measurement available, the
+        REAL measurement decides this, not `estimated_tokens` -- see module
+        docstring "Real-Usage Token Meter" and _measure_working_tokens for
+        the identical mode/fallback logic. Falls back to `estimated_tokens`
+        in "estimate" mode, or whenever no real measurement has arrived yet.
+        """
+        if budget <= 0:
+            return False
+        if (
+            self.token_meter == TOKEN_METER_ACTUAL
+            and self._last_measured_prompt_tokens is not None
+        ):
+            return (self._last_measured_prompt_tokens / budget) >= self.compact_threshold
+        return (estimated_tokens / budget) >= self.compact_threshold
+
+    def _measure_working_tokens(
+        self, working_messages: list[dict[str, Any]]
+    ) -> tuple[int, str, int]:
+        """Return (token_count, source, estimated_tokens) used to evaluate
+        the compaction trigger this call.
+
+        `estimated_tokens` is ALWAYS the len(str)//4 heuristic over
+        `working_messages` (see _estimate_tokens) -- computed unconditionally
+        so the estimator-vs-real-usage drift this meter exists to close is
+        observable via `_last_token_meter_stats` regardless of mode.
+
+        `token_count`/`source` are what actually drives `_should_compact`:
+
+        - token_meter == "estimate" (default): ALWAYS `estimated_tokens`,
+          source "estimate" -- regardless of whether a real measurement is
+          available. This is what keeps the default mode's behavior
+          byte-identical to before this meter existed.
+        - token_meter == "actual": the last real usage recorded from
+          `llm:response` (input_tokens + cache_write_tokens -- see
+          `_on_llm_response`), source "measured", if one has arrived this
+          session; otherwise falls back to `estimated_tokens`, source
+          "estimate" (before the first response of the session, or
+          whenever hooks/events are unavailable).
+        """
+        estimated_tokens = self._estimate_tokens(working_messages)
+        if (
+            self.token_meter == TOKEN_METER_ACTUAL
+            and self._last_measured_prompt_tokens is not None
+        ):
+            return self._last_measured_prompt_tokens, "measured", estimated_tokens
+        return estimated_tokens, "estimate", estimated_tokens
+
+    async def _on_llm_response(self, event: str, data: dict[str, Any]) -> Any:
+        """Hook handler for the canonical `llm:response` event -- records the
+        provider's OWN reported usage (ground truth) for the real-usage
+        token meter (`token_meter: "actual"`).
+
+        Ported from amplifier-module-context-handoff's `_on_llm_response`
+        (see that module's README "Live demonstration" for the production
+        incident that shaped this exact formula). Per PROVIDER_CONTRACT.md,
+        `usage.input_tokens` is the provider's own GROSS total (fresh +
+        cache_read combined) billed as "input" for the call that was just
+        made. That figure alone UNDER-counts true context-window occupancy
+        on any call that performs a first-time cache write: a large
+        system/tool prompt written to cache for the first time is billed
+        almost entirely as `cache_write_tokens`, disjoint from
+        `input_tokens` -- a real session showed `input_tokens=2` and
+        `cache_write_tokens=161,165` on its very first call. This meter
+        therefore sums `input_tokens + cache_write_tokens`.
+        `cache_read_tokens` is NOT added separately: it is already inside
+        the gross `input_tokens` figure per the contract, and adding it
+        again would double-count.
+
+        Always records (regardless of `token_meter` config) so the
+        estimator-vs-real drift is observable via `_last_token_meter_stats`
+        even in "estimate" mode; only `token_meter: "actual"` ever uses this
+        reading to DRIVE the compaction trigger -- see
+        `_measure_working_tokens`.
+
+        Never raises: any malformed/missing usage payload is logged at
+        DEBUG and leaves the meter unchanged (falls back to the estimator
+        wherever it's consulted), so a broken/unexpected event shape can
+        never crash the agent loop or the request it was about to serve.
+        """
+        from amplifier_core.models import HookResult
+
+        usage = (data or {}).get("usage") or {}
+        input_tokens = usage.get("input_tokens")
+        cache_write_tokens = usage.get("cache_write_tokens") or 0
+        if isinstance(input_tokens, int | float):
+            total = int(input_tokens) + int(cache_write_tokens)
+            self._last_measured_prompt_tokens = total
+            logger.debug(
+                f"context-simple: token_meter recorded real usage from "
+                f"llm:response -- input_tokens={int(input_tokens):,} + "
+                f"cache_write_tokens={int(cache_write_tokens):,} = {total:,} total"
+            )
+        else:
+            logger.debug(
+                "context-simple: llm:response event carried no "
+                "usage.input_tokens; token_meter unchanged (still using "
+                "estimator wherever token_meter='actual' has no measurement yet)"
+            )
+        return HookResult(action="continue")
 
     # --- Sticky compaction decision helpers ---
     #
@@ -717,9 +932,29 @@ class SimpleContextManager:
         non_system_tokens = self._estimate_tokens(working_messages)
         current_tokens = system_tokens + non_system_tokens
 
-        needs_escalation = (
-            budget > 0 and (current_tokens / budget) >= self.compact_threshold
-        )
+        # Escalation GATE: in token_meter="actual" mode with a real
+        # measurement available, the REAL measurement decides whether a new
+        # escalation is needed -- consistent with the outer trigger in
+        # get_messages_for_request() (_should_compact, driven by
+        # _measure_working_tokens). This keeps "actual" mode meaningful: if
+        # the estimator alone gated this too, a real measurement crossing
+        # threshold could be silently ignored whenever the (up to ~2x off)
+        # estimator disagreed -- exactly the gap this meter exists to close.
+        #
+        # KNOWN, ACCEPTED LIMITATION (documented, not hidden -- see README
+        # "Real-usage token meter"): only the GATE (whether to escalate at
+        # all) uses the real number. The amount of reduction below --
+        # target_tokens, and every per-level termination check -- is still
+        # computed from the estimator throughout, because a real, billed
+        # token count for a *hypothetical* smaller message set does not
+        # exist without another provider round-trip. If the real measurement
+        # and the estimator disagree sharply, "actual" mode can still
+        # converge on level 1 without having done much real reduction (the
+        # estimator's own view of `working_messages` already looked small
+        # enough) -- this module fires the escalation honestly, but the
+        # sizing of that escalation is only as good as the estimator was
+        # before this meter existed.
+        needs_escalation = self._exceeds_threshold(current_tokens, budget)
         if not needs_escalation:
             # Sticky state alone already keeps us under the threshold that
             # triggered compaction in the first place -- nothing NEW needs
