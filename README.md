@@ -721,6 +721,200 @@ of every run), so it cannot show a retention difference in either
 direction. Do not enable by default, and do not claim a quality benefit,
 until a discriminating eval has run.
 
+## Worth-the-rebuild predicate (`compact_clear_at_least`)
+
+**Default `null` (disabled). Byte-identical to before this feature existed.**
+
+### The problem
+
+The compaction trigger fires on a usage *threshold* (`compact_threshold`,
+default 0.92) and **never asks how many tokens the compaction will actually
+free**.
+
+That omission is not free, because every compaction *shrinks* the request, and
+a shrink is a guaranteed cold prompt-cache rebuild on the OpenAI path. The
+measured mechanism (micro-probe v3, 3 reps, ~9.8k-token payloads, validity gate
+passed): identical repeat **9,789 cache_read HIT**, pure append **9,789 HIT**,
+and a **byte-identical strict prefix of the cached request — 0, MISS**. The
+cache matches forward from a cached entry, never backward into one. So a
+boundary that frees 3k tokens still pays a full rebuild of an ~18.4k-token
+pinned head plus everything after it. We take that trade silently, every time.
+
+What the omission costs, measured: the `cad-deep` arm set `target_usage: 0.15`
+— a 6,750-token target *below* the ~32k system floor — so compaction escalated
+to max level on every request: **25 boundaries** (more than stock's 21.6),
+prefix retention **0.0%**, **$3.16** against stock's **$2.58**, and no quality
+upside. A worth-the-rebuild predicate would have refused every one of them.
+
+### What it does
+
+Lifted from Anthropic's context-editing API, whose parameter of the same name
+is documented as: *"If the API can't clear at least the specified amount, the
+strategy will not be applied. This helps determine if context clearing is worth
+breaking your prompt cache."* Vendor-agnostic — implemented here client-side,
+with no API support required.
+
+```yaml
+compact_clear_at_least: 20000    # absolute token floor
+compact_clear_at_least: 0.15     # or a fraction of the budget
+compact_max_consecutive_skips: 3 # fail loud after this many refusals
+```
+
+| value | meaning |
+|---|---|
+| `null` (default), `0`, negative | disabled — today's behaviour exactly |
+| int `>= 1` | absolute token floor |
+| float in `(0, 1)` | that fraction of the per-call budget |
+| unparseable | disabled, with a logged warning (never raises on config alone) |
+
+`1.0` is deliberately read as **absolute (1 token)**, not "100% of budget": a
+floor of one entire budget can never be met, so reading it as a fraction would
+turn a plausible-looking config into a guaranteed fail-loud.
+
+### What `freed` means here, precisely
+
+This module's ladder has **no separable plan/apply split** — it mutates an
+ephemeral copy level by level, threading a running `current_tokens` through
+every rung. So the predicate does not build a second estimator or a projection.
+It compares two counts the ladder already produces:
+
+```
+freed = tokens(view this call would have returned had it decided nothing new)
+      - tokens(view the ladder actually produced)
+```
+
+That is the **marginal** reclaim of this boundary, and it is the right number:
+what breaks the provider's cache is this view differing from the last one, not
+its distance from raw history. (A predicate measured against raw history would
+report a large stale "freed" on every call of an already-compacted session and
+approve boundaries that free nothing.) Both sides go through the same
+`_estimate_tokens` the rest of the ladder runs on, recomputed exactly rather
+than read off the running counter, which carries small deliberate
+approximations (e.g. the flat ~18-token stub charge at level 8).
+
+### On refusal
+
+The escalation is **rolled back completely**: the sticky truncate/remove/stub
+decisions recorded during it are discarded, `_last_compaction_stats` is left
+untouched (so the tail compaction notice stays byte-stable across a skip),
+`_sticky_level` does not move, **no `context:compaction` event is emitted**, and
+a `context:compaction-skipped` event carries `freed_tokens`, `required_tokens`,
+`level_reached`, `consecutive_skips`, `baseline_tokens`, `budget`, and the
+protected-set knobs. The returned view is the unchanged baseline, so a refusal
+is strictly append-only with respect to the previous request — which is the
+entire point of refusing.
+
+A refusal is also **not** a compaction boundary for `replay_last_user_on_compaction`:
+the replay fires once per boundary identified by `(sticky_level,
+summary_absorbed_count)`, and a refusal leaves both unchanged by design, so
+without an explicit check the first-ever refusal would still look like a fresh
+boundary and replay after a compaction that did not happen.
+
+### Escalation path: it fails loud, it does not hang
+
+This predicate can starve compaction. If it refuses and usage keeps climbing,
+the next request is larger and the predicate will normally pass — but if the
+plan can *never* free the floor (the protected set is too large, or the floor
+is simply misconfigured), skipping forever would end in an opaque provider
+context-overflow error, and quietly compacting anyway would let a run "pass"
+while the predicate had silently stopped applying.
+
+So after `compact_max_consecutive_skips` (default 3) **consecutive** refusals it
+raises `RuntimeError`, naming what the ladder freed, what was required, the
+level it reached, the baseline size against the budget, and the protected set
+holding the floor — i.e. which knob to actually move:
+
+```
+context-simple: compact_clear_at_least=20000 could not be satisfied 3
+consecutive times (cap: 3). The compaction ladder reached level 8 and freed
+only 7,698 tokens against a required floor of 20,000. Protected set holding
+the floor: protected_tool_results=1 (of 30 tool results in the view),
+protected_recent=20% of 124 messages. Baseline view is 7,852 tokens against a
+budget of 1,200. Lower compact_clear_at_least, lower
+protected_recent/protected_tool_results, or raise the budget -- compacting
+harder will not help.
+```
+
+Two deliberate details:
+
+- **Calls that decided nothing are never judged and never count as a skip.**
+  Once sticky state alone keeps the view under threshold, the ladder returns
+  early having refused nothing; counting those would fail loud on a session
+  that is behaving perfectly.
+- **A cap of `0` clamps up to `1`, not down to "never fail".** Read literally,
+  0 means "tolerate unlimited refusals" — exactly the silent hang the cap
+  exists to prevent.
+- The streak does **not** survive `clear()` or `set_messages()`: a streak
+  accumulated against one message set says nothing about a different one.
+
+### Why it is not shipped on by default
+
+`freed` is a token count, and in the default `token_meter: "estimate"` mode it
+comes from the `len(str)//4` heuristic — never reconciled against real provider
+usage, and roughly 2× off in production sessions. **A predicate that refuses
+boundaries based on a number that is 2× off will refuse the wrong boundaries.**
+The honest resolution already shipped in this module: `token_meter: "hybrid"`
+anchors on the provider's own reported total and carries provenance
+(`kind ∈ {usage, estimated, none}`). **Run this predicate with
+`token_meter: "hybrid"`, not on the bare estimator.**
+
+No workload evaluation has been run. The pre-registered gates are in the
+follow-up item: boundary count must fall **monotonically** across
+`{null, 10k, 20k, 40k}` at n≥3 (a flat response falsifies the mechanism),
+`max_consecutive_skips` must never be reached, cost must not rise, and re-billed
+waste must not rise. **A cost *reduction* is deliberately not pre-registered as
+a win**: fewer boundaries measurably "buys latency, not money"
+(`cad-fewer`: −29% requests, −14% wall, same cost, same quality), and the
+underlying fit (`waste ≈ 36.3 − 0.357 × boundaries`, r = −0.586 over 12 points)
+is suggestive, not established. A retention gate on S5-CRAC would be **vacuous**
+(40/40 constraints and 20/20 post-compaction in every run of every arm across
+probes 1–6) and is deferred.
+
+The suggested starting value of **20,000** comes from the observed pinned
+`cache_read` head of 18,458 tokens — but that number was derived through a
+4.59 chars/token constant that is tokenizer- and model-version-specific.
+**Re-derive the head in tokens from real provider usage before pinning it.**
+
+## Summary shrink guard
+
+**Always on when `compaction_strategy: "summary"`. No config knob.**
+
+The rolling summarizer previously swapped in whatever the summarizer returned.
+This refuses a summary that is **not smaller** than the span of messages it
+replaces — including exactly equal, since paying a cache rebuild to swap content
+for content of identical cost buys nothing.
+
+Lifted from deepseek-harness's `compaction-basic` region check: *"a summary that
+is not smaller than what it replaces is a silent cost regression, and they
+simply refuse it."* We had nothing like it, and a terse span plus a verbose
+5-section summary is entirely capable of growing.
+
+On refusal the pending summary is **discarded** and the pass falls back to
+progressive compaction — the same graceful path a stale summary already takes,
+and explicitly **not** counted as a summarizer failure. Both sides are measured
+as full message dicts through the same `_estimate_tokens`, so the comparison is
+apples-to-apples.
+
+There is no knob because there is no defensible reason to want a summary that
+makes the context bigger.
+
+### Byte-identity evidence
+
+`compact_clear_at_least: null` (the default) was verified against
+`origin/main` by loading both module versions in one process and driving them
+through identical scenarios with identical inputs (message timestamps frozen, so
+the two runs differ in nothing but the module source), comparing every returned
+view, every emitted hook event, the full sticky-decision state, and
+`_last_compaction_stats` after every call.
+
+**11 of 11 scenarios byte-identical**: `default`, `token_meter_actual`,
+`token_meter_hybrid`, `summary_strategy_no_provider`, `tool_result_budget`,
+`tool_result_head_tail`, `replay_last_user`, `notice_disabled`,
+`protected_tool_results_zero`, `larger_budget`, `system_prompt_factory`.
+
+The check is **not vacuous**: a negative control that flips only the default to
+`20_000` diverges immediately and loudly on the same harness.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
