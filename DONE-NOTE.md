@@ -330,6 +330,7 @@ budget, head+tail, per-tool), then spill the truncated middle to disk.
 |---|---|
 | Repo | `amplifier-module-context-simple` |
 | Branch | `lane/x1r-tool-result-budget` (forked from `c6dfbba`, `main`) |
+| Draft PR | microsoft/amplifier-module-context-simple#21 (DRAFT — do not merge) |
 | Tests | **151 green** (103 pre-existing, unchanged + 48 new) |
 | Spend | **$0.00** — no API calls, no DTU, no containers, no infrastructure created |
 | Default behavior | **byte-identical**, proven by external stash-compare (below) |
