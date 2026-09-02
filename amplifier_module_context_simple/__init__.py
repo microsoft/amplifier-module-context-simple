@@ -94,12 +94,61 @@ Summary Compaction Strategy (opt-in, default off -- see config
     here; see README for the candidate levers (cooldown / absolute floor
     / trigger hysteresis). OPT-IN, EXPERIMENTAL -- do not enable by
     default.
+
+Tool-result budget and spill (opt-in, default off -- see config
+`tool_result_budget_tokens` / `tool_result_shape` /
+`tool_result_budget_by_tool` / `tool_result_exempt_tools` /
+`tool_result_spill_dir`):
+  • The truncation rung of the progressive ladder historically kept
+    `content[:250]` -- 250 characters, HEAD ONLY, ~62 estimator tokens.
+    The only shipped reference implementation available to compare
+    against (codex) keeps a ~10,000-token budget, HEAD + TAIL, with an
+    explicit truncation marker. We were ~160x below it, and keeping the
+    head is the part that hurts: for `pytest`, `grep`, `git log` and
+    build output the ANSWER IS IN THE TAIL.
+  • MEASURED (step 0 of this change, two existing capture roots, 17
+    sessions, 2,479 tool results, char-denominated, confidence:
+    measured): tool-result content is 46.4% / 47.3% of all transcript
+    characters; individual results run p50 412 / p90 7,904 / p99 ~31.7k
+    / max 52.3k chars; 63-65% of every tool result exceeds today's
+    250-char budget, and today's budget discards ~91% of all
+    tool-result content it touches.
+  • `tool_result_budget_tokens: int` replaces the char budget with a
+    TOKEN-denominated one (chars/token constants are tokenizer-version
+    specific and drift; a char budget silently changes meaning across a
+    model version). Default `None` = the pre-existing `truncate_chars`
+    path, byte-identical.
+  • `tool_result_shape: "head" | "head_tail"` -- `"head_tail"` splits
+    the budget in half and keeps both ends with an explicit
+    `...[N chars omitted]...` marker between them, so the model can never
+    reason from a truncated result without knowing it was truncated.
+    Default `"head"`.
+  • `tool_result_budget_by_tool: dict[str, int]` -- per-tool token
+    budgets, resolved by tool name; takes precedence over the global
+    budget. Default `{}`.
+  • `tool_result_exempt_tools: list[str]` -- these tool results are
+    NEVER truncated (the value-order names loaded skills explicitly).
+    Default `[]`.
+  • `tool_result_spill_dir: path` -- when set, the FULL original result
+    is written to a content-addressed file under this directory and the
+    replacement text points the model at it, so the truncated middle is
+    recoverable through the ordinary file tools with no new retrieval
+    tool. Default `None` (nothing is ever written).
+  • DETERMINISM, load-bearing: the replacement text (including the spill
+    pointer) is a pure function of the message's content plus config. It
+    NEVER depends on whether the spill write succeeded, because
+    `_apply_sticky_decisions` re-derives it on every single request and a
+    pointer that changed after a failed-then-successful write would
+    mutate an already-cached prefix -- which, under a grow-only prompt
+    cache, is a full cold rebuild. A failed write yields a pointer to a
+    missing file (visible, recoverable) rather than a silent byte change.
 """
 
 # Amplifier module metadata
 __amplifier_module_type__ = "context"
 
 import asyncio
+import hashlib
 import json
 import logging
 from collections.abc import Awaitable, Callable
@@ -147,6 +196,23 @@ _VALID_COMPACTION_STRATEGIES = (
     COMPACTION_STRATEGY_PROGRESSIVE,
     COMPACTION_STRATEGY_SUMMARY,
 )
+
+# tool_result_shape config values. "head" (default) keeps the leading slice
+# only -- the pre-existing behavior. "head_tail" splits the budget in half
+# and keeps both ends with an explicit omission marker between them. See
+# module docstring "Tool-result budget and spill".
+TOOL_RESULT_SHAPE_HEAD = "head"
+TOOL_RESULT_SHAPE_HEAD_TAIL = "head_tail"
+_VALID_TOOL_RESULT_SHAPES = (TOOL_RESULT_SHAPE_HEAD, TOOL_RESULT_SHAPE_HEAD_TAIL)
+
+# Chars-per-token constant used to convert a token-denominated tool-result
+# budget into the char slice actually taken. Deliberately the SAME constant
+# this module's own estimator uses (_estimate_tokens: len(str(msg)) // 4), so
+# a budget expressed in tokens and the token accounting the compaction ladder
+# runs on cannot drift apart. This is an estimator, not a tokenizer: see
+# README "Tool-result budget" for why the budget is nevertheless expressed in
+# tokens rather than chars.
+_TOOL_RESULT_CHARS_PER_TOKEN = 4
 
 # The summary message's envelope source tag and metadata type marker. The
 # envelope is what makes foundation's is_real_user_message() classify this
@@ -245,6 +311,26 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               provider.complete() call before treating it as a failure and
               falling back to progressive compaction for that pass
               (default: 30.0).
+            - tool_result_budget_tokens: Token budget kept when truncating a
+              tool result (default: None = use the legacy `truncate_chars`
+              char budget, byte-identical to before this feature existed).
+              Setting it switches that tool result to the token-denominated
+              path. See module docstring "Tool-result budget and spill".
+            - tool_result_shape: "head" (default) or "head_tail". "head_tail"
+              splits the budget in half and keeps both ends with an explicit
+              `...[N chars omitted]...` marker. An unrecognized value falls
+              back to "head" with a logged warning rather than crashing
+              mount().
+            - tool_result_budget_by_tool: Per-tool token budgets keyed by tool
+              name (default: {}). Takes precedence over
+              tool_result_budget_tokens for a matching tool. Entries whose
+              value is not a positive int are dropped with a logged warning.
+            - tool_result_exempt_tools: Tool names whose results are NEVER
+              truncated (default: []). Recommended for skill-type outputs.
+            - tool_result_spill_dir: Directory to write the FULL original tool
+              result into when it is truncated, so the truncated middle stays
+              recoverable via the ordinary file tools (default: None = nothing
+              is ever written and no pointer appears in any message).
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -292,6 +378,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         summarization_model=config.get("summarization_model"),
         summarization_prompt_path=config.get("summarization_prompt_path"),
         summarization_timeout_s=config.get("summarization_timeout_s", 30.0),
+        tool_result_budget_tokens=config.get("tool_result_budget_tokens"),
+        tool_result_shape=config.get("tool_result_shape", TOOL_RESULT_SHAPE_HEAD),
+        tool_result_budget_by_tool=config.get("tool_result_budget_by_tool"),
+        tool_result_exempt_tools=config.get("tool_result_exempt_tools"),
+        tool_result_spill_dir=config.get("tool_result_spill_dir"),
         hooks=getattr(coordinator, "hooks", None),
     )
 
@@ -373,6 +464,11 @@ class SimpleContextManager:
         summarization_model: str | None = None,
         summarization_prompt_path: str | None = None,
         summarization_timeout_s: float = 30.0,
+        tool_result_budget_tokens: int | None = None,
+        tool_result_shape: str = TOOL_RESULT_SHAPE_HEAD,
+        tool_result_budget_by_tool: dict[str, int] | None = None,
+        tool_result_exempt_tools: list[str] | None = None,
+        tool_result_spill_dir: str | None = None,
         hooks: Any = None,
     ):
         """
@@ -421,6 +517,18 @@ class SimpleContextManager:
                 DEFAULT_SUMMARIZATION_PROMPT. None uses the built-in prompt.
             summarization_timeout_s: Seconds to wait for the summarizer's
                 provider.complete() call before treating it as a failure.
+            tool_result_budget_tokens: Token budget kept when truncating a
+                tool result. None (default) keeps the pre-existing
+                `truncate_chars` char budget, byte-identical.
+            tool_result_shape: "head" (default, pre-existing behavior) or
+                "head_tail". An unrecognized value falls back to "head" with
+                a logged warning rather than raising.
+            tool_result_budget_by_tool: Per-tool token budgets keyed by tool
+                name; takes precedence over tool_result_budget_tokens.
+            tool_result_exempt_tools: Tool names whose results are never
+                truncated.
+            tool_result_spill_dir: Directory the full original result is
+                written to when truncated. None (default) writes nothing.
             hooks: Optional hooks instance for emitting observability events
                 and (always, when present) recording real usage for the
                 token meter via `llm:response` -- see `_on_llm_response`.
@@ -457,6 +565,42 @@ class SimpleContextManager:
         self.summarization_model = summarization_model
         self.summarization_prompt_path = summarization_prompt_path
         self.summarization_timeout_s = summarization_timeout_s
+        # --- Tool-result budget / shape / spill (all default no-op) ---
+        # Every one of these is validated the same way the other enums in
+        # this module are: an unusable value logs a warning and falls back to
+        # the pre-existing behavior rather than crashing mount(). A context
+        # manager that refuses to start is worse than one that runs at the
+        # old default and says so.
+        self.tool_result_budget_tokens = self._validate_budget_tokens(
+            tool_result_budget_tokens
+        )
+        if tool_result_shape not in _VALID_TOOL_RESULT_SHAPES:
+            logger.warning(
+                f"context-simple: unknown tool_result_shape {tool_result_shape!r} "
+                f"(expected one of {_VALID_TOOL_RESULT_SHAPES!r}); falling back to "
+                f"{TOOL_RESULT_SHAPE_HEAD!r}"
+            )
+            tool_result_shape = TOOL_RESULT_SHAPE_HEAD
+        self.tool_result_shape = tool_result_shape
+        self.tool_result_budget_by_tool = self._validate_budget_by_tool(
+            tool_result_budget_by_tool
+        )
+        self.tool_result_exempt_tools = frozenset(
+            str(t) for t in (tool_result_exempt_tools or []) if str(t)
+        )
+        self.tool_result_spill_dir = (
+            str(tool_result_spill_dir) if tool_result_spill_dir else None
+        )
+        # tool_call_id -> tool name, harvested from assistant tool_calls so a
+        # tool RESULT (which carries only the id) can be matched to a per-tool
+        # budget or exemption. Only populated when at least one of those two
+        # knobs is configured -- in the default configuration this map stays
+        # empty and add_message() does no extra work at all.
+        self._tool_name_by_call_id: dict[str, str] = {}
+        # Spill paths already written this session, so the same result is not
+        # re-written on every request (_apply_sticky_decisions re-derives the
+        # replacement text for every sticky-truncated message, every call).
+        self._spilled_paths: set[str] = set()
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
         # --- Summary compaction strategy state (compaction_strategy == "summary") ---
@@ -556,6 +700,12 @@ class SimpleContextManager:
             "metadata": {**(message.get("metadata") or {}), "_seq": self._next_seq},
         }
         self._next_seq += 1
+
+        # Harvest tool_call_id -> tool name for per-tool budgets/exemptions.
+        # Gated on config: in the default configuration this is a single
+        # boolean check and nothing else.
+        if self._per_tool_config_active():
+            self._harvest_tool_names(message)
 
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
@@ -884,10 +1034,17 @@ class SimpleContextManager:
         produced the transcript.
         """
         restamped: list[dict[str, Any]] = []
+        per_tool_active = self._per_tool_config_active()
+        self._tool_name_by_call_id = {}
         for i, msg in enumerate(messages):
             meta = dict(msg.get("metadata") or {})
             meta["_seq"] = i
             restamped.append({**msg, "metadata": meta})
+            # Rebuild the id->name map from the restored history, so a
+            # resumed session resolves per-tool budgets exactly as the
+            # original session did. No-op unless a per-tool knob is set.
+            if per_tool_active:
+                self._harvest_tool_names(msg)
         self.messages = restamped
         self._next_seq = len(restamped)
         # Seqs were just restamped from 0, so any anchor split recorded
@@ -915,6 +1072,12 @@ class SimpleContextManager:
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
         self._reset_hybrid_meter_state()
+        # Per-tool name map belongs to the cleared conversation. The spill
+        # cache is only a write-skip memo -- the files themselves are
+        # content-addressed and deliberately NOT deleted here (a resumed or
+        # forked session may still hold a pointer to one; see README).
+        self._tool_name_by_call_id = {}
+        self._spilled_paths = set()
         self._reset_summary_strategy_state()
         logger.info("Context cleared")
 
@@ -1994,6 +2157,13 @@ class SimpleContextManager:
             msg = messages[i]
             if msg.get("role") != "tool":  # Verify it's still a tool message
                 continue
+            if self._tool_result_is_exempt(msg):
+                # Skipped BEFORE _record_truncated so an exempt result is
+                # never marked truncated (which would inflate the reported
+                # truncation count and pin a permanent sticky decision that
+                # does nothing). No-op unless tool_result_exempt_tools is
+                # configured.
+                continue
             if not msg.get("_truncated"):
                 if true_total is None:
                     # First mutation in this call: establish the true baseline
@@ -2403,20 +2573,263 @@ class SimpleContextManager:
 
         return final_messages
 
+    # --- Tool-result budget / shape / spill helpers ---
+    #
+    # Every one of these is a no-op in the default configuration. See the
+    # module docstring "Tool-result budget and spill" for the measured
+    # rationale and the determinism constraint that shapes the spill design.
+
+    @staticmethod
+    def _validate_budget_tokens(value: Any) -> int | None:
+        """Coerce `tool_result_budget_tokens` to a positive int, or None.
+
+        None (the default) means "keep the pre-existing char budget".
+        Anything unusable logs a warning and becomes None -- i.e. falls back
+        to today's behavior rather than raising at mount time.
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+            logger.warning(
+                f"context-simple: tool_result_budget_tokens must be a positive "
+                f"int, got {value!r}; falling back to the truncate_chars "
+                f"char budget"
+            )
+            return None
+        return value
+
+    @staticmethod
+    def _validate_budget_by_tool(value: Any) -> dict[str, int]:
+        """Coerce `tool_result_budget_by_tool` to {tool_name: positive int}.
+
+        Unusable entries are dropped INDIVIDUALLY with a warning naming the
+        offending key, so one bad entry never silently discards the whole map
+        (and never crashes mount()).
+        """
+        if not value:
+            return {}
+        if not isinstance(value, dict):
+            logger.warning(
+                f"context-simple: tool_result_budget_by_tool must be a dict, "
+                f"got {type(value).__name__}; ignoring it"
+            )
+            return {}
+        cleaned: dict[str, int] = {}
+        for name, budget in value.items():
+            if (
+                isinstance(budget, bool)
+                or not isinstance(budget, int)
+                or budget < 1
+                or not str(name)
+            ):
+                logger.warning(
+                    f"context-simple: tool_result_budget_by_tool[{name!r}] must "
+                    f"be a positive int, got {budget!r}; dropping this entry"
+                )
+                continue
+            cleaned[str(name)] = budget
+        return cleaned
+
+    def _per_tool_config_active(self) -> bool:
+        """True when any knob needs a tool RESULT matched to a tool NAME."""
+        return bool(self.tool_result_budget_by_tool or self.tool_result_exempt_tools)
+
+    def _harvest_tool_names(self, message: dict[str, Any]) -> None:
+        """Record tool_call_id -> tool name from an assistant message.
+
+        A tool result carries only `tool_call_id`; the NAME lives on the
+        assistant message that requested the call. This harvests the mapping
+        incrementally as history is appended, so per-tool budget lookup is
+        O(1) and never rescans history. Handles both the OpenAI
+        (`{"id", "function": {"name"}}`) and Anthropic-ish
+        (`{"id", "name"}`) tool_call shapes -- the same two shapes
+        _format_messages_for_summarization already handles.
+
+        Called only when a per-tool knob is configured: in the default
+        configuration this never runs.
+        """
+        for tc in message.get("tool_calls") or []:
+            if not isinstance(tc, dict):
+                continue
+            call_id = tc.get("id") or tc.get("tool_call_id")
+            if "function" in tc and isinstance(tc["function"], dict):
+                name = tc["function"].get("name")
+            else:
+                name = tc.get("name") or tc.get("tool")
+            if call_id and name:
+                self._tool_name_by_call_id[str(call_id)] = str(name)
+
+    def _resolve_tool_name(self, msg: dict[str, Any]) -> str | None:
+        """Best-effort tool name for a tool RESULT message.
+
+        Three sources, in order of directness. Returning None simply means
+        no per-tool rule can apply to this message -- it falls through to the
+        global budget, which is the safe direction.
+        """
+        name = msg.get("name")
+        if isinstance(name, str) and name:
+            return name
+        meta_name = (msg.get("metadata") or {}).get("tool_name")
+        if isinstance(meta_name, str) and meta_name:
+            return meta_name
+        call_id = msg.get("tool_call_id")
+        if call_id:
+            return self._tool_name_by_call_id.get(str(call_id))
+        return None
+
+    def _tool_result_is_exempt(self, msg: dict[str, Any]) -> bool:
+        """True if this tool result must never be truncated."""
+        if not self.tool_result_exempt_tools:
+            return False
+        name = self._resolve_tool_name(msg)
+        return name is not None and name in self.tool_result_exempt_tools
+
+    def _resolve_tool_result_budget(self, msg: dict[str, Any]) -> tuple[int, str]:
+        """Return (budget_chars, shape) for one tool result.
+
+        Precedence: per-tool budget > global token budget > the pre-existing
+        `truncate_chars` char budget. The shape knob applies to whichever
+        budget won -- there is deliberately no per-tool shape, because a
+        per-tool budget with a global shape already covers every case the
+        reference implementations express, and a second per-tool map would
+        double the config surface for no measured gain.
+        """
+        budget_tokens: int | None = None
+        if self.tool_result_budget_by_tool:
+            name = self._resolve_tool_name(msg)
+            if name is not None:
+                budget_tokens = self.tool_result_budget_by_tool.get(name)
+        if budget_tokens is None:
+            budget_tokens = self.tool_result_budget_tokens
+        if budget_tokens is None:
+            # Nothing configured: the pre-existing char budget, head-only.
+            # This is the byte-identical default path.
+            return self.truncate_chars, TOOL_RESULT_SHAPE_HEAD
+        return budget_tokens * _TOOL_RESULT_CHARS_PER_TOKEN, self.tool_result_shape
+
+    def _spill_pointer(self, msg: dict[str, Any], content: str) -> str | None:
+        """Write the full result to the spill dir; return its path, or None.
+
+        DETERMINISM (load-bearing -- see module docstring): the returned path
+        is a pure function of `content` (+ the message's stable `_seq`) and
+        is returned REGARDLESS of whether the write succeeded. This method is
+        re-entered for every sticky-truncated message on every request; if
+        the pointer text tracked write success, one transient disk error
+        would change the bytes of an already-sent message and cold-rebuild
+        the prompt cache. A dangling pointer is visible and recoverable; a
+        silently mutated prefix is neither.
+
+        Content-addressing also makes the write idempotent across a resumed
+        or forked session: the same result always lands at the same path.
+        """
+        if not self.tool_result_spill_dir:
+            return None
+        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[
+            :16
+        ]
+        seq = self._extract_seq(msg)
+        stem = (
+            f"tool-result-{seq:06d}-{digest}"
+            if isinstance(seq, int)
+            else f"tool-result-{digest}"
+        )
+        path = Path(self.tool_result_spill_dir) / f"{stem}.txt"
+        path_str = str(path)
+        if path_str in self._spilled_paths:
+            return path_str
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if not path.exists():
+                # Write-then-rename so a reader (the agent, via its file
+                # tools) can never observe a half-written spill file.
+                tmp = path.parent / f"{path.name}.{id(self):x}.tmp"
+                tmp.write_text(content, encoding="utf-8")
+                tmp.replace(path)
+            self._spilled_paths.add(path_str)
+        except Exception as e:
+            # Deliberately NOT fatal and deliberately NOT reflected in the
+            # returned pointer -- see the determinism note above.
+            logger.warning(
+                f"context-simple: could not spill tool result to {path_str}: {e}. "
+                f"The pointer is still emitted (byte-stability); the file may "
+                f"be missing."
+            )
+        return path_str
+
+    def _format_truncated_tool_result(
+        self,
+        content: str,
+        budget_chars: int,
+        shape: str,
+        original_tokens: int,
+        spill_path: str | None,
+    ) -> str:
+        """Build the replacement text for one over-budget tool result.
+
+        BYTE-IDENTITY CONTRACT: with `budget_chars == self.truncate_chars`,
+        `shape == "head"` and `spill_path is None` -- i.e. the default
+        configuration -- this returns EXACTLY the string this module has
+        always returned. tests/test_tool_result_budget.py pins that literally.
+        """
+        recovery = (
+            f"read {spill_path} for the full result"
+            if spill_path
+            else "call tool again if needed"
+        )
+        header = f"[truncated: ~{original_tokens:,} tokens - {recovery}]"
+
+        if shape != TOOL_RESULT_SHAPE_HEAD_TAIL:
+            return f"{header} {content[:budget_chars]}..."
+
+        # head_tail: split the budget in half, keep both ends, and say
+        # explicitly how much vanished in between. The marker matters as much
+        # as the tail does -- a model must never reason from a truncated
+        # result without knowing that it is truncated.
+        head_chars = budget_chars // 2
+        tail_chars = budget_chars - head_chars
+        # content[-0:] is the WHOLE string, not the empty one; guard it.
+        tail = content[-tail_chars:] if tail_chars else ""
+        omitted = len(content) - head_chars - tail_chars
+        return (
+            f"{header} {content[:head_chars]}"
+            f"\n...[{omitted:,} chars omitted]...\n"
+            f"{tail}"
+        )
+
     def _truncate_tool_result(self, msg: dict[str, Any]) -> dict[str, Any]:
         """
         Truncate a tool result message to reduce token count.
 
         Returns a NEW dict - does not modify the original.
+
+        Deterministic: called once per over-budget tool result during an
+        escalation, and again for every sticky-truncated message on every
+        subsequent request (_apply_sticky_decisions). Same input, same bytes,
+        every time -- that is what the returned view's prefix stability rests
+        on.
         """
         content = msg.get("content", "")
-        if not isinstance(content, str) or len(content) <= self.truncate_chars:
+        if not isinstance(content, str):
+            return msg
+        if self._tool_result_is_exempt(msg):
+            # No-op unless tool_result_exempt_tools is configured.
+            return msg
+
+        budget_chars, shape = self._resolve_tool_result_budget(msg)
+        # CHARS BEFORE LINES: the gate below is, and has always been, a pure
+        # character count. There is no line-based cap anywhere in this path,
+        # so the "a file could have 2 lines that are each 10MB" failure mode
+        # is structurally impossible here rather than merely unlikely.
+        if len(content) <= budget_chars:
             return msg
 
         original_tokens = len(content) // 4
+        spill_path = self._spill_pointer(msg, content)
         return {
             **msg,
-            "content": f"[truncated: ~{original_tokens:,} tokens - call tool again if needed] {content[: self.truncate_chars]}...",
+            "content": self._format_truncated_tool_result(
+                content, budget_chars, shape, original_tokens, spill_path
+            ),
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
