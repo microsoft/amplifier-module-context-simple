@@ -155,6 +155,66 @@ Summary Compaction Strategy (opt-in, default off -- see config
     / trigger hysteresis). OPT-IN, EXPERIMENTAL -- do not enable by
     default.
 
+Cache-safe forking of the summarization call (opt-in, default off -- see
+config `summary_call_mode`; only consulted when compaction_strategy ==
+"summary"):
+  • THE PROBLEM. The summarizer's request is, today, a STANDALONE two
+    message call: its own ~955-char system prompt plus a freshly
+    formatted plain-text rendering of the span being absorbed. It shares
+    not one byte of prefix with the main line, so every token of the span
+    is billed as FRESH input -- even though the provider is already
+    holding that exact span in a warm cache for the main conversation.
+  • THE SHAPE THAT FIXES IT. `summary_call_mode: "fork"` re-issues the
+    same ask as a PURE APPEND onto the prefix the main line already sent:
+    [ ...the exact messages of the last request... ] + [ one user message
+    carrying the summarization instruction ]. Pure append is the one
+    mutation measured as a cache HIT under the grow-only rule (probe P4:
+    identical-repeat 9,789 HIT, pure-append 9,789 HIT, strict truncation
+    0 MISS, middle-drop 0 MISS). The span itself is NOT re-sent -- it is
+    already in the appended-to prefix; re-sending it would cost exactly
+    what standalone costs today PLUS the prefix, i.e. a regression.
+  • THE PROMPT MOVES INTO THE USER MESSAGE. The standalone call puts the
+    summarization prompt in a `role: "system"` message. A fork MUST NOT:
+    providers hoist every system-role message into a single top-level
+    system block, so a per-summarization system message would rewrite the
+    cached system prefix -- the exact failure mode already documented for
+    the summary tier and the compaction notice. In fork mode the prompt
+    rides the appended `role: "user"` message instead.
+  • THE MAIN LINE IS NEVER TOUCHED. The forked request is built from a
+    read-only snapshot. No `_seq` is consumed, nothing is appended to
+    `self.messages`, no sticky/removal state moves, and `_last_sent_estimate`
+    (the hybrid meter's conservatism comparand) is NOT rewritten -- which
+    is why the fork calls `_strip_internal_metadata` directly rather than
+    `_finalize_view`. The summary that eventually lands is produced by the
+    unchanged `_swap_in_pending_summary` path.
+  • A SILENTLY UNFORKED FORK IS THE FAILURE MODE THAT MATTERS. If the
+    forked request does not reproduce the parent's prefix byte-for-byte
+    it wins nothing AND pays for the whole conversation -- strictly worse
+    than standalone. So the fork is attempted ONLY when every alignment
+    precondition holds, and any miss falls back to the standalone call
+    LOUDLY (a warning naming the precondition, a counter, and the mode
+    actually used reported on `context:post_summarize` and in
+    `last_summary_call_stats`). It never silently half-forks.
+  • THE PRECONDITION YOU MUST WIRE. Tool specs are part of the cached
+    prefix (they are serialized ahead of the system block), and this
+    module is handed messages, never tools. So a caller that wants fork
+    mode MUST hand over the request it actually sent, via the optional
+    public `note_request_sent(messages=..., tools=..., model=...)` seam.
+    Without it the fork refuses (warning, once) and standalone is used.
+    Supplying `messages` too gives exact parity with what went on the
+    wire -- including any hook-injected tail the orchestrator appended
+    after this module returned its view, which is what an implicit,
+    match-forward-only cache (OpenAI) requires. With only `tools`, the
+    fork appends to this module's own last returned view, which is what
+    an explicit-breakpoint cache (Anthropic) needs, since the provider
+    places its breakpoint at the last STABLE message -- i.e. exactly
+    where this module's view ends.
+  • UNMEASURED. The gates (G-FORK-PREFIX / G-FORK-CACHED / G-FORK-COST /
+    G-FORK-NOBOUNDARY) are a separately funded eval; nothing in this
+    module claims a measured cache or cost win yet. What IS proven here
+    is structural: default byte-identity, main-line non-mutation, and
+    pure-append shape.
+
 Tool-result budget and spill (opt-in, default off -- see config
 `tool_result_budget_tokens` / `tool_result_shape` /
 `tool_result_budget_by_tool` / `tool_result_exempt_tools` /
@@ -288,6 +348,29 @@ _VALID_COMPACTION_STRATEGIES = (
     COMPACTION_STRATEGY_SUMMARY,
 )
 
+# summary_call_mode config values -- HOW the summarizer's own LLM call is
+# shaped when compaction_strategy == "summary". "standalone" (default) is
+# byte-identical to the pre-existing behavior: its own tiny two-message
+# request (system prompt + formatted span), sharing nothing with the main
+# line. "fork" issues the SAME summarization ask as a PURE APPEND onto the
+# prefix the main line already sent, so the provider's prompt cache can be
+# read instead of paying fresh input tokens for the span. See module
+# docstring "Cache-safe forking of the summarization call".
+#
+# "inline" is accepted as an alias for "standalone": the lane brief that
+# commissioned this work named the default mode "inline" while the work
+# item named it "standalone". Both mean "today's behavior, unchanged".
+SUMMARY_CALL_MODE_STANDALONE = "standalone"
+SUMMARY_CALL_MODE_FORK = "fork"
+_VALID_SUMMARY_CALL_MODES = (SUMMARY_CALL_MODE_STANDALONE, SUMMARY_CALL_MODE_FORK)
+_SUMMARY_CALL_MODE_ALIASES = {"inline": SUMMARY_CALL_MODE_STANDALONE}
+
+# How much of the span's final message is quoted back in the fork
+# instruction as the "summarize up to HERE" boundary marker. Long enough to
+# be unambiguous in a real transcript, short enough that it is never a
+# material share of the appended (uncached) tail.
+_FORK_BOUNDARY_EXCERPT_CHARS = 300
+
 # tool_result_shape config values. "head" (default) keeps the leading slice
 # only -- the pre-existing behavior. "head_tail" splits the budget in half
 # and keeps both ends with an explicit omission marker between them. See
@@ -419,6 +502,28 @@ discovered during the conversation.
 """
 
 
+def _normalize_summary_call_mode(value: Any) -> str:
+    """Canonicalize a `summary_call_mode` config value.
+
+    Accepts the two real modes plus the documented "inline" alias for
+    "standalone" (the commissioning lane brief and the work item named the
+    same default differently -- see _SUMMARY_CALL_MODE_ALIASES). An
+    unusable value logs a warning and falls back to "standalone", matching
+    how every other enum in this module is validated: a context manager
+    that refuses to start is worse than one that runs at the old default
+    and says so.
+    """
+    mode = _SUMMARY_CALL_MODE_ALIASES.get(value, value)
+    if mode not in _VALID_SUMMARY_CALL_MODES:
+        logger.warning(
+            f"context-simple: unknown summary_call_mode {value!r} (expected "
+            f"one of {_VALID_SUMMARY_CALL_MODES!r}); falling back to "
+            f"{SUMMARY_CALL_MODE_STANDALONE!r}"
+        )
+        return SUMMARY_CALL_MODE_STANDALONE
+    return mode
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the simple context manager.
@@ -476,8 +581,21 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               boundaries / +83% run cost in the T0/T1 eval. Raising this
               is the cheapest lever; see README "Known issue: boundary
               refire".
+            - summary_call_mode: "standalone" (default, byte-identical to the
+              pre-existing summarizer call) or "fork" -- issue the
+              summarization ask as a pure append onto the prefix the main
+              line already sent, so it can be cache-read instead of paying
+              fresh input tokens for the span. "inline" is accepted as an
+              alias for "standalone". Only consulted when
+              compaction_strategy == "summary". Fork mode additionally
+              requires the caller to have called note_request_sent(); see
+              module docstring "Cache-safe forking of the summarization
+              call".
             - summarization_model: Model identifier passed to the summarizer's
-              ChatRequest (default: None, i.e. provider default).
+              ChatRequest (default: None, i.e. provider default). Setting it
+              CONFLICTS with summary_call_mode "fork" (a summarizer routed to
+              a different model cannot read the main line's cache) and makes
+              the fork fall back to standalone, loudly.
             - summarization_prompt_path: Path to a file overriding
               DEFAULT_SUMMARIZATION_PROMPT (default: None).
             - summarization_timeout_s: Seconds to wait for the summarizer's
@@ -538,6 +656,10 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
 
+    summary_call_mode = _normalize_summary_call_mode(
+        config.get("summary_call_mode", SUMMARY_CALL_MODE_STANDALONE)
+    )
+
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
@@ -561,6 +683,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         ),
         compaction_strategy=compaction_strategy,
         summary_trigger=config.get("summary_trigger", 0.60),
+        summary_call_mode=summary_call_mode,
         summarization_model=config.get("summarization_model"),
         summarization_prompt_path=config.get("summarization_prompt_path"),
         summarization_timeout_s=config.get("summarization_timeout_s", 30.0),
@@ -652,6 +775,7 @@ class SimpleContextManager:
         compact_max_consecutive_skips: int = DEFAULT_MAX_CONSECUTIVE_SKIPS,
         compaction_strategy: str = COMPACTION_STRATEGY_PROGRESSIVE,
         summary_trigger: float = 0.60,
+        summary_call_mode: str = SUMMARY_CALL_MODE_STANDALONE,
         summarization_model: str | None = None,
         summarization_prompt_path: str | None = None,
         summarization_timeout_s: float = 30.0,
@@ -717,8 +841,21 @@ class SimpleContextManager:
                 compaction boundaries (+84%) and run cost (+83%) -- see
                 module docstring and README "Known issue: boundary
                 refire".
+            summary_call_mode: "standalone" (default; the pre-existing
+                two-message summarizer call, byte-identical) or "fork" (the
+                same ask appended onto the main line's already-sent prefix
+                so the provider can cache-read it). "inline" is an accepted
+                alias for "standalone". Only consulted when
+                compaction_strategy == "summary". See module docstring
+                "Cache-safe forking of the summarization call" -- in
+                particular, fork mode needs note_request_sent() to have been
+                called, and falls back to standalone (loudly) when it has
+                not.
             summarization_model: Model identifier for the summarizer's own
                 ChatRequest. None uses the provider's default model.
+                Incompatible with summary_call_mode "fork" -- a summarizer
+                pointed at another model reads no cache the main line wrote,
+                so the fork falls back to standalone rather than pretending.
             summarization_prompt_path: Path to a file overriding
                 DEFAULT_SUMMARIZATION_PROMPT. None uses the built-in prompt.
             summarization_timeout_s: Seconds to wait for the summarizer's
@@ -778,6 +915,7 @@ class SimpleContextManager:
             )
             compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
         self.compaction_strategy = compaction_strategy
+        self.summary_call_mode = _normalize_summary_call_mode(summary_call_mode)
         self.summary_trigger = summary_trigger
         self.summarization_model = summarization_model
         self.summarization_prompt_path = summarization_prompt_path
@@ -852,6 +990,43 @@ class SimpleContextManager:
         self._summarization_failures: int = 0
         self._summarization_task: "asyncio.Task[None] | None" = None
         self._summary_absorbed_count: int = 0
+        # --- Cache-safe summarizer fork state (summary_call_mode == "fork") ---
+        # ALL of these stay None/0/False unless BOTH compaction_strategy ==
+        # "summary" AND summary_call_mode == "fork"; nothing below is even
+        # written in any other configuration (see _finalize_view), which is
+        # what makes the default path byte-identical by construction rather
+        # than by inspection.
+        #
+        # `_last_request_view` is this module's own last returned view, kept
+        # PRE-strip (it still carries `_seq`) so the fork can verify the span
+        # it was asked to summarize is actually present in the prefix it is
+        # about to append to. `_sent_*` is the richer, optional truth handed
+        # over by the caller through note_request_sent().
+        #
+        # `_view_serial` / `_sent_serial` exist for one reason: a caller
+        # that wires note_request_sent() ONCE (at startup, in a helper that
+        # only runs on the first turn) would otherwise hand the fork a
+        # request from turn 1 to append to on turn 40. That prefix is not
+        # the parent's prefix any more, so appending to it is a guaranteed
+        # miss AND a wasted cache write -- a silent misalignment wearing a
+        # correct-looking API call. Matching serials is how "the caller told
+        # us about THIS request" is distinguished from "the caller told us
+        # about SOME request, once".
+        self._last_request_view: list[dict[str, Any]] | None = None
+        self._view_serial: int = 0
+        self._sent_messages: list[dict[str, Any]] | None = None
+        self._sent_serial: int | None = None
+        self._sent_tools: Any = None
+        self._sent_tools_supplied: bool = False
+        self._sent_model: str | None = None
+        # Observability: what the LAST summarizer call actually did, and how
+        # many times a requested fork had to fall back. An eval arm reads
+        # these to tell a real fork from a silently unforked one.
+        self._last_summary_call: dict[str, Any] | None = None
+        self._summary_fork_fallbacks: int = 0
+        # Precondition names already warned about, so a session that can
+        # never fork logs once per reason instead of once per summarization.
+        self._fork_warned: set[str] = set()
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
         # most recent real usage observed via `llm:response`
@@ -978,6 +1153,78 @@ class SimpleContextManager:
         """
         self._system_prompt_factory = factory
         logger.info("System prompt factory registered - will refresh on each request")
+
+    def note_request_sent(
+        self,
+        messages: list[dict[str, Any]] | None = None,
+        *,
+        tools: Any = None,
+        model: str | None = None,
+    ) -> None:
+        """OPTIONAL. Tell this module what request the caller actually sent.
+
+        This exists for exactly one reason: `summary_call_mode: "fork"`
+        re-issues the summarization ask as a PURE APPEND onto the prefix the
+        main line already sent, and this module cannot see that prefix in
+        full. It is handed messages; it is never handed the tool specs, and
+        it never sees the hook-injected tail an orchestrator may append
+        AFTER `get_messages_for_request()` returns. Both are part of what a
+        provider caches -- tool specs are serialized ahead of the system
+        block -- so a fork built without them is not an append onto the
+        cached prefix at all, and would pay full price for the whole
+        conversation. That is strictly worse than the standalone call it
+        replaces, so fork mode refuses to run without this.
+
+        Completely inert unless BOTH compaction_strategy == "summary" AND
+        summary_call_mode == "fork". Never mutates history: nothing here
+        enters `self.messages`, consumes a `_seq`, or moves any compaction
+        state. Callers that do not know about it lose nothing.
+
+        Call it EVERY request, not once. A `messages` record is only used
+        while it still describes the most recent request this module served
+        -- a one-time wiring would otherwise have turn 40's fork append to
+        turn 1's request, which is a guaranteed cache miss dressed up as a
+        correct API call. A stale record is ignored (this module's own last
+        view is used instead), never trusted.
+
+        Args:
+            messages: The exact message array sent, if known. Gives the fork
+                byte-parity with the wire -- required for an implicit,
+                match-forward-only cache (OpenAI, whose measured behavior
+                misses on anything that is not a strict superset of a cached
+                request). Omit it and the fork appends to this module's own
+                last returned view instead, which is what an
+                explicit-breakpoint cache (Anthropic) needs, since the
+                breakpoint lands on the last STABLE message -- exactly where
+                this module's view ends, before any ephemeral injection.
+            tools: The tool specs sent, in the order sent. Passing this at
+                all -- even as None or [] for a genuinely tool-free session
+                -- is what arms fork mode; "not supplied" and "supplied as
+                empty" are deliberately distinguishable, because guessing
+                between them is how a fork silently misaligns.
+            model: The resolved model, if the caller knows it. Pins the
+                fork to the same model the parent used; a summarizer routed
+                elsewhere reads no cache the main line wrote.
+        """
+        if messages is not None:
+            self._sent_messages = list(messages)
+            self._sent_serial = self._view_serial
+        self._sent_tools = list(tools) if isinstance(tools, list) else tools
+        self._sent_tools_supplied = True
+        if model is not None:
+            self._sent_model = model
+
+    @property
+    def last_summary_call_stats(self) -> dict[str, Any] | None:
+        """What the most recent summarizer call actually did.
+
+        None before the first one. Otherwise a dict with `mode_requested`,
+        `mode_used`, `reason` (None when the requested mode was honored),
+        `prefix_messages`, and `fork_fallbacks` (session-cumulative). This
+        is how an eval arm distinguishes a real fork from a silently
+        unforked one WITHOUT patching the module.
+        """
+        return dict(self._last_summary_call) if self._last_summary_call else None
 
     async def get_messages_for_request(
         self,
@@ -1370,6 +1617,19 @@ class SimpleContextManager:
         self._summarization_failures = 0
         self._summarization_task = None
         self._summary_absorbed_count = 0
+        # Fork state is history-derived: a reset session's old prefix is not
+        # a prefix of anything any more, and the caller's note_request_sent()
+        # facts describe a request that no longer relates to this history.
+        # Keeping either would be exactly the stale-alignment bug fork mode
+        # exists to refuse. `_summary_fork_fallbacks` is a session-cumulative
+        # observability counter and deliberately survives.
+        self._last_request_view = None
+        self._view_serial = 0
+        self._sent_messages = None
+        self._sent_serial = None
+        self._sent_tools = None
+        self._sent_tools_supplied = False
+        self._sent_model = None
 
     async def should_compact(self) -> bool:
         """Check if context should be compacted.
@@ -1509,6 +1769,14 @@ class SimpleContextManager:
         """
         view = self._strip_internal_metadata(messages)
         self._last_sent_estimate = self._estimate_tokens(view)
+        # Remember the PRE-strip list (it still carries `_seq`) so a forked
+        # summarizer call can both reproduce this exact view byte-for-byte
+        # AND verify the span it was asked to summarize is present in it.
+        # Guarded so the default path allocates nothing new and stays
+        # byte-identical by construction, not by inspection.
+        if self._fork_armed():
+            self._last_request_view = list(messages)
+            self._view_serial += 1
         return view
 
     def _cache_aggregates(self) -> dict[str, int] | None:
@@ -3762,9 +4030,18 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             )
             return
 
+        # Snapshot the fork prefix HERE, synchronously, rather than letting
+        # the background task read it whenever it happens to be scheduled.
+        # `_last_request_view` is rewritten on every request; a task that
+        # read it later would append to a prefix chosen by scheduling order.
+        # Capturing at trigger time makes the forked request a pure function
+        # of this moment -- deterministic, and therefore testable. None in
+        # every configuration but fork.
+        fork_prefix = self._capture_fork_prefix()
+
         self._is_summarizing = True
         self._summarization_task = asyncio.create_task(
-            self._run_summary_compaction_task(seqs)
+            self._run_summary_compaction_task(seqs, fork_prefix=fork_prefix)
         )
 
     def _select_summary_absorb_seqs(self, excess_tokens: int) -> list[int] | None:
@@ -3881,7 +4158,284 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 return 0
         return 0  # defensive; unreachable given the termination argument above
 
-    async def _run_summary_compaction_task(self, seqs: list[int]) -> None:
+    # --- Cache-safe fork of the summarizer call (summary_call_mode) --------
+    #
+    # Everything from here to _run_summary_compaction_task is inert unless
+    # BOTH compaction_strategy == "summary" AND summary_call_mode == "fork".
+    # The default path never calls any of it (see _build_summary_request's
+    # first branch), which is what makes "default is byte-identical" a
+    # structural property rather than a claim.
+
+    def _fork_armed(self) -> bool:
+        """True only when a forked summarizer call is actually configured."""
+        return (
+            self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY
+            and self.summary_call_mode == SUMMARY_CALL_MODE_FORK
+        )
+
+    def _capture_fork_prefix(self) -> list[dict[str, Any]] | None:
+        """Snapshot the message array a forked call would append to.
+
+        Prefers the caller's own `note_request_sent(messages=...)` record
+        (byte-parity with the wire, including any tail the orchestrator
+        injected after this module returned). Falls back to this module's
+        last returned view, which still ends exactly where an
+        explicit-breakpoint provider places its cache breakpoint.
+        """
+        if not self._fork_armed():
+            return None
+        source = self._last_request_view
+        if self._sent_messages is not None:
+            if self._sent_serial == self._view_serial:
+                source = self._sent_messages
+            else:
+                logger.debug(
+                    "context-simple: ignoring a stale note_request_sent() "
+                    f"message record (recorded at view {self._sent_serial}, "
+                    f"now at view {self._view_serial}); appending to this "
+                    "module's own last returned view instead"
+                )
+        return list(source) if source is not None else None
+
+    @staticmethod
+    def _message_identity(msg: dict[str, Any]) -> tuple[str, str, str]:
+        """A content-level identity for a message, used only to check span
+        presence when the prefix came from a caller and therefore had its
+        internal `_seq` already stripped."""
+        return (
+            str(msg.get("role", "")),
+            str(msg.get("content", "")),
+            str(msg.get("tool_call_id", "")),
+        )
+
+    def _prefix_contains_span(
+        self, prefix: list[dict[str, Any]], span: list[dict[str, Any]]
+    ) -> bool:
+        """Is every message of the span actually present in the prefix?
+
+        A fork does NOT re-send the span -- the whole point is that the span
+        is already inside the prefix being appended to. If it is not (a
+        compaction removed it between the last request and this trigger),
+        the forked call would be asking the model to summarize text it
+        cannot see. Checked by `_seq` when the prefix carries them, and by
+        content identity when it came from a caller (post-strip).
+        """
+        prefix_seqs = {self._extract_seq(m) for m in prefix} - {None}
+        span_seqs = {self._extract_seq(m) for m in span} - {None}
+        if span_seqs and span_seqs <= prefix_seqs:
+            return True
+        present = {self._message_identity(m) for m in prefix}
+        return all(self._message_identity(m) in present for m in span)
+
+    def _fork_refusal_reason(
+        self,
+        messages_to_summarize: list[dict[str, Any]],
+        fork_prefix: list[dict[str, Any]] | None,
+    ) -> str | None:
+        """Why this summarization CANNOT be forked, or None if it can.
+
+        Every branch here is a case where the forked request would not be a
+        true append onto the parent's cached prefix. A fork that misses pays
+        for the entire conversation as fresh input -- strictly worse than
+        the standalone call it replaces -- so each of these falls back
+        rather than half-forking.
+        """
+        if not self._sent_tools_supplied:
+            return (
+                "note_request_sent() has never been called, so the tool specs "
+                "the parent sent are unknown; tool specs are serialized ahead "
+                "of the system block, so a fork without them is not an append "
+                "onto the cached prefix at all"
+            )
+        if self.summarization_model:
+            return (
+                f"summarization_model={self.summarization_model!r} points the "
+                "summarizer at a different model than the main line, which "
+                "reads none of the cache the main line wrote"
+            )
+        if not fork_prefix:
+            return (
+                "no request has been recorded yet, so there is no prefix to "
+                "append to"
+            )
+        if fork_prefix[-1].get("tool_calls"):
+            return (
+                "the prefix ends on an assistant turn with unanswered "
+                "tool_calls; appending a user message there would interleave "
+                "between tool_use and tool_result"
+            )
+        if not self._prefix_contains_span(fork_prefix, messages_to_summarize):
+            return (
+                "the span selected for absorption is not present in the "
+                "recorded prefix, so a forked call could not see the text it "
+                "was asked to summarize"
+            )
+        return None
+
+    def _note_fork_fallback(self, reason: str) -> None:
+        """Record and (once per distinct reason) announce a refused fork.
+
+        WARNING level and counted, never silent: a fork that quietly did not
+        happen is the exact failure mode that makes this treatment look like
+        it does not work. Once per reason, not once per call, so a session
+        that can never fork logs a handful of lines instead of hundreds.
+        """
+        self._summary_fork_fallbacks += 1
+        if reason in self._fork_warned:
+            logger.debug(f"context-simple: summarizer fork refused again ({reason})")
+            return
+        self._fork_warned.add(reason)
+        logger.warning(
+            f"context-simple: summary_call_mode='fork' requested but this "
+            f"summarization ran STANDALONE instead -- {reason}. The standalone "
+            "call is correct and costs what it always did; no cache reuse was "
+            "attempted. This is logged once per distinct reason."
+        )
+
+    def _span_boundary_excerpt(self, msg: dict[str, Any]) -> str:
+        """A short verbatim excerpt of the span's final message, used as the
+        'summarize up to HERE' marker in the fork instruction."""
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            parts: list[str] = []
+            for block in content:
+                if isinstance(block, dict):
+                    text = block.get("text", "")
+                    if text:
+                        parts.append(str(text))
+                elif hasattr(block, "text"):
+                    parts.append(str(block.text))
+            content = "\n".join(parts)
+        text = str(content).strip()
+        if not text:
+            # A tool_calls-only assistant turn has no text of its own; name
+            # the tools instead of emitting an empty, useless marker.
+            names = [
+                str(tc.get("name") or tc.get("tool") or "")
+                for tc in (msg.get("tool_calls") or [])
+                if isinstance(tc, dict)
+            ]
+            names = [n for n in names if n]
+            text = (
+                f"[{msg.get('role', 'unknown')} turn calling: {', '.join(names)}]"
+                if names
+                else f"[{msg.get('role', 'unknown')} turn with no text content]"
+            )
+        if len(text) > _FORK_BOUNDARY_EXCERPT_CHARS:
+            text = text[:_FORK_BOUNDARY_EXCERPT_CHARS] + "..."
+        return text
+
+    def _format_fork_instruction(
+        self, messages_to_summarize: list[dict[str, Any]], prompt: str
+    ) -> str:
+        """The single user message a forked call appends.
+
+        Carries the summarization prompt (which in standalone mode is a
+        `role: "system"` message -- see module docstring for why a fork must
+        NOT add one) plus explicit scoping, because a fork does not re-send
+        the span: the model reads it from the prefix it is already holding,
+        so the instruction has to say which part of that prefix to
+        summarize. This is a REAL difference from standalone, which scopes
+        by construction: standalone can only see the span, a fork can see
+        everything and is asked to attend to the span.
+        """
+        n = len(messages_to_summarize)
+        excerpt = self._span_boundary_excerpt(messages_to_summarize[-1])
+        return (
+            f"{prompt}\n\n"
+            "SCOPE OF THIS SUMMARY. Summarize ONLY the OLDEST part of the "
+            f"conversation above: the first {n} message(s) following the "
+            "system prompt -- the span about to be retired from context to "
+            "make room. That span ENDS with the message excerpted below. Do "
+            "not summarize anything after it, and do not describe this "
+            "instruction.\n\n"
+            "--- final message of the span (verbatim excerpt) ---\n"
+            f"{excerpt}\n"
+            "--- end excerpt ---"
+        )
+
+    def _build_summary_request(
+        self,
+        messages_to_summarize: list[dict[str, Any]],
+        fork_prefix: list[dict[str, Any]] | None,
+    ) -> tuple[Any, str, str | None]:
+        """Build the summarizer's ChatRequest.
+
+        Returns (request, mode_actually_used, fallback_reason_or_None). The
+        standalone branch below is verbatim the pre-existing call and is the
+        ONLY branch reachable unless fork mode is both configured and
+        satisfiable.
+        """
+        from amplifier_core import ChatRequest, Message
+
+        prompt = self._get_summarization_prompt()
+        reason: str | None = None
+
+        if self._fork_armed():
+            reason = self._fork_refusal_reason(messages_to_summarize, fork_prefix)
+            if reason is None:
+                try:
+                    assert fork_prefix is not None  # guaranteed by the check above
+                    return (
+                        self._build_fork_request(
+                            messages_to_summarize, fork_prefix, prompt
+                        ),
+                        SUMMARY_CALL_MODE_FORK,
+                        None,
+                    )
+                except Exception as e:
+                    # A prefix message this module never created (unexpected
+                    # content shape from a caller, say) can fail Message
+                    # validation. Falling back keeps the summary happening at
+                    # today's cost instead of turning a cache optimization
+                    # into a lost summary.
+                    reason = f"the forked request could not be built ({e!r})"
+            self._note_fork_fallback(reason)
+
+        formatted = self._format_messages_for_summarization(messages_to_summarize)
+        request = ChatRequest(
+            messages=[
+                Message(role="system", content=prompt),
+                Message(role="user", content=formatted),
+            ],
+            model=self.summarization_model,
+        )
+        return request, SUMMARY_CALL_MODE_STANDALONE, reason
+
+    def _build_fork_request(
+        self,
+        messages_to_summarize: list[dict[str, Any]],
+        fork_prefix: list[dict[str, Any]],
+        prompt: str,
+    ) -> Any:
+        """The forked request: the parent's prefix, then ONE appended user
+        message. Nothing else -- no extra system message, no re-sent span,
+        no reordering.
+
+        Deliberately calls `_strip_internal_metadata` and NOT
+        `_finalize_view`: the latter also rewrites `_last_sent_estimate`,
+        the hybrid meter's conservatism comparand, which describes the view
+        the MAIN line sent. A summarizer call must not move it.
+        """
+        from amplifier_core import ChatRequest, Message
+
+        prefix_view = self._strip_internal_metadata(fork_prefix)
+        messages = [Message(**msg) for msg in prefix_view]
+        messages.append(
+            Message(
+                role="user",
+                content=self._format_fork_instruction(messages_to_summarize, prompt),
+            )
+        )
+        return ChatRequest(
+            messages=messages,
+            tools=self._sent_tools,
+            model=self._sent_model,
+        )
+
+    async def _run_summary_compaction_task(
+        self, seqs: list[int], fork_prefix: list[dict[str, Any]] | None = None
+    ) -> None:
         """Background task: call the summarizer over the message span
         identified by `seqs` and stash the result in `_pending_summary` for
         the next get_messages_for_request()/_compact_ephemeral() call to
@@ -3908,24 +4462,29 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             if provider is None:
                 raise RuntimeError("no cached provider available for summary compaction")
 
-            prompt = self._get_summarization_prompt()
-            formatted = self._format_messages_for_summarization(messages_to_summarize)
-
-            from amplifier_core import ChatRequest, Message
-
-            request = ChatRequest(
-                messages=[
-                    Message(role="system", content=prompt),
-                    Message(role="user", content=formatted),
-                ],
-                model=self.summarization_model,
+            request, call_mode, fallback_reason = self._build_summary_request(
+                messages_to_summarize, fork_prefix
             )
+            self._last_summary_call = {
+                "mode_requested": self.summary_call_mode,
+                "mode_used": call_mode,
+                "reason": fallback_reason,
+                "prefix_messages": (
+                    len(request.messages) - 1
+                    if call_mode == SUMMARY_CALL_MODE_FORK
+                    else 0
+                ),
+                "fork_fallbacks": self._summary_fork_fallbacks,
+            }
 
             if self._hooks is not None:
                 try:
                     await self._hooks.emit(
                         "context:pre_summarize",
-                        {"message_count": len(messages_to_summarize)},
+                        {
+                            "message_count": len(messages_to_summarize),
+                            "call_mode": call_mode,
+                        },
                     )
                 except Exception as e:
                     logger.warning(f"Could not emit context:pre_summarize: {e}")
@@ -3944,7 +4503,10 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 try:
                     await self._hooks.emit(
                         "context:post_summarize",
-                        {"summary_length": len(summary_text)},
+                        {
+                            "summary_length": len(summary_text),
+                            "call_mode": call_mode,
+                        },
                     )
                 except Exception as e:
                     logger.warning(f"Could not emit context:post_summarize: {e}")
