@@ -31,6 +31,27 @@ Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
     arrived this session (falling back to the estimator before then, or
     whenever hooks/events are unavailable). Default is `"estimate"`, which
     keeps behavior byte-identical to before this feature existed.
+  • Set `token_meter: "hybrid"` to ANCHOR on the provider's own reported
+    total from the last response and apply the heuristic ONLY to items
+    appended since that anchor (openai/codex's shape), carrying the
+    PROVENANCE of the resulting number -- `kind` in
+    {'usage','estimated','none'} -- on every count
+    (deepseek-harness's shape). Two guards ride with it:
+      - CONSERVATISM: if the provider total is below what the heuristic
+        priced for the same billed content, the anchor is rejected and
+        the count is honestly marked kind='estimated'.
+      - REFUSE TO GUESS: optional cache aggregates are reported only when
+        EVERY usage event this session carried them; otherwise undefined.
+    G-METER-PROVENANCE: in this mode no irreversible action (the
+    compaction trigger) is taken on a count that is not kind='usage'.
+    The single recorded escape -- no anchor has EVER arrived AND the
+    count has reached 100% of budget, where refusing would guarantee a
+    provider hard-failure -- fires, logs a warning, and is counted
+    separately as a provenance OVERRIDE rather than a clean fire.
+  • ALL THREE meters (estimate / actual / hybrid) are computed on every
+    request in EVERY mode and reported via `_last_token_meter_stats` and
+    the `context:token_meter` event, so their divergence is measurable
+    without changing which one drives the trigger.
   • Ported from amplifier-module-context-handoff's proven `_on_llm_response`
     meter. See README "Real-usage token meter" for the full rationale.
 
@@ -97,7 +118,23 @@ logger = logging.getLogger(__name__)
 # SimpleContextManager._measure_working_tokens.
 TOKEN_METER_ESTIMATE = "estimate"
 TOKEN_METER_ACTUAL = "actual"
-_VALID_TOKEN_METERS = (TOKEN_METER_ESTIMATE, TOKEN_METER_ACTUAL)
+TOKEN_METER_HYBRID = "hybrid"
+_VALID_TOKEN_METERS = (
+    TOKEN_METER_ESTIMATE,
+    TOKEN_METER_ACTUAL,
+    TOKEN_METER_HYBRID,
+)
+
+# Provenance of a token count (`kind`), reported on EVERY count this module
+# produces -- lifted from deepseek-harness's `baseline.kind`. "usage" means
+# the number is anchored on the provider's own reported usage;
+# "estimated" means it came from the len(str)//4 heuristic (in whole or in
+# part, or the anchor was rejected by the conservatism guard); "none" means
+# there was nothing to price. G-METER-PROVENANCE: in `hybrid` mode, no
+# irreversible action may be taken on a count whose kind is not "usage".
+METER_KIND_USAGE = "usage"
+METER_KIND_ESTIMATED = "estimated"
+METER_KIND_NONE = "none"
 
 # compaction_strategy config values. "progressive" (default) preserves the
 # existing truncate/remove ladder exactly (byte-identical -- see module
@@ -173,8 +210,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compaction_notice_verbosity: Notice detail level - "minimal", "normal", "verbose" (default: "normal")
             - compaction_notice_min_level: Only show notice if compaction level >= this (default: 1)
             - output_reserve_fraction: Fraction of max_output_tokens to reserve for responses (default: 0.5)
-            - token_meter: "estimate" (default) or "actual". "estimate" is
-              byte-identical to pre-existing behavior. "actual" drives the
+            - token_meter: "estimate" (default), "actual" or "hybrid".
+              "estimate" is byte-identical to pre-existing behavior.
+              "hybrid" anchors on the provider's own reported total and
+              estimates only the un-billed tail, carrying provenance
+              (`kind`) that gates irreversible actions -- see module
+              docstring. "actual" drives the
               compaction trigger from real provider usage (input_tokens +
               cache_write_tokens, observed via the `llm:response` hook)
               once at least one response has been observed this session,
@@ -354,7 +395,9 @@ class SimpleContextManager:
                 responses (0.0-1.0, default: 0.5). Lower values give more context
                 budget at the cost of less headroom for long responses.
             token_meter: "estimate" (default, byte-identical to pre-existing
-                behavior) or "actual" (compaction trigger uses real provider
+                behavior), "hybrid" (provider-anchored total + heuristic
+                for the un-billed tail, with provenance gating
+                irreversible actions), or "actual" (compaction trigger uses real provider
                 usage from the `llm:response` hook once observed this
                 session -- see module docstring "Real-Usage Token Meter").
                 An unrecognized value falls back to "estimate" with a
@@ -435,6 +478,31 @@ class SimpleContextManager:
         # "estimate" mode -- see README "Real-usage token meter".
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
+        # --- Hybrid meter state (token_meter == "hybrid") ---
+        # `_anchor_seq` is `_next_seq` frozen at the moment the anchor was
+        # recorded: every message whose `_seq` is >= it was appended AFTER
+        # the request the provider billed, so it is exactly the un-billed
+        # tail the heuristic is still allowed to price (codex's shape).
+        # `_anchor_estimate` is what the heuristic said about the view that
+        # was actually SENT on that request -- the comparand for the
+        # conservatism guard (deepseek's shape). `_last_sent_estimate` is
+        # the running value that becomes `_anchor_estimate` when the next
+        # llm:response arrives.
+        self._anchor_seq: int | None = None
+        self._anchor_estimate: int | None = None
+        self._last_sent_estimate: int | None = None
+        self._last_hybrid_tokens: int | None = None
+        self._last_hybrid_kind: str = METER_KIND_NONE
+        # Refuse-to-guess accounting for optional cache aggregates: they are
+        # reported ONLY when every usage event seen this session carried
+        # them, else undefined (None). Never partially summed.
+        self._usage_events: int = 0
+        self._usage_events_with_cache: int = 0
+        self._usage_cache_read_total: int = 0
+        self._usage_cache_write_total: int = 0
+        # G-METER-PROVENANCE accounting (observability; see _should_compact).
+        self._provenance_refusals: int = 0
+        self._provenance_overrides: int = 0
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
 
         # --- Sticky compaction decision state ---
@@ -603,18 +671,51 @@ class SimpleContextManager:
             # Static mode: use messages as-is (may include stored system messages)
             working_messages = list(self.messages)
 
-        token_count, meter_source, estimated_tokens = self._measure_working_tokens(
-            working_messages
-        )
+        (
+            token_count,
+            meter_source,
+            estimated_tokens,
+            meter,
+        ) = self._measure_working_tokens(working_messages)
         self._last_token_meter_stats = {
             "mode": self.token_meter,
             "source": meter_source,
+            # Provenance of `used_tokens` -- present on 100% of counts, in
+            # every mode (G-METER-PROVENANCE).
+            "kind": meter["kind"],
             "used_tokens": token_count,
+            # All three meters, computed simultaneously on every request,
+            # regardless of which one is actually driving the trigger. This is
+            # what makes the estimate-vs-hybrid-vs-actual divergence
+            # measurable without changing behaviour (POC-05 G-METER-DELTA).
             "estimated_tokens": estimated_tokens,
             "measured_tokens": self._last_measured_prompt_tokens,
+            "hybrid_tokens": meter["hybrid_tokens"],
+            "hybrid_kind": meter["hybrid_kind"],
+            "anchor_tokens": meter["anchor_tokens"],
+            "anchor_estimate": meter["anchor_estimate"],
+            "anchor_rejected": meter["anchor_rejected"],
+            "tail_estimated_tokens": meter["tail_estimated_tokens"],
+            "tail_messages": meter["tail_messages"],
+            # Undefined (None) unless EVERY usage event this session reported
+            # cache fields -- refuse to guess, never a partial sum.
+            "cache_aggregates": self._cache_aggregates(),
+            "provenance_refusals": self._provenance_refusals,
+            "provenance_overrides": self._provenance_overrides,
             "budget": effective_budget,
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
+
+        # Observability emit: lets an eval harness capture all three meters
+        # per request without patching this module. Never raises, never
+        # changes the view that is returned.
+        if self._hooks is not None:
+            try:
+                await self._hooks.emit(
+                    "context:token_meter", dict(self._last_token_meter_stats)
+                )
+            except Exception as e:  # pragma: no cover - defensive
+                logger.debug(f"Could not emit context:token_meter event: {e}")
 
         # Summary compaction strategy: trigger an async background
         # summarization call EARLY (well before compact_threshold, so it has
@@ -625,7 +726,7 @@ class SimpleContextManager:
             await self._maybe_trigger_summary_compaction(token_count, effective_budget)
 
         # Check if compaction needed (using effective budget with notice reserve deducted)
-        if self._should_compact(token_count, effective_budget):
+        if self._should_compact(token_count, effective_budget, meter["kind"]):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
                 effective_budget, working_messages
@@ -713,9 +814,9 @@ class SimpleContextManager:
             # Strip internal bookkeeping at the module boundary -- everything
             # above this point (sticky decisions, token accounting) still runs
             # on messages carrying `_seq`; only what leaves has it removed.
-            return self._strip_internal_metadata(compacted)
+            return self._finalize_view(compacted)
 
-        return self._strip_internal_metadata(working_messages)
+        return self._finalize_view(working_messages)
 
     # Metadata keys that are internal bookkeeping only and must never cross
     # the module boundary into a provider-facing view. `_seq` is sticky
@@ -789,6 +890,11 @@ class SimpleContextManager:
             restamped.append({**msg, "metadata": meta})
         self.messages = restamped
         self._next_seq = len(restamped)
+        # Seqs were just restamped from 0, so any anchor split recorded
+        # against the OLD numbering is meaningless -- and worse, would
+        # silently classify restored history as an un-billed tail. Drop it;
+        # the meter re-anchors on the next llm:response.
+        self._reset_hybrid_meter_state()
         self._removed_seqs = set()
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
@@ -808,6 +914,7 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
+        self._reset_hybrid_meter_state()
         self._reset_summary_strategy_state()
         logger.info("Context cleared")
 
@@ -849,10 +956,54 @@ class SimpleContextManager:
         """
         pass
 
-    def _should_compact(self, token_count: int, budget: int) -> bool:
-        """Check if context should be compacted."""
+    def _should_compact(
+        self, token_count: int, budget: int, kind: str | None = None
+    ) -> bool:
+        """Check if context should be compacted.
+
+        `kind` is the PROVENANCE of `token_count` (see METER_KIND_*). It is
+        only consulted in `token_meter: "hybrid"` mode, where G-METER-PROVENANCE
+        applies: firing compaction is an irreversible action (it destroys the
+        provider's prompt cache for at least one request and permanently
+        records sticky truncate/remove decisions), so it may NOT be taken on a
+        number the provider never anchored.
+
+        The one deliberate escape, recorded rather than hidden: if NO anchor
+        has ever arrived this session AND the count has reached 100% of
+        budget, refusing would guarantee a provider hard-failure on the very
+        next request, which is strictly worse than acting on an estimate. That
+        path fires, logs a warning, and is counted separately in
+        `_provenance_overrides` so a gate reports it honestly instead of it
+        looking like a clean pass. It cannot mask a guard-rejected anchor: it
+        requires that no measurement exists at all.
+        """
         usage = token_count / budget if budget > 0 else 0
         should = usage >= self.compact_threshold
+        if (
+            should
+            and self.token_meter == TOKEN_METER_HYBRID
+            and kind is not None
+            and kind != METER_KIND_USAGE
+        ):
+            if self._last_measured_prompt_tokens is None and usage >= 1.0:
+                self._provenance_overrides += 1
+                logger.warning(
+                    f"context-simple: token_meter='hybrid' firing compaction on an "
+                    f"UNANCHORED count ({token_count:,} tokens = {usage:.1%} of "
+                    f"budget) because no provider usage has been observed this "
+                    f"session and the count has reached the hard ceiling; "
+                    f"refusing would guarantee a context-overflow failure. "
+                    f"Recorded as a provenance override, not a clean fire."
+                )
+                return True
+            self._provenance_refusals += 1
+            logger.info(
+                f"context-simple: token_meter='hybrid' REFUSING to fire compaction "
+                f"on kind={kind!r} ({token_count:,} tokens = {usage:.1%} of budget) "
+                f"-- G-METER-PROVENANCE: no irreversible action on an un-anchored "
+                f"number. Waiting for provider-reported usage."
+            )
+            return False
         if should:
             logger.info(
                 f"Context at {usage:.1%} capacity ({token_count:,}/{budget:,} tokens), "
@@ -869,8 +1020,19 @@ class SimpleContextManager:
         In token_meter="actual" mode with a real measurement available, the
         REAL measurement decides this, not `estimated_tokens` -- see module
         docstring "Real-Usage Token Meter" and _measure_working_tokens for
-        the identical mode/fallback logic. Falls back to `estimated_tokens`
-        in "estimate" mode, or whenever no real measurement has arrived yet.
+        the identical mode/fallback logic. In token_meter="hybrid" mode the
+        hybrid number decides it, but ONLY when that number is anchored
+        (kind == 'usage'); an estimated hybrid count falls through to the
+        estimator branch rather than driving an escalation -- the same
+        G-METER-PROVENANCE rule _should_compact applies to the outer trigger.
+        Falls back to `estimated_tokens` in "estimate" mode, or whenever no
+        real measurement has arrived yet.
+
+        NOTE (unchanged from "actual" mode, and equally true here): only the
+        GATE uses the anchored number. The SIZING of the reduction --
+        target_tokens and every per-level termination check -- is still the
+        estimator throughout, because a billed token count for a hypothetical
+        smaller message set does not exist without another round-trip.
         """
         if budget <= 0:
             return False
@@ -879,18 +1041,199 @@ class SimpleContextManager:
             and self._last_measured_prompt_tokens is not None
         ):
             return (self._last_measured_prompt_tokens / budget) >= self.compact_threshold
+        if (
+            self.token_meter == TOKEN_METER_HYBRID
+            and self._last_hybrid_tokens is not None
+            and self._last_hybrid_kind == METER_KIND_USAGE
+        ):
+            return (self._last_hybrid_tokens / budget) >= self.compact_threshold
         return (estimated_tokens / budget) >= self.compact_threshold
+
+    def _reset_hybrid_meter_state(self) -> None:
+        """Drop every hybrid-meter reading. Called from clear() and from
+        set_messages() (which restamps `_seq` from 0, invalidating any
+        recorded anchor split). Observability-only in the default
+        "estimate" mode -- these fields never drive that mode's trigger."""
+        self._anchor_seq = None
+        self._anchor_estimate = None
+        self._last_sent_estimate = None
+        self._last_hybrid_tokens = None
+        self._last_hybrid_kind = METER_KIND_NONE
+        self._usage_events = 0
+        self._usage_events_with_cache = 0
+        self._usage_cache_read_total = 0
+        self._usage_cache_write_total = 0
+
+    def _finalize_view(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Strip internal metadata and record the heuristic price of the view
+        that is actually being SENT.
+
+        That recorded number is the conservatism guard's comparand: when the
+        next `llm:response` arrives, its provider total describes THIS view,
+        so "is the provider total below what the heuristic would say for the
+        same content?" is only a meaningful question against the estimate of
+        the view that was sent -- not against the full, uncompacted history.
+        """
+        view = self._strip_internal_metadata(messages)
+        self._last_sent_estimate = self._estimate_tokens(view)
+        return view
+
+    def _cache_aggregates(self) -> dict[str, int] | None:
+        """Session cache aggregates, or None if UNDEFINED.
+
+        Refuse-to-guess rule, lifted from deepseek-harness's
+        `deriveTurnTokenUsage`: an optional aggregate is reported only when
+        EVERY usage event observed this session reported the underlying
+        fields. One event missing them makes the aggregate undefined -- a
+        partial sum that silently under-reports is worse than no number.
+        """
+        if self._usage_events == 0:
+            return None
+        if self._usage_events_with_cache != self._usage_events:
+            return None
+        return {
+            "events": self._usage_events,
+            "cache_read_tokens": self._usage_cache_read_total,
+            "cache_write_tokens": self._usage_cache_write_total,
+        }
+
+    def _hybrid_split(
+        self, working_messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        """Split `working_messages` into (billed prefix, un-billed tail) at
+        the recorded anchor.
+
+        A message belongs to the tail iff it carries a `_seq` >= `_anchor_seq`
+        -- i.e. it was appended after the request the provider billed.
+        Messages with no `_seq` at all (the factory-generated system prompt)
+        are treated as PREFIX: they were part of the billed request, and
+        pricing them into the tail on top of an anchor that already contains
+        them would double-count the single largest block in the window.
+        """
+        if self._anchor_seq is None:
+            return list(working_messages), []
+        prefix: list[dict[str, Any]] = []
+        tail: list[dict[str, Any]] = []
+        for msg in working_messages:
+            seq = self._extract_seq(msg)
+            if seq is not None and seq >= self._anchor_seq:
+                tail.append(msg)
+            else:
+                prefix.append(msg)
+        return prefix, tail
+
+    def _measure_hybrid(
+        self, working_messages: list[dict[str, Any]], estimated_tokens: int
+    ) -> dict[str, Any]:
+        """Compute the hybrid (provider-anchored + provenance) token count.
+
+            total = provider_reported_total_from_the_last_llm_response
+                  + estimate(items appended since that response)
+
+        This is codex's shape (never price the whole window by heuristic when
+        the provider has already said what the window cost; heuristic only the
+        un-billed tail) with deepseek's provenance and conservatism guard
+        bolted on.
+
+        Returns a dict carrying the number AND its provenance. Computed on
+        every request in every mode, so the estimate-vs-hybrid-vs-actual
+        divergence is observable without changing which meter drives the
+        trigger.
+
+        Guards:
+          * CONSERVATISM -- if the provider's total is BELOW what the
+            heuristic priced for the same sent content, the anchor is not
+            trustworthy as a floor; reject it, report the (larger) full
+            heuristic, and mark kind='estimated'. Never let a number that may
+            under-state occupancy authorise an irreversible action.
+          * REFUSE TO GUESS -- with no anchor at all this is honestly
+            kind='estimated', not a hybrid number wearing a usage label.
+        """
+        if not working_messages:
+            return {
+                "hybrid_tokens": 0,
+                "hybrid_kind": METER_KIND_NONE,
+                "anchor_tokens": None,
+                "anchor_estimate": None,
+                "anchor_rejected": False,
+                "tail_estimated_tokens": 0,
+                "tail_messages": 0,
+                "reason": "no_messages",
+            }
+
+        anchor = self._last_measured_prompt_tokens
+        if anchor is None:
+            return {
+                "hybrid_tokens": estimated_tokens,
+                "hybrid_kind": METER_KIND_ESTIMATED,
+                "anchor_tokens": None,
+                "anchor_estimate": None,
+                "anchor_rejected": False,
+                "tail_estimated_tokens": None,
+                "tail_messages": None,
+                "reason": "no_anchor",
+            }
+
+        _prefix, tail = self._hybrid_split(working_messages)
+        tail_estimate = self._estimate_tokens(tail)
+
+        if anchor <= 0:
+            # A non-positive provider total is not a measurement of anything.
+            # OBSERVED LIVE, not hypothetical: during this feature's own
+            # divergence capture a provider returned HTTP 200 with an
+            # all-zero usage block mid-run (input_tokens=0, output_tokens=0)
+            # on a ~38k-token request. Trusting that as an anchor would have
+            # asserted the context was EMPTY. The comparand guard below
+            # catches it whenever a sent-estimate exists; this catches the
+            # case where one does not.
+            return {
+                "hybrid_tokens": estimated_tokens,
+                "hybrid_kind": METER_KIND_ESTIMATED,
+                "anchor_tokens": anchor,
+                "anchor_estimate": self._anchor_estimate,
+                "anchor_rejected": True,
+                "tail_estimated_tokens": tail_estimate,
+                "tail_messages": len(tail),
+                "reason": "anchor_non_positive",
+            }
+
+        if self._anchor_estimate is not None and anchor < self._anchor_estimate:
+            # Conservatism guard fired: the provider total is smaller than the
+            # heuristic price of the very content it billed, so it cannot be
+            # trusted as a floor for this window.
+            return {
+                "hybrid_tokens": estimated_tokens,
+                "hybrid_kind": METER_KIND_ESTIMATED,
+                "anchor_tokens": anchor,
+                "anchor_estimate": self._anchor_estimate,
+                "anchor_rejected": True,
+                "tail_estimated_tokens": tail_estimate,
+                "tail_messages": len(tail),
+                "reason": "anchor_below_heuristic",
+            }
+
+        return {
+            "hybrid_tokens": anchor + tail_estimate,
+            "hybrid_kind": METER_KIND_USAGE,
+            "anchor_tokens": anchor,
+            "anchor_estimate": self._anchor_estimate,
+            "anchor_rejected": False,
+            "tail_estimated_tokens": tail_estimate,
+            "tail_messages": len(tail),
+            "reason": None,
+        }
 
     def _measure_working_tokens(
         self, working_messages: list[dict[str, Any]]
-    ) -> tuple[int, str, int]:
-        """Return (token_count, source, estimated_tokens) used to evaluate
-        the compaction trigger this call.
+    ) -> tuple[int, str, int, dict[str, Any]]:
+        """Return (token_count, source, estimated_tokens, meter) used to
+        evaluate the compaction trigger this call.
 
         `estimated_tokens` is ALWAYS the len(str)//4 heuristic over
-        `working_messages` (see _estimate_tokens) -- computed unconditionally
-        so the estimator-vs-real-usage drift this meter exists to close is
-        observable via `_last_token_meter_stats` regardless of mode.
+        `working_messages` (see _estimate_tokens), and `meter` ALWAYS carries
+        the hybrid number too -- both computed unconditionally so all three
+        meters (estimate / actual / hybrid) are observable per request via
+        `_last_token_meter_stats` regardless of mode.
 
         `token_count`/`source` are what actually drives `_should_compact`:
 
@@ -902,16 +1245,41 @@ class SimpleContextManager:
           `llm:response` (input_tokens + cache_write_tokens -- see
           `_on_llm_response`), source "measured", if one has arrived this
           session; otherwise falls back to `estimated_tokens`, source
-          "estimate" (before the first response of the session, or
-          whenever hooks/events are unavailable).
+          "estimate".
+        - token_meter == "hybrid": the provider-anchored total plus a
+          heuristic price for the un-billed tail, source "hybrid" -- see
+          `_measure_hybrid`. Its provenance (`kind`) rides along and gates
+          irreversible actions in `_should_compact`.
+
+        `meter["kind"]` is the provenance of the RETURNED `token_count` (not
+        of the hybrid number, which is reported separately as `hybrid_kind`)
+        -- so 100% of counts this module produces carry a provenance, in
+        every mode.
         """
         estimated_tokens = self._estimate_tokens(working_messages)
+        hybrid = self._measure_hybrid(working_messages, estimated_tokens)
+        self._last_hybrid_tokens = hybrid["hybrid_tokens"]
+        self._last_hybrid_kind = hybrid["hybrid_kind"]
+
         if (
             self.token_meter == TOKEN_METER_ACTUAL
             and self._last_measured_prompt_tokens is not None
         ):
-            return self._last_measured_prompt_tokens, "measured", estimated_tokens
-        return estimated_tokens, "estimate", estimated_tokens
+            meter = {**hybrid, "kind": METER_KIND_USAGE}
+            return (
+                self._last_measured_prompt_tokens,
+                "measured",
+                estimated_tokens,
+                meter,
+            )
+
+        if self.token_meter == TOKEN_METER_HYBRID:
+            meter = {**hybrid, "kind": hybrid["hybrid_kind"]}
+            return hybrid["hybrid_tokens"], "hybrid", estimated_tokens, meter
+
+        kind = METER_KIND_NONE if not working_messages else METER_KIND_ESTIMATED
+        meter = {**hybrid, "kind": kind}
+        return estimated_tokens, "estimate", estimated_tokens, meter
 
     async def _on_llm_response(self, event: str, data: dict[str, Any]) -> Any:
         """Hook handler for the canonical `llm:response` event -- records the
@@ -953,6 +1321,20 @@ class SimpleContextManager:
         if isinstance(input_tokens, int | float):
             total = int(input_tokens) + int(cache_write_tokens)
             self._last_measured_prompt_tokens = total
+            # Hybrid meter bookkeeping (no-op for the trigger unless
+            # token_meter == "hybrid"; recorded always so the hybrid number
+            # is observable in every mode -- see _measure_hybrid).
+            self._anchor_seq = self._next_seq
+            self._anchor_estimate = self._last_sent_estimate
+            self._usage_events += 1
+            cache_read = usage.get("cache_read_tokens")
+            cache_write_reported = usage.get("cache_write_tokens")
+            if isinstance(cache_read, int | float) and isinstance(
+                cache_write_reported, int | float
+            ):
+                self._usage_events_with_cache += 1
+                self._usage_cache_read_total += int(cache_read)
+                self._usage_cache_write_total += int(cache_write_reported)
             logger.debug(
                 f"context-simple: token_meter recorded real usage from "
                 f"llm:response -- input_tokens={int(input_tokens):,} + "
