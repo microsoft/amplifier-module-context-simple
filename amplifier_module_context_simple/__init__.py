@@ -165,7 +165,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compact_threshold: Trigger compaction at this usage (default: 0.92)
             - target_usage: Compact down to this usage (default: 0.50)
             - protected_recent: Always protect last N% of messages (default: 0.30)
-            - protected_tool_results: Always protect last N tool results (default: 5)
+            - protected_tool_results: Always protect last N tool results (default: 5;
+              0 protects none)
             - truncate_chars: Characters to keep when truncating tool results (default: 250)
             - compaction_notice_enabled: Enable compaction notice (default: True)
             - compaction_notice_token_reserve: Tokens to reserve for notice (default: 800)
@@ -341,7 +342,9 @@ class SimpleContextManager:
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
-            protected_tool_results: Always protect last N tool results from truncation
+            protected_tool_results: Always protect last N tool results from
+                truncation. 0 (or negative) protects NONE of them -- every tool
+                result becomes truncation-eligible.
             truncate_chars: Characters to keep when truncating tool results
             compaction_notice_enabled: Enable compaction notice injection
             compaction_notice_token_reserve: Tokens to reserve for notice
@@ -1240,9 +1243,7 @@ class SimpleContextManager:
         total_tools = len(tool_result_indices)
 
         # Always protect the last N tool results from truncation
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
-        )
+        protected_tool_indices = self._protected_tool_indices(tool_result_indices)
 
         # Calculate wave boundaries (25% chunks)
         wave1_end = int(total_tools * 0.25)
@@ -1343,9 +1344,7 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
-        )
+        protected_tool_indices = self._protected_tool_indices(tool_result_indices)
         wave3_start = int(len(tool_result_indices) * 0.50)
         wave3_end = int(len(tool_result_indices) * 0.75)
 
@@ -1410,9 +1409,7 @@ class SimpleContextManager:
         tool_result_indices = [
             i for i, msg in enumerate(working_messages) if msg.get("role") == "tool"
         ]
-        protected_tool_indices = set(
-            tool_result_indices[-self.protected_tool_results :]
-        )
+        protected_tool_indices = self._protected_tool_indices(tool_result_indices)
 
         truncated, current_tokens = self._truncate_tool_wave(
             working_messages,
@@ -1545,6 +1542,28 @@ class SimpleContextManager:
             budget,
             target_tokens,
         )
+
+    def _protected_tool_indices(self, tool_result_indices: list[int]) -> set[int]:
+        """
+        The set of tool-result indices that truncation must never touch:
+        the LAST `self.protected_tool_results` of them.
+
+        The zero guard is load-bearing, not defensive. Python's `list[-0:]`
+        is `list[0:]` -- the WHOLE list -- so the obvious spelling
+        `set(tool_result_indices[-self.protected_tool_results:])` inverts the
+        knob's meaning at exactly one value: `protected_tool_results=0`, which
+        reads as "protect nothing", would instead protect EVERYTHING. Every
+        truncation rung (levels 1, 2, 4, 6) then becomes a no-op and
+        compaction escalates straight to message REMOVAL, which is strictly
+        more lossy than the truncation it skipped.
+
+        A negative value is treated the same as 0 (protect nothing) rather
+        than being handed to the slice, where it would silently mean
+        "protect the last |n|" -- the opposite of what a negative reads like.
+        """
+        if self.protected_tool_results <= 0:
+            return set()
+        return set(tool_result_indices[-self.protected_tool_results :])
 
     def _truncate_tool_wave(
         self,
