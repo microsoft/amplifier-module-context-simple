@@ -1174,6 +1174,26 @@ class SimpleContextManager:
         _prefix, tail = self._hybrid_split(working_messages)
         tail_estimate = self._estimate_tokens(tail)
 
+        if anchor <= 0:
+            # A non-positive provider total is not a measurement of anything.
+            # OBSERVED LIVE, not hypothetical: during this feature's own
+            # divergence capture a provider returned HTTP 200 with an
+            # all-zero usage block mid-run (input_tokens=0, output_tokens=0)
+            # on a ~38k-token request. Trusting that as an anchor would have
+            # asserted the context was EMPTY. The comparand guard below
+            # catches it whenever a sent-estimate exists; this catches the
+            # case where one does not.
+            return {
+                "hybrid_tokens": estimated_tokens,
+                "hybrid_kind": METER_KIND_ESTIMATED,
+                "anchor_tokens": anchor,
+                "anchor_estimate": self._anchor_estimate,
+                "anchor_rejected": True,
+                "tail_estimated_tokens": tail_estimate,
+                "tail_messages": len(tail),
+                "reason": "anchor_non_positive",
+            }
+
         if self._anchor_estimate is not None and anchor < self._anchor_estimate:
             # Conservatism guard fired: the provider total is smaller than the
             # heuristic price of the very content it billed, so it cannot be

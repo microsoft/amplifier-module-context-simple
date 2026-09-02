@@ -524,3 +524,50 @@ async def test_mount_accepts_hybrid():
 async def test_unknown_token_meter_still_degrades_to_estimate(caplog):
     context = SimpleContextManager(token_meter="hybird")  # typo on purpose
     assert context.token_meter == "estimate"
+
+
+@pytest.mark.asyncio
+async def test_non_positive_anchor_is_never_trusted():
+    """A provider total of zero is not a measurement. Observed live during
+    this feature's own divergence capture: a provider returned HTTP 200 with
+    an all-zero usage block mid-run on a ~38k-token request. Trusting it
+    would have asserted the context was empty."""
+    context = SimpleContextManager(
+        max_tokens=1_000_000, compact_threshold=0.99, token_meter=TOKEN_METER_HYBRID
+    )
+    await context.add_message({"role": "user", "content": BIG})
+    # No prior send, so there is no comparand for the conservatism guard --
+    # this must still be refused on its own merits.
+    await _anchor(context, 0)
+
+    await context.get_messages_for_request()
+    stats = context._last_token_meter_stats
+
+    assert stats["anchor_tokens"] == 0
+    assert stats["anchor_rejected"] is True
+    assert stats["hybrid_kind"] == METER_KIND_ESTIMATED
+    assert stats["hybrid_tokens"] == stats["estimated_tokens"]
+
+
+@pytest.mark.asyncio
+async def test_zero_usage_report_after_real_traffic_is_rejected_by_the_guard():
+    """The same anomaly, in the shape it was actually observed: several real
+    responses, then one zero-usage response. The conservatism guard must
+    reject it rather than let the count collapse to ~zero."""
+    context = SimpleContextManager(
+        max_tokens=1_000_000, compact_threshold=0.99, token_meter=TOKEN_METER_HYBRID
+    )
+    for i in range(4):
+        await context.add_message({"role": "user", "content": f"m{i} {BIG}"})
+    await context.get_messages_for_request()
+    await _anchor(context, context._last_sent_estimate * 2)
+    await context.get_messages_for_request()
+    assert context._last_token_meter_stats["hybrid_kind"] == METER_KIND_USAGE
+
+    await _anchor(context, 0)  # provider anomaly
+    await context.get_messages_for_request()
+    stats = context._last_token_meter_stats
+
+    assert stats["anchor_rejected"] is True
+    assert stats["hybrid_kind"] == METER_KIND_ESTIMATED
+    assert stats["hybrid_tokens"] == stats["estimated_tokens"]
