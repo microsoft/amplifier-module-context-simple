@@ -666,7 +666,7 @@ authority was $0 and none of it was used.
 
 | deliverable | status |
 |---|---|
-| DRAFT PR on origin, branch `lane/2o9-clear-at-least`, default byte-identical, full suite green | **DONE** |
+| DRAFT PR on origin, branch `lane/2o9-clear-at-least`, default byte-identical, full suite green | **DONE** — [microsoft/amplifier-module-context-simple#26](https://github.com/microsoft/amplifier-module-context-simple/pull/26) (draft, rebased on `3972070`) |
 | Tests for block / allow / default byte-identity / prefix stability | **DONE** — 41 new tests, 249 passed + 1 skipped total |
 | Follow-up eval item filed with a Given/When/Then gate | **DONE** — `model_performance-wxs`, filed `discovered-from` this item |
 | DONE-NOTE.md in the PR body | **DONE** — this note |
