@@ -33,14 +33,57 @@ Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
     keeps behavior byte-identical to before this feature existed.
   • Ported from amplifier-module-context-handoff's proven `_on_llm_response`
     meter. See README "Real-usage token meter" for the full rationale.
+
+Summary Compaction Strategy (opt-in, default off -- see config
+`compaction_strategy`):
+  • `compaction_strategy: "progressive"` (default) is this module's
+    existing truncate/remove ladder, completely unchanged -- byte-identical
+    to before this feature existed.
+  • `compaction_strategy: "summary"` absorbs the oldest non-protected span
+    into an LLM-generated rolling summary instead of truncating/removing
+    it. The IDEAS (structured 5-section prompt, early-async-trigger
+    design) are lifted from amplifier-bundle-context-managed's rolling
+    summarizer; ALL plumbing is rebuilt on this module's own sticky/_seq
+    machinery rather than that donor's index-based splice-and-swap -- see
+    the "Summary compaction strategy" section in
+    _select_summary_absorb_seqs/_snap_absorb_boundary/
+    _swap_in_pending_summary below for why, and README "Summary
+    compaction strategy" for the measured donor defects this avoids
+    (a dropped tool-call/result pair, and a `role: "system"` summary tier
+    that measurably busted the provider's system-prompt cache breakpoint).
+  • The summary message is role="user" (never "system"), wrapped in a
+    `<system-reminder source="context-summary">` envelope, and persists as
+    stable history (not ephemeral, unlike the tail compaction notice).
+  • MOTIVATED by retention (the progressive ladder is lossy; a summary
+    keeps a lossy-but-real account of the absorbed span). It is NOT a
+    cache-cost play: like the progressive ladder, this still shrinks what
+    the model sees each turn, which under a grow-only cache is still a
+    cold rebuild at the moment of absorption.
+  • MEASURED (T0/T1 eval, n=3 vs n=5, S5-CRAC -- see README "Summary
+    compaction strategy" for the full table): the mechanism is validated
+    (zero tool-pair errors; agent system prompt byte-stable, 1 hash/run;
+    append-only) but NO retention benefit is demonstrated -- 94.0 vs 94.4
+    on a SATURATED metric (both arms 40/40 constraints, 20/20
+    post-compaction, every run). Absence of evidence, not evidence of
+    parity-by-design; a discriminating scenario does not exist yet.
+  • KNOWN ISSUE, measured: +83% run cost and +84% compaction boundaries
+    vs the progressive baseline, via a boundary-refire loop (absorbing a
+    span shrinks the request below summary_trigger, so it refires
+    sooner). The summarizer itself is only 8-11% of run cost. Not fixed
+    here; see README for the candidate levers (cooldown / absolute floor
+    / trigger hysteresis). OPT-IN, EXPERIMENTAL -- do not enable by
+    default.
 """
 
 # Amplifier module metadata
 __amplifier_module_type__ = "context"
 
+import asyncio
+import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -55,6 +98,60 @@ logger = logging.getLogger(__name__)
 TOKEN_METER_ESTIMATE = "estimate"
 TOKEN_METER_ACTUAL = "actual"
 _VALID_TOKEN_METERS = (TOKEN_METER_ESTIMATE, TOKEN_METER_ACTUAL)
+
+# compaction_strategy config values. "progressive" (default) preserves the
+# existing truncate/remove ladder exactly (byte-identical -- see module
+# docstring "Summary compaction strategy"). "summary" opts in to absorbing
+# the oldest non-protected span into an LLM-generated rolling summary
+# instead of truncating/removing it outright.
+COMPACTION_STRATEGY_PROGRESSIVE = "progressive"
+COMPACTION_STRATEGY_SUMMARY = "summary"
+_VALID_COMPACTION_STRATEGIES = (
+    COMPACTION_STRATEGY_PROGRESSIVE,
+    COMPACTION_STRATEGY_SUMMARY,
+)
+
+# The summary message's envelope source tag and metadata type marker. The
+# envelope is what makes foundation's is_real_user_message() classify this
+# role="user" message as NOT a real user turn (see module docstring); the
+# metadata type marker is how this module recognizes its own past summary
+# messages (so they are never re-absorbed into a later summary).
+_SUMMARY_ENVELOPE_SOURCE = "context-summary"
+_SUMMARY_METADATA_TYPE = "context_summary"
+
+# Default 5-section summarization prompt, lifted near-verbatim from
+# amplifier-bundle-context-managed's modules/context-managed/__init__.py:71-97
+# (the donor's structured summarization prompt -- see README "Summary
+# compaction strategy" for full provenance). The donor's two
+# `read_transcript` tool references are deliberately dropped: this module
+# ships no transcript tool, and pointing an agent at a tool that does not
+# exist would be actively misleading. File-overridable via
+# `summarization_prompt_path`, mirroring the donor's own
+# `summarization_prompt_path` config knob.
+DEFAULT_SUMMARIZATION_PROMPT = """\
+Produce a compact summary of the conversation so far. Use the following sections:
+
+## User Requests & Decisions
+List the key requests made by the user and any important decisions reached.
+
+## Files Examined or Modified
+List files that were read, analyzed, or modified during the conversation.
+
+## Errors Encountered & Resolutions
+Describe any errors, failures, or unexpected behavior encountered, and how they were resolved.
+
+## Current Task State
+Describe the current state of work -- what has been completed, what is in progress, and what remains.
+
+## Key Technical Details
+Note any important technical constraints, patterns, configurations, or implementation details
+discovered during the conversation.
+
+## Guidelines
+- Be factual and concise. Do not speculate beyond what the conversation contains.
+- Preserve numeric values, file paths, error messages, and command outputs exactly.
+- Each section may be omitted if there is nothing to report for it.
+"""
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -83,6 +180,29 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               falling back to the estimator before then. An unrecognized
               value falls back to "estimate" with a logged warning rather
               than crashing mount(). See module docstring.
+            - compaction_strategy: "progressive" (default) or "summary". See
+              module docstring "Summary compaction strategy". An
+              unrecognized value falls back to "progressive" with a logged
+              warning rather than crashing mount().
+            - summary_trigger: Usage fraction (0.0-1.0) at which the summary
+              strategy starts an async background summarization call, well
+              ahead of compact_threshold so it has time to finish before
+              tokens must actually be shed (default: 0.60). Only consulted
+              when compaction_strategy == "summary". KNOWN ISSUE: because
+              absorbing a span shrinks the request back below this
+              fraction, an aggressive (low) trigger refires sooner and
+              measurably multiplies compaction boundaries -- +84%
+              boundaries / +83% run cost in the T0/T1 eval. Raising this
+              is the cheapest lever; see README "Known issue: boundary
+              refire".
+            - summarization_model: Model identifier passed to the summarizer's
+              ChatRequest (default: None, i.e. provider default).
+            - summarization_prompt_path: Path to a file overriding
+              DEFAULT_SUMMARIZATION_PROMPT (default: None).
+            - summarization_timeout_s: Seconds to wait for the summarizer's
+              provider.complete() call before treating it as a failure and
+              falling back to progressive compaction for that pass
+              (default: 30.0).
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -99,6 +219,17 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         token_meter = TOKEN_METER_ESTIMATE
 
+    compaction_strategy = config.get(
+        "compaction_strategy", COMPACTION_STRATEGY_PROGRESSIVE
+    )
+    if compaction_strategy not in _VALID_COMPACTION_STRATEGIES:
+        logger.warning(
+            f"context-simple: unknown compaction_strategy {compaction_strategy!r} "
+            f"(expected one of {_VALID_COMPACTION_STRATEGIES!r}); falling back to "
+            f"{COMPACTION_STRATEGY_PROGRESSIVE!r}"
+        )
+        compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
+
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
@@ -114,6 +245,11 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
         output_reserve_fraction=config.get("output_reserve_fraction", 0.5),
         token_meter=token_meter,
+        compaction_strategy=compaction_strategy,
+        summary_trigger=config.get("summary_trigger", 0.60),
+        summarization_model=config.get("summarization_model"),
+        summarization_prompt_path=config.get("summarization_prompt_path"),
+        summarization_timeout_s=config.get("summarization_timeout_s", 30.0),
         hooks=getattr(coordinator, "hooks", None),
     )
 
@@ -190,6 +326,11 @@ class SimpleContextManager:
         compaction_notice_min_level: int = 1,
         output_reserve_fraction: float = 0.5,
         token_meter: str = TOKEN_METER_ESTIMATE,
+        compaction_strategy: str = COMPACTION_STRATEGY_PROGRESSIVE,
+        summary_trigger: float = 0.60,
+        summarization_model: str | None = None,
+        summarization_prompt_path: str | None = None,
+        summarization_timeout_s: float = 30.0,
         hooks: Any = None,
     ):
         """
@@ -215,6 +356,25 @@ class SimpleContextManager:
                 session -- see module docstring "Real-Usage Token Meter").
                 An unrecognized value falls back to "estimate" with a
                 logged warning rather than raising.
+            compaction_strategy: "progressive" (default, byte-identical to
+                pre-existing behavior) or "summary" -- see module docstring
+                "Summary compaction strategy". An unrecognized value falls
+                back to "progressive" with a logged warning rather than
+                raising.
+            summary_trigger: Usage fraction (0.0-1.0) at which the summary
+                strategy kicks off an async background summarization call.
+                Only consulted when compaction_strategy == "summary".
+                KNOWN ISSUE (measured): a low trigger refires soon after
+                each absorption shrinks the request, multiplying
+                compaction boundaries (+84%) and run cost (+83%) -- see
+                module docstring and README "Known issue: boundary
+                refire".
+            summarization_model: Model identifier for the summarizer's own
+                ChatRequest. None uses the provider's default model.
+            summarization_prompt_path: Path to a file overriding
+                DEFAULT_SUMMARIZATION_PROMPT. None uses the built-in prompt.
+            summarization_timeout_s: Seconds to wait for the summarizer's
+                provider.complete() call before treating it as a failure.
             hooks: Optional hooks instance for emitting observability events
                 and (always, when present) recording real usage for the
                 token meter via `llm:response` -- see `_on_llm_response`.
@@ -239,8 +399,28 @@ class SimpleContextManager:
             )
             token_meter = TOKEN_METER_ESTIMATE
         self.token_meter = token_meter
+        if compaction_strategy not in _VALID_COMPACTION_STRATEGIES:
+            logger.warning(
+                f"context-simple: unknown compaction_strategy {compaction_strategy!r} "
+                f"(expected one of {_VALID_COMPACTION_STRATEGIES!r}); falling back to "
+                f"{COMPACTION_STRATEGY_PROGRESSIVE!r}"
+            )
+            compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
+        self.compaction_strategy = compaction_strategy
+        self.summary_trigger = summary_trigger
+        self.summarization_model = summarization_model
+        self.summarization_prompt_path = summarization_prompt_path
+        self.summarization_timeout_s = summarization_timeout_s
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
+        # --- Summary compaction strategy state (compaction_strategy == "summary") ---
+        # Unused, and never touched, in the default "progressive" mode.
+        self._cached_provider: Any = None
+        self._is_summarizing: bool = False
+        self._pending_summary: dict[str, Any] | None = None
+        self._summarization_failures: int = 0
+        self._summarization_task: "asyncio.Task[None] | None" = None
+        self._summary_absorbed_count: int = 0
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
         # most recent real usage observed via `llm:response`
@@ -366,6 +546,13 @@ class SimpleContextManager:
         """
         budget = self._calculate_budget(token_budget, provider)
 
+        # Summary compaction strategy needs a provider handle to call the
+        # summarizer -- cache the latest one seen (mirrors how the donor
+        # module caches it, context-managed:365-367). No-op in the default
+        # "progressive" mode.
+        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY and provider is not None:
+            self._cached_provider = provider
+
         # Reserve token budget for potential compaction notice (if enabled)
         effective_budget = budget
         if self.compaction_notice_enabled:
@@ -425,6 +612,14 @@ class SimpleContextManager:
             "budget": effective_budget,
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
+
+        # Summary compaction strategy: trigger an async background
+        # summarization call EARLY (well before compact_threshold, so it has
+        # time to finish -- see module docstring "Summary compaction
+        # strategy" and _maybe_trigger_summary_compaction). No-op in the
+        # default "progressive" mode. Never raises, never blocks this turn.
+        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY:
+            await self._maybe_trigger_summary_compaction(token_count, effective_budget)
 
         # Check if compaction needed (using effective budget with notice reserve deducted)
         if self._should_compact(token_count, effective_budget):
@@ -596,6 +791,7 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._reset_summary_strategy_state()
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:
@@ -609,7 +805,28 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
+        self._reset_summary_strategy_state()
         logger.info("Context cleared")
+
+    def _reset_summary_strategy_state(self) -> None:
+        """Reset all `compaction_strategy == "summary"` state -- called from
+        both set_messages() and clear() so a resumed/cleared session never
+        carries stale in-flight summarization state across the reset. A
+        no-op in the default "progressive" mode (the fields are simply
+        never populated in the first place).
+
+        Cancels any in-flight background summarization task rather than
+        leaving it to run against a context that has just been reset out
+        from under it.
+        """
+        if self._summarization_task is not None and not self._summarization_task.done():
+            self._summarization_task.cancel()
+        self._cached_provider = None
+        self._is_summarizing = False
+        self._pending_summary = None
+        self._summarization_failures = 0
+        self._summarization_task = None
+        self._summary_absorbed_count = 0
 
     async def should_compact(self) -> bool:
         """Check if context should be compacted.
@@ -871,6 +1088,22 @@ class SimpleContextManager:
             msg for msg in messages_to_compact if msg.get("role") != "system"
         ]
 
+        # Summary compaction strategy: if a background summarization call
+        # has completed since the last escalation, absorb its span NOW --
+        # before sticky decisions are (re-)applied, so the new removals and
+        # the new summary message are both visible to this call's
+        # _apply_sticky_decisions() below. No-op (did_summary_swap stays
+        # False) in the default "progressive" mode, and a no-op whenever
+        # compaction_strategy == "summary" but nothing is pending yet. See
+        # module docstring "Summary compaction strategy".
+        did_summary_swap = False
+        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY and (
+            self._pending_summary is not None
+        ):
+            non_system_messages, did_summary_swap = await self._swap_in_pending_summary(
+                non_system_messages
+            )
+
         # UNITS CONVENTION (see the block comment below): every "are we under
         # target yet?" comparison in this method and its helpers is TOTAL vs
         # TOTAL. System messages are extracted from `working_messages` but are
@@ -955,7 +1188,7 @@ class SimpleContextManager:
         # sizing of that escalation is only as good as the estimator was
         # before this meter existed.
         needs_escalation = self._exceeds_threshold(current_tokens, budget)
-        if not needs_escalation:
+        if not needs_escalation and not did_summary_swap:
             # Sticky state alone already keeps us under the threshold that
             # triggered compaction in the first place -- nothing NEW needs
             # deciding this call. Return the already-decided view unchanged;
@@ -968,6 +1201,31 @@ class SimpleContextManager:
                 f"(no new decisions this call; cumulative level so far: {self._sticky_level})"
             )
             return final_messages
+
+        if not needs_escalation:
+            # Summary swap alone (see above) already brought us back under
+            # threshold this call -- no progressive level is needed. Still
+            # route through _finalize_compaction_with_stats (rather than the
+            # cheap early-return above) so _last_compaction_stats/hooks
+            # observe that something DID change this call.
+            # max_level_reached=0 records "no progressive level was needed".
+            logger.info(
+                f"Summary compaction alone reached target: {old_count} raw messages, "
+                f"{old_tokens:,} raw tokens -> {len(working_messages)} messages, "
+                f"{current_tokens:,} tokens"
+            )
+            return await self._finalize_compaction_with_stats(
+                working_messages,
+                system_messages,
+                old_count,
+                old_tokens,
+                0,
+                0,
+                0,
+                0,
+                budget,
+                target_tokens,
+            )
 
         logger.info(
             f"Compacting context (new escalation): {old_count} raw messages, {old_tokens:,} raw tokens "
@@ -1728,6 +1986,11 @@ class SimpleContextManager:
             "protected_recent": self.protected_recent,
             "protected_tool_results": self.protected_tool_results,
         }
+        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY:
+            # Only surfaced in "summary" mode -- keeps the default
+            # "progressive" mode's stats dict shape byte-identical to
+            # before this feature existed.
+            stats["messages_absorbed_by_summary"] = self._summary_absorbed_count
         self._last_compaction_stats = stats
 
         # Emit event if hooks available
@@ -1872,6 +2135,445 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 '- Some user messages may be stubbed as "[User message compacted...]"\n'
                 "- If context is critical, consider asking user to clarify their current goal"
             )
+
+    # ------------------------------------------------------------------
+    # Summary compaction strategy (`compaction_strategy: "summary"`)
+    # ------------------------------------------------------------------
+    #
+    # Opt-in alternative to the progressive truncate/remove ladder above.
+    # Lifts the IDEAS from amplifier-bundle-context-managed's rolling
+    # summarizer -- the structured 5-section prompt, the early-async-trigger
+    # design -- but rebuilds ALL plumbing on this module's own sticky/_seq
+    # primitives instead of that donor module's index-based splice-and-swap:
+    #
+    #   - absorbed messages are recorded via _record_removed(), the SAME
+    #     mechanism progressive Levels 3/5/7/8 already use, so
+    #     _apply_sticky_decisions() replays the absorption byte-identically
+    #     on every subsequent call. Candidates are keyed by each message's
+    #     permanent `_seq`, never by list index/offset, so there is no
+    #     "stale boundary" class of bug here at all -- contrast the donor's
+    #     `offset_at_creation` drift-guard, which existed only because ITS
+    #     design tracked absolute indices in the first place.
+    #   - the summary itself is stamped with a fresh `_seq` exactly like
+    #     add_message() would (see _make_summary_message), and is APPENDED
+    #     to self.messages -- never spliced in -- so self.messages remains
+    #     a strict, append-only log and this module's "compaction never
+    #     modifies self.messages" invariant is never violated.
+    #   - the summary is role="user" (never "system"), wrapped in a
+    #     <system-reminder source="context-summary"> envelope, and is
+    #     NOT marked ephemeral -- it is meant to persist as stable history,
+    #     unlike the (ephemeral, tail-only) compaction notice above. A
+    #     role="system" summary tier is what measurably busted the donor's
+    #     own provider-level system-prompt cache breakpoint (see README
+    #     "Summary compaction strategy" for the measured numbers); this fix
+    #     is non-negotiable, not cosmetic.
+    #   - the absorb boundary is snapped (_snap_absorb_boundary) so an
+    #     assistant tool_calls message and every one of its tool results
+    #     are absorbed together or not at all -- reusing the same
+    #     tool_call_id identity fields _check_tool_pair_removable already
+    #     keys on, not the donor's adjacent-index-only heuristic (the exact
+    #     gap that let the donor split a live call/result pair in practice).
+
+    def _get_summarization_prompt(self) -> str:
+        """Return the summarization prompt.
+
+        Reads from `summarization_prompt_path` if configured and the file
+        exists, mirroring the donor's own file-override knob. Falls back to
+        DEFAULT_SUMMARIZATION_PROMPT on any OSError, logging a warning --
+        never raises.
+        """
+        if self.summarization_prompt_path:
+            try:
+                return Path(self.summarization_prompt_path).read_text()
+            except OSError as e:
+                logger.warning(
+                    f"context-simple: could not read summarization_prompt_path "
+                    f"{self.summarization_prompt_path!r}: {e}; falling back to "
+                    "the built-in DEFAULT_SUMMARIZATION_PROMPT"
+                )
+        return DEFAULT_SUMMARIZATION_PROMPT
+
+    def _format_messages_for_summarization(
+        self, messages: list[dict[str, Any]]
+    ) -> str:
+        """Format messages into the plain-text transcript the summarizer
+        reads. Each message becomes '[role]: content'; tool results are
+        linked back to their call via '[tool_result for {tool_call_id}]:
+        ...'; tool_calls are rendered as '[tool_call: name(args)]' with
+        arguments truncated to 500 chars. Adapted from the donor's
+        `_format_messages_for_summarization`.
+        """
+        lines: list[str] = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            content = msg.get("content", "")
+            if isinstance(content, list):
+                parts = []
+                for block in content:
+                    if isinstance(block, dict):
+                        text = block.get("text", "")
+                        if text:
+                            parts.append(text)
+                    elif hasattr(block, "text"):
+                        parts.append(block.text)
+                content = "\n".join(parts)
+
+            if role == "tool":
+                tc_id = msg.get("tool_call_id", "")
+                line = f"[tool_result for {tc_id}]: {content}"
+            else:
+                line = f"[{role}]: {content}"
+
+            extra_lines: list[str] = []
+            for tc in msg.get("tool_calls") or []:
+                if not isinstance(tc, dict):
+                    continue
+                if "function" in tc:
+                    name = tc["function"].get("name", "unknown_tool")
+                    raw_args = tc["function"].get("arguments", "{}")
+                else:
+                    name = tc.get("name") or tc.get("tool", "unknown_tool")
+                    raw_args = tc.get("input") or tc.get("arguments") or {}
+                if isinstance(raw_args, str):
+                    arg_str = raw_args
+                else:
+                    arg_str = json.dumps(raw_args, separators=(",", ":"))
+                if len(arg_str) > 500:
+                    arg_str = arg_str[:500] + "..."
+                extra_lines.append(f"  [tool_call: {name}({arg_str})]")
+
+            lines.append("\n".join([line, *extra_lines]) if extra_lines else line)
+
+        return "\n\n".join(lines)
+
+    def _extract_text_from_response(self, response: Any) -> str:
+        """Join every text-bearing content block in a ChatResponse. Blocks
+        without a `.text` attribute (tool calls, thinking, etc.) are
+        silently skipped."""
+        parts = []
+        for block in getattr(response, "content", None) or []:
+            text = getattr(block, "text", None)
+            if text:
+                parts.append(text)
+        return "".join(parts)
+
+    async def _maybe_trigger_summary_compaction(
+        self, token_count: int, effective_budget: int
+    ) -> None:
+        """Start an async background summarization call if usage has
+        crossed `summary_trigger` and nothing is already in flight/pending.
+
+        Mirrors the donor's early-trigger design (default 0.60, well ahead
+        of compact_threshold) so the LLM call has time to finish before
+        tokens must actually be shed -- see _swap_in_pending_summary, which
+        performs the actual absorption once this completes. Never raises,
+        never blocks this turn: the provider call itself happens inside an
+        asyncio.create_task, off the critical path.
+        """
+        if self._is_summarizing or self._pending_summary is not None:
+            return
+        if self._cached_provider is None:
+            logger.debug(
+                "context-simple: skipping summary trigger -- no cached "
+                "provider yet (first get_messages_for_request() of the "
+                "session hasn't run, or the caller never passes one)"
+            )
+            return
+        if effective_budget <= 0:
+            return
+
+        usage_fraction = token_count / effective_budget
+        if usage_fraction < self.summary_trigger:
+            return
+
+        target_tokens = int(effective_budget * self.target_usage)
+        if token_count <= target_tokens:
+            return
+        excess_tokens = token_count - target_tokens
+
+        seqs = self._select_summary_absorb_seqs(excess_tokens)
+        if not seqs:
+            logger.debug(
+                "context-simple: summary trigger fired but nothing eligible "
+                "to absorb yet (too little non-protected history)"
+            )
+            return
+
+        self._is_summarizing = True
+        self._summarization_task = asyncio.create_task(
+            self._run_summary_compaction_task(seqs)
+        )
+
+    def _select_summary_absorb_seqs(self, excess_tokens: int) -> list[int] | None:
+        """Select a prefix of the oldest, still-live, non-protected,
+        non-system messages to summarize, sized to shed roughly
+        `excess_tokens`, snapped so a tool_calls/tool-result pair is never
+        split (_snap_absorb_boundary). Returns the ordered list of `_seq`
+        ids to absorb, or None if nothing qualifies.
+
+        Excludes: system messages (never compacted, handled separately),
+        messages already absorbed/removed by a prior escalation, and this
+        module's own past summary messages (never re-summarized -- each
+        escalation produces its own standalone summary; see module
+        docstring for why this PR does not implement tier merging).
+        """
+        live = [
+            m
+            for m in self.messages
+            if m.get("role") != "system"
+            and self._extract_seq(m) not in self._removed_seqs
+            and (m.get("metadata") or {}).get("type") != _SUMMARY_METADATA_TYPE
+        ]
+        if not live:
+            return None
+
+        last_user_idx = None
+        for i, m in enumerate(live):
+            if m.get("role") == "user":
+                last_user_idx = i
+
+        protected_boundary = int(len(live) * (1 - self.protected_recent))
+        if last_user_idx is not None:
+            protected_boundary = min(protected_boundary, last_user_idx)
+        if protected_boundary <= 0:
+            return None
+
+        accumulated = 0
+        end_idx = 0
+        for i in range(protected_boundary):
+            accumulated += len(str(live[i])) // 4
+            end_idx = i + 1
+            if accumulated >= excess_tokens:
+                break
+
+        end_idx = self._snap_absorb_boundary(live, end_idx, protected_boundary)
+        if end_idx <= 0:
+            return None
+
+        seqs = [self._extract_seq(m) for m in live[:end_idx]]
+        return [s for s in seqs if s is not None] or None
+
+    def _snap_absorb_boundary(
+        self,
+        live: list[dict[str, Any]],
+        end_idx: int,
+        protected_boundary: int,
+    ) -> int:
+        """Adjust `end_idx` (an exclusive boundary into `live`) so an
+        assistant tool_calls message and every one of its tool results are
+        absorbed together, or not absorbed at all -- and so the boundary
+        never crosses into the protected tail (index >= protected_boundary).
+
+        Reuses the same identity fields _check_tool_pair_removable keys on
+        (`tool_calls[].id` / `tool_call_id`), applied to a single
+        contiguous prefix boundary instead of scattered removal candidates.
+        This is the fix for the donor's exact production failure: its
+        `_snap_to_tool_pair_boundary` only checked whether the immediately
+        NEXT message had role "tool" -- an adjacency heuristic that misses
+        non-adjacent results and does no protected-boundary accounting at
+        all, which is how it shipped dropping a `function_call` while
+        keeping its `function_call_output` (InvalidRequestError, see
+        README "Summary compaction strategy").
+        """
+        if end_idx <= 0:
+            return 0
+
+        id_map: dict[str, list[int]] = {}
+        for idx, msg in enumerate(live):
+            tcid = msg.get("tool_call_id")
+            if tcid:
+                id_map.setdefault(tcid, []).append(idx)
+
+        def result_indices(assistant_msg: dict[str, Any]) -> list[int]:
+            idxs: list[int] = []
+            for tc in assistant_msg.get("tool_calls") or []:
+                tc_id = tc.get("id") or tc.get("tool_call_id")
+                if tc_id:
+                    idxs.extend(id_map.get(tc_id, []))
+            return idxs
+
+        # Bounded fixed-point: each iteration either grows end_idx (capped
+        # at protected_boundary) or shrinks it to exclude exactly one
+        # unabsorbable call -- never both for the same call twice -- so
+        # this always terminates within len(live) iterations.
+        for _ in range(len(live) + 1):
+            max_needed = end_idx
+            overflow_call_idx: int | None = None
+            for i in range(end_idx):
+                msg = live[i]
+                if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                    for k in result_indices(msg):
+                        if k >= max_needed:
+                            max_needed = k + 1
+                        if k >= protected_boundary and overflow_call_idx is None:
+                            overflow_call_idx = i
+            if max_needed <= protected_boundary:
+                return max_needed
+            # Can't extend past the protected tail without splitting a
+            # pair -- drop the first offending call (and, transitively,
+            # everything after it in this round) rather than ever crossing
+            # the boundary or absorbing a call without its result.
+            end_idx = overflow_call_idx if overflow_call_idx is not None else 0
+            if end_idx <= 0:
+                return 0
+        return 0  # defensive; unreachable given the termination argument above
+
+    async def _run_summary_compaction_task(self, seqs: list[int]) -> None:
+        """Background task: call the summarizer over the message span
+        identified by `seqs` and stash the result in `_pending_summary` for
+        the next get_messages_for_request()/_compact_ephemeral() call to
+        swap in (_swap_in_pending_summary).
+
+        Never raises: any failure (bad/absent provider, timeout, malformed
+        response, empty summary) increments `_summarization_failures`,
+        logs a warning, and leaves `_pending_summary` unset -- the next
+        compaction pass that needs to shed tokens falls back to the
+        progressive ladder for that pass, exactly as if
+        compaction_strategy were "progressive". Always clears
+        `_is_summarizing`/`_summarization_task` in a finally block so a
+        failed round never permanently wedges future triggers.
+        """
+        try:
+            seq_set = set(seqs)
+            messages_to_summarize = [
+                m for m in self.messages if self._extract_seq(m) in seq_set
+            ]
+            if not messages_to_summarize:
+                return
+
+            provider = self._cached_provider
+            if provider is None:
+                raise RuntimeError("no cached provider available for summary compaction")
+
+            prompt = self._get_summarization_prompt()
+            formatted = self._format_messages_for_summarization(messages_to_summarize)
+
+            from amplifier_core import ChatRequest, Message
+
+            request = ChatRequest(
+                messages=[
+                    Message(role="system", content=prompt),
+                    Message(role="user", content=formatted),
+                ],
+                model=self.summarization_model,
+            )
+
+            if self._hooks is not None:
+                try:
+                    await self._hooks.emit(
+                        "context:pre_summarize",
+                        {"message_count": len(messages_to_summarize)},
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not emit context:pre_summarize: {e}")
+
+            response = await asyncio.wait_for(
+                provider.complete(request), timeout=self.summarization_timeout_s
+            )
+            summary_text = self._extract_text_from_response(response)
+            if not summary_text.strip():
+                raise ValueError("summarizer returned empty text")
+
+            self._pending_summary = {"seqs": frozenset(seqs), "text": summary_text}
+            self._summarization_failures = 0
+
+            if self._hooks is not None:
+                try:
+                    await self._hooks.emit(
+                        "context:post_summarize",
+                        {"summary_length": len(summary_text)},
+                    )
+                except Exception as e:
+                    logger.warning(f"Could not emit context:post_summarize: {e}")
+        except Exception as e:
+            self._summarization_failures += 1
+            logger.warning(
+                f"context-simple: summary compaction failed ({e!r}); falling "
+                "back to progressive compaction for the next pass that needs "
+                "to shed tokens"
+            )
+        finally:
+            self._is_summarizing = False
+            self._summarization_task = None
+
+    def _make_summary_message(self, summary_text: str) -> dict[str, Any]:
+        """Build the persisted summary message: role="user" (never
+        "system" -- see module docstring), wrapped in a
+        <system-reminder source="context-summary"> envelope so
+        foundation's is_real_user_message() classifies it correctly, and
+        stamped with a fresh `_seq` exactly like add_message() would.
+
+        NOT marked metadata.ephemeral=True: unlike the tail compaction
+        notice, this message is meant to persist as stable history.
+        """
+        content = (
+            f'<system-reminder source="{_SUMMARY_ENVELOPE_SOURCE}">\n'
+            f"{summary_text}\n"
+            "</system-reminder>"
+        )
+        message: dict[str, Any] = {
+            "role": "user",
+            "content": content,
+            "metadata": {
+                "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds"),
+                "type": _SUMMARY_METADATA_TYPE,
+                "_seq": self._next_seq,
+            },
+        }
+        self._next_seq += 1
+        return message
+
+    async def _swap_in_pending_summary(
+        self, non_system_messages: list[dict[str, Any]]
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Absorb a completed pending summary, if it is still valid.
+
+        Validity is checked purely by `_seq` membership -- every captured
+        seq must still be present in `non_system_messages` and not already
+        removed by an intervening escalation. There is no index/offset
+        arithmetic here, so there is no "stale boundary" bug to guard
+        against beyond this membership check; if the whole span was
+        already resolved (e.g. an emergency progressive escalation ran in
+        between), the summary is discarded gracefully -- NOT counted as a
+        failure -- and the caller falls back to progressive compaction for
+        this pass, same as if none had been pending.
+
+        Never hand-splices self.messages: absorbed messages are recorded
+        via _record_removed() (the existing sticky-decision path), and the
+        summary message is APPENDED to self.messages, never inserted at an
+        arbitrary position.
+
+        Returns (possibly-updated non_system_messages, did_swap).
+        """
+        pending = self._pending_summary
+        self._pending_summary = None
+
+        present_seqs = {self._extract_seq(m) for m in non_system_messages}
+        absorb_seqs = {
+            s
+            for s in pending["seqs"]
+            if s in present_seqs and s not in self._removed_seqs
+        }
+        if not absorb_seqs:
+            logger.info(
+                "context-simple: discarding stale pending summary -- its "
+                "absorbed span was already resolved by an earlier escalation"
+            )
+            return non_system_messages, False
+
+        for msg in non_system_messages:
+            if self._extract_seq(msg) in absorb_seqs:
+                self._record_removed(msg)
+
+        summary_message = self._make_summary_message(pending["text"])
+        self.messages.append(summary_message)
+        self._summary_absorbed_count += len(absorb_seqs)
+
+        logger.info(
+            f"context-simple: summary compaction absorbed {len(absorb_seqs)} "
+            "messages into 1 stable summary message"
+        )
+        return non_system_messages + [summary_message], True
 
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.

@@ -166,6 +166,197 @@ should happen only after running the module's own eval harness against
 reduction in compaction cadence (request count / wall time) holds up without
 a corresponding quality regression.
 
+## Summary compaction strategy (`compaction_strategy`)
+
+> ### :warning: Opt-in, experimental. Do not enable by default.
+>
+> Ships behind `compaction_strategy: "progressive"` (default,
+> byte-identical to this module's behavior before this feature existed).
+>
+> A T0/T1 evaluation has now run (n=3 vs. n=5 baselines, S5-CRAC
+> scenario). Its two headline results, stated plainly:
+>
+> - **No retention benefit is demonstrated.** T1 scored 94.0 mean vs.
+>   T0's 94.4 — statistically and practically indistinguishable, and on a
+>   metric that is **saturated**: both arms score a perfect 40/40 planted
+>   constraints and 20/20 post-compaction in *every* run, and have across
+>   20+ historical runs. The scenario cannot discriminate retention. This
+>   is *not* evidence that summaries retain worse — it is the absence of
+>   evidence either way. A discriminating scenario does not exist yet.
+> - **Measured +83% run cost** ($4.73 vs. $2.58) and **+84% compaction
+>   boundaries** (39.7 vs. 21.6) on a compaction-heavy workload, via a
+>   boundary-refire loop (see "Known issue" below). This **falsifies** the
+>   pre-registered prediction that cache economics would land in T0's
+>   band, in the worse direction.
+>
+> The mechanism itself is validated and correct (all four pre-registered
+> gates pass, including the two the donor design failed catastrophically).
+> This flag exists so the strategy can be studied further, not because it
+> is known to be better. **Do not enable it by default anywhere.**
+
+### The idea, and where it comes from
+
+The progressive ladder above is lossy: once a message is truncated or
+removed, that content is gone. `compaction_strategy: "summary"` absorbs the
+oldest non-protected span into an LLM-generated rolling summary instead --
+retaining *meaning* at the cost of exact wording, rather than losing the
+span outright.
+
+The IDEAS here -- a structured 5-section summarization prompt, and an
+async trigger that fires **early** (well before the hard compaction
+threshold, so the LLM call has time to finish off the critical path) --
+are lifted from `amplifier-bundle-context-managed`'s `modules/context-managed/`
+rolling summarizer (see that repo's `__init__.py:71-97` for the prompt this
+one is adapted from). **All plumbing is rebuilt from scratch** on this
+module's own sticky/`_seq` machinery, because a live evaluation of that
+donor module *as shipped* found two showstoppers its own 5,890 LOC of tests
+never caught:
+
+1. **It drops a tool call while keeping its result.** Its
+   `_snap_to_tool_pair_boundary` only checked whether the *immediately
+   next* message had role `"tool"` -- an adjacency heuristic with no
+   protected-boundary accounting. In a real multi-turn session this
+   produced `InvalidRequestError: No tool call found for function call
+   output` on 29 of 30 turns.
+2. **Its summary tiers are `role: "system"`.** The Anthropic provider
+   hoists every system-role message into the single top-level system
+   block, so each summary swap rewrote that block and busted the
+   *system*-prompt cache breakpoint -- not just the conversation-region
+   one. Measured on a live run: 7 distinct `instructions` hashes across 23
+   requests (lengths swinging 44,516 -> 1,113 -> 45,310 tokens), vs. **1**
+   stable hash for `context-simple`'s own control.
+
+See `.amplifier/evaluation/treatment-validation/20260901-t4-ctxmanaged/PROBE5-VERDICT.md`
+for the full write-up. Neither defect is inherited here:
+
+- **Tool-pair atomicity**: the absorb boundary is snapped by
+  `_snap_absorb_boundary`, which reuses the *same* `tool_calls[].id` /
+  `tool_call_id` identity fields `_check_tool_pair_removable` (above) keys
+  on -- not an adjacency guess. An assistant `tool_calls` message and every
+  one of its results are absorbed together, or the whole group is excluded
+  and left for the next round. Never split.
+- **Cache-safe role**: the summary message is `role: "user"`, wrapped in a
+  `<system-reminder source="context-summary">` envelope (so foundation's
+  `is_real_user_message()` classifies it correctly) -- **never**
+  `role: "system"`. Unlike the tail compaction notice above, it is **not**
+  marked `metadata.ephemeral` -- it is meant to persist as stable history.
+
+### How it's wired into this module's own primitives
+
+- **Absorption is sticky, not a splice.** Absorbed messages are recorded
+  via the *existing* `_record_removed()` path -- the exact mechanism
+  progressive Levels 3/5/7/8 already use -- so `_apply_sticky_decisions()`
+  replays the absorption byte-identically on every subsequent call.
+  Candidates are keyed by each message's permanent `_seq`, never by list
+  index, so there is no "stale boundary" class of bug at all (contrast the
+  donor's `offset_at_creation` drift-guard, which existed only because its
+  own design tracked absolute indices in the first place).
+- **`self.messages` is still never modified by compaction.** The summary
+  message is stamped with a fresh `_seq` exactly like `add_message()`
+  would and *appended* to `self.messages` -- never spliced in at an
+  earlier position. This keeps this module's core invariant intact, at the
+  cost of the summary landing wherever `self.messages`' tail happens to be
+  at swap time (not necessarily immediately after the span it covers) --
+  an explicit, disclosed trade-off in exchange for never reordering a
+  shared, cacheable prefix.
+- **Async + fallback.** `summary_trigger` (default `0.60`, an absolute
+  usage fraction of budget) fires an `asyncio.create_task` off the
+  critical path, mirroring the donor's early-trigger idea (optionally
+  driven by the real-usage token meter above when `token_meter: "actual"`).
+  If the hard compaction threshold is reached and no summary has finished
+  yet (in flight, failed, timed out, or no provider was ever passed), that
+  pass falls back to the progressive ladder -- a turn is never blocked and
+  never fails on a summarizer error.
+- **No tier merging in this PR.** Each absorption round produces its own
+  standalone summary message; a message already carrying
+  `metadata.type == "context_summary"` is never re-selected for a later
+  round. `context-managed`'s tier-merging (`_merge_oldest_tiers`) is real
+  and useful but out of scope here -- see the design mandate for why this
+  PR keeps scope tight (no custom resume logic, no transcript persistence,
+  no tool-transcript tool).
+
+### Configuration
+
+```toml
+[[contexts]]
+module = "context-simple"
+config = {
+    compaction_strategy = "summary",   # default: "progressive"
+    summary_trigger = 0.60,            # usage fraction that starts the async summarizer
+    summarization_model = "...",       # optional; None uses the provider default
+    summarization_prompt_path = "...", # optional file override for the 5-section prompt
+    summarization_timeout_s = 30.0,    # provider.complete() timeout before falling back
+}
+```
+
+### What this was built to buy, and what the evaluation actually measured
+
+**The motivation** was retention: the progressive ladder is lossy, so an
+LLM summary that keeps a lossy-but-real account of an absorbed span
+*should* retain more than dropping it outright. That was and remains the
+reason to build this. It is **not** a cache-cost play — like the
+progressive ladder, this strategy still shrinks what the model sees each
+turn, which under a grow-only prompt cache is still a cold rebuild of the
+shared prefix at the moment of absorption.
+
+**What the T0/T1 evaluation measured** (n=3 T1 runs vs. n=5 reused T0
+baselines, S5-CRAC scenario, capture root
+`.amplifier/evaluation/treatment-validation/20260902-t0t1/`):
+
+| Gate | Requirement | Result |
+|---|---|---|
+| **G1 retention** | T1 S5 ≥ T0 band (92–95) | **PASS — but vacuous.** T1 [95, 95, 92] vs. T0 mean 94.4. See note below. |
+| **G2 tool-pairs** | zero `InvalidRequestError` | **PASS** — 0 across all runs (the donor design: 29/30 turns failed) |
+| **G3 system prompt** | agent `instructions` byte-stable | **PASS** — 1 hash per run, all 3 runs (the `role: "user"` fix holds under a real provider round trip; the donor's agent prompt moved 44,516 → 1,113 → 45,310 within one run) |
+| **G4 append-only** | no history re-minting | **PASS** — `ID_ONLY` divergences 0/0/0 |
+
+> **G1 passed but proves nothing about retention.** `b_constraints` is
+> 40/40 and `c_post_compaction` is 20/20 in **every run of both arms**,
+> and has been across 20+ historical runs. The only moving part is the
+> task score. S5-CRAC is at its ceiling: both strategies already hold
+> every planted constraint perfectly, so a "≥ baseline" check against a
+> saturated metric is a floor check, not a win. **No retention advantage
+> is demonstrated by this evaluation.** Establishing one requires a
+> scenario with headroom — one where the progressive baseline measurably
+> *loses* constraints. That scenario does not exist yet (TBD).
+
+Summaries do fire correctly and do carry the material: 63–95 requests per
+run carried a summary, all `role: "user"` (zero `role: "system"`), up to
+67 messages absorbed in a single round, and the emitted summaries restate
+all five planted constraints verbatim. The mechanism works. What is
+unproven is that the mechanism *helps*.
+
+### Known issue: boundary refire roughly doubles compaction cost
+
+Measured on the same evaluation, and **worse than the pre-registered
+prediction** (which expected cache economics in T0's band):
+
+| Metric | T0 (progressive) | T1 (summary) | Delta |
+|---|---:|---:|---:|
+| Cache waste | 29.0% | **53.9%** | **+24.9pp** (no overlap between arms) |
+| Cache-read share | 0.714 | **0.537** | −0.177 |
+| Run cost | $2.58 | **$4.73** | **+83%** |
+| Compaction boundaries | 21.6 | **39.7** | **+84%** |
+
+**Mechanism.** The summarizer itself is only 8–11% of run cost — it is
+not the driver. The dominant cost is the near-doubling of compaction
+boundaries, and every boundary is a guaranteed cold rebuild against a
+grow-only cache. Absorbing a span *shrinks* the request, which pulls
+usage back below `summary_trigger` (0.60) sooner, which fires another
+absorb/compact cycle sooner: a refire loop. Under an aggressive
+compaction config (the evaluation forced `max_tokens: 45000`) the early
+trigger — deliberately set well below `compact_threshold` to give the
+async call time to finish — drives the extra cycles.
+
+**Not fixed in this change, tracked honestly.** The obvious levers, none
+of which are implemented here: a post-absorb **cooldown** before the
+trigger may refire; an **absolute floor** on absorbed-span size so small
+absorptions cannot cycle; **hysteresis** on `summary_trigger` (arm at
+0.60, disarm only after usage falls below some lower band). Tuning
+`summary_trigger` upward is the cheapest first experiment. Any of these
+should be validated against the same cost metrics before this flag is
+enabled anywhere by default.
+
 ## Dependencies
 
 - `amplifier-core>=1.0.0`
