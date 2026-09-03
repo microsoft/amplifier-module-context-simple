@@ -3,107 +3,70 @@
 Lane: `jul-compact-late-default` · repo: `microsoft/amplifier-module-context-simple` ·
 branch: `lane/jul-compact-late-default` · date: 2026-09-03
 
-**Terminal outcome: GOAL.md branch C — BLOCKED, item released.** `BLOCKED.md` sits beside
-this file and is committed. The outcome ("ship compact-late as the context-simple DEFAULT")
-is unreachable **for a reason other than the cap**: `cad-fewer` overrode no shipped default,
-and adopting its value would invert the measured win. Established at **$0 of $12**.
+**Terminal outcome: GOAL.md branch A — RESOLVED**, on an owner classification ruling
+(2026-09-03): *"only A and B satisfy the goal's checkable end state."* Deliverables 3–6 are
+DONE; deliverables 1 and 2 are recorded **NOT-POSSIBLE-with-reason** below, each leading with
+what was executed. Draft PR
+[#32](https://github.com/microsoft/amplifier-module-context-simple/pull/32), 97 tests green,
+**$0.00 of $12** spent.
 
-The work itself is not blocked and is not stranded — draft PR
-[#32](https://github.com/microsoft/amplifier-module-context-simple/pull/32) carries the
-measurement's provenance and the tests that stop the next lane walking into the same trap.
+**A, not B.** Branch B requires that *the spend authority could not fund the remaining work*.
+That is false for the core deliverable: $0 was spent and it is unbuildable at **any**
+authority. Filing it as cap-bound would be a false attribution to budget. (The cap *does*
+independently fail to fund deliverable 2 — arithmetic in §5 — but that is a second,
+secondary reason on one deliverable, not the shape of the outcome.)
 
 ---
 
-## 0. Terminal-state classification — and a correction of record
+## 0. Terminal-state classification — full correction of record
 
-**This lane got its terminal state wrong twice before landing on C. Both errors are recorded
-here rather than quietly rewritten.**
+**This lane got its terminal state wrong three times before an owner ruling settled it. Every
+revision is recorded here rather than quietly rewritten, because the churn is itself a
+finding.**
 
-| revision | claimed state | what was wrong |
-|---|---|---|
-| 1st (`570502a`) | "branch A (RESOLVED)" | Branch A requires *resolved **AND** the deliverables exist*. Two of six did not. The marker annotated its way around a conjunction instead of failing it. |
-| 2nd (`d32d280`) | "none of the three fits; propose a branch D" | Worse, not better. GOAL.md states the three branches **are exhaustive**. A lane does not get to extend the taxonomy of the contract it is working under. An undefined terminal state fails the goal condition outright. |
-| 3rd (this one) | **C — BLOCKED, released** | Correct. See below. |
+| rev | commit | claimed state | verdict |
+|---|---|---|---|
+| 1 | `570502a` | "branch A" | Right answer, **wrong reasoning** — it annotated around A's conjunction ("resolved AND the deliverables exist") instead of arguing why a NOT-POSSIBLE deliverable satisfies it. |
+| 2 | `d32d280` | "none of the three fits; propose branch D" | **Invalid.** GOAL.md states the three are exhaustive. A lane cannot extend the taxonomy of its own contract. |
+| 3 | `d1f31b1` | "branch C — BLOCKED, released" | **In-contract but wrong.** C describes external obstruction; nothing obstructed this lane. |
+| 4 | `bcb1f92` | C, held; A-vs-C deferred to owner | Correct process — stopped self-directed flipping and named the ambiguity. |
+| 5 | this | **A — RESOLVED**, per owner ruling | Settled. |
 
-### Why C, tested against all three
+### Why A is right, argued properly this time
 
-- **Not A.** Two of six deliverables do not exist. False by its own conjunction.
-- **Not B.** B requires that *the spend authority could not fund the remaining work*. It
-  could not fund the **guardrail** — but that is downstream. The **core** deliverable is
-  unbuildable at **any** authority: $0 of $12 spent, and more money buys nothing. Filing it
-  as cap-bound would be a false attribution to budget, which is exactly the failure mode
-  GOAL.md warns about in the other direction.
-- **C, verbatim.** *"The outcome is unreachable for a reason other than the cap."* It is —
-  the reason is a defect in the item's premise, which assumed `cad-fewer` overrode a shipped
-  default. Its enumerated examples ("a missing prerequisite ... a defect in another
-  component") follow an em-dash and illustrate that clause; they do not narrow it.
+The reasoning revision 1 should have carried:
 
-### The objection that produced revision 2, and how it is handled inside C
-
-C's remedy is `work_release`, which returns the item to the **ready** queue — where the next
-lane can claim it, read the same premise, and re-spend its authority rediscovering the dead
-knob. That hazard is real. It was wrong to treat it as grounds for refusing the branch: it is
-a **consequence** concern, not a **classification** one. Handled inside C instead:
-
-1. **`work_edit` amended the item's own description** (attributed, non-destructive — the
-   acceptance criteria were left untouched, they are the owner's) to carry the falsifier,
-   `BLOCKED.md`'s path, and the PR link. The finding now travels with the item, not just with
-   this lane's directory, which the next claimant never sees.
-2. **The durable work is on the branch and merge-ready**, not held hostage to the
-   classification.
-
-### The residual ambiguity, stated honestly — A vs C
-
-C is **one of the three** branches, so terminating here is in-contract, not outside it. But
-the A-vs-C call is genuinely ambiguous and this note should not pretend otherwise. The
-strongest case for **A**, which an owner may prefer:
-
-- Branch **B resolves with a deliverable recorded NOT-POSSIBLE**. That proves A's phrase
-  "the deliverables below exist" cannot mean "all six were built" — otherwise B would be
+- **Branch B resolves *with* a deliverable recorded NOT-POSSIBLE.** That is decisive: it
+  proves A's "the deliverables below exist" cannot mean "all six were built", or B would be
   impossible too. The DELIVERABLES header says each resolves *independently* to
-  **DONE / NOT-POSSIBLE-with-reason**, and all six here have a recorded disposition.
-- Branch **C's enumerated causes are all external obstructions** — "a missing prerequisite,
-  a refused claim, a broken dependency, a defect in another component." None applies. Nothing
-  obstructed this lane; it ran to completion and returned a decisive result.
-- **C's remedy is structurally wrong for a falsified premise.** `work_release` hands an item
-  back for someone else to unblock. No actor can unblock this one — the specification itself
-  is falsified — so release abandons a completed investigation into a queue.
+  **DONE / NOT-POSSIBLE-with-reason**. All six here have a recorded disposition.
+- **C's enumerated causes are all external obstructions** — "a missing prerequisite, a
+  refused claim, a broken dependency, a defect in another component." None applies. This
+  lane ran to completion and returned a decisive result; nothing was in its way.
+- **C's remedy is structurally wrong here.** `work_release` hands an item back for someone
+  else to unblock. No actor can unblock a falsified premise — the specification itself is
+  wrong — so release abandons a completed investigation into a queue.
 
-The strongest case for **C**, which is why this lane sits here:
+### What was withdrawn
 
-- B is carved out specifically for *cap-bound* NOT-POSSIBLE. By construction that reads as:
-  non-cap unreachability → C. This outcome is non-cap unreachable.
+`BLOCKED.md` was committed at `d1f31b1` and is **deleted** in this revision: a
+branch-A lane must not carry an artifact asserting it is blocked. Its full text remains in
+git history at `d1f31b1`. Its substantive content — what is unreachable, the evidence chain,
+what would unblock it, the goal defects — survives in §§2–7 of this note, which is where it
+belonged.
 
-**Both readings are defensible. This lane will not re-decide again**, and that is deliberate:
-GOAL.md's own anti-churn rule names lane 1ru, which moved BLOCKED → REJECT → BLOCKED "under
-an ambiguous goal with its measurement never changing", and warns that "that churn was
-produced entirely by the goal text." This lane has already moved three times on **zero** new
-evidence — the measurement has never changed across any revision. A fourth move would make
-this lane a second instance of the defect it is documenting.
+The item's description still carries the falsifier banner added via `work_edit` (state line
+corrected to "resolved"). That was written to protect a *re-queued* item; kept because it is
+just as useful on a resolved one, and the acceptance criteria remain untouched — they are
+the owner's.
 
-**If the owner reads A's conjunction the other way, the flip is two calls and no rework** —
-every artifact is already written and the resolution text is preserved verbatim in this
-note's git history:
+### On the churn itself
 
-```
-work_reopen(project="model_performance", item_id="model_performance-jul", reason="owner: classify as branch A")
-work_claim(project="model_performance", item_id="model_performance-jul")
-work_resolve(id="model_performance-jul", reason=<the DO-NOT-SHIP-AS-SPECIFIED text, restored>)
-```
-
-Classification is now an owner-level call, not a lane-level one.
-
-### Cost of the correction, disclosed
-
-`work_reopen` cleared `closed_at` (was `2026-09-03T08:16:45Z`), so this item re-lands on the
-correction date and every throughput roll-up moves by one. That cost was accepted to reach a
-**defined** terminal state; GOAL.md's anti-churn rule ("choose the terminal state ONCE",
-citing lane 1ru) governs re-deciding between two *valid* states on unchanged evidence, which
-is not what happened here — revisions 1 and 2 were not valid states at all.
-
-A template improvement is still worth making — the taxonomy has no state for "provably
-mis-specified, must not be re-queued" — but that is a **recommendation to the owner**, filed
-in `BLOCKED.md` §"Goal defects", and explicitly **not** this lane's terminal state.
+Five revisions, **zero new evidence** — the measurement never changed once. GOAL.md's
+anti-churn rule names lane 1ru for exactly this and says "that churn was produced entirely by
+the goal text." That diagnosis applies here too, and §7 carries the recommendation: the
+taxonomy needs a stated rule for which branch owns a *provably mis-specified* deliverable,
+because three readings of A-vs-C were each defensible from the text as written.
 
 ---
 
@@ -284,8 +247,8 @@ must run then, at an authority of at least $15.89.
 
 | # | deliverable | state | reason |
 |---|---|---|---|
-| 1 | Default trigger equals `cad-fewer`'s measured value, old value via config, tests for both | **NOT-POSSIBLE (as specified)** | `cad-fewer`'s value is a harness forcing knob applied through a container-only source patch; no shipped default equals it; adopting 70,000 moves the trigger **2.3–13.3× earlier**, inverting the measured win (§3). The *property* the change was meant to buy — compact as late as headroom allows — is **already true of the shipped default**. The `compact_threshold` half of the deliverable ("old value reachable via config, tests covering both") **is** delivered and under test. $0 spent. |
-| 2 | DTU guardrail, both providers, anchors + anchors-amp-dev at pinned SHAs | **NOT-POSSIBLE** | Two independent reasons, either sufficient: (i) no wire behavior changed, so there is nothing to guard; (ii) the authority does not close — $15.89 needed at observed validity vs $12 available, and even at perfect validity the $1.40 residue cannot buy the $2.13 minimum re-run (§5). Not run for reason (i); reason (ii) is recorded because the goal asks for the arithmetic on first read. Neither provider was silently dropped: **both** are unrun, for the same stated reason. |
+| 1 | Default trigger equals `cad-fewer`'s measured value, old value via config, tests for both | **NOT-POSSIBLE (as specified)** | **Executed:** the full harness chain traced (`fewer_leg.sh:41` → `scripted_driver.py` → `configure_cell.py:83-92`), `_calculate_budget`'s four-branch priority order read (`__init__.py:1895-1961`), all four `loop-streaming` call sites checked, the foundation bundle's `max_tokens: 300000` located, `git log -S` run over this repo's entire history, and 10 characterization tests written and passing. **Finding:** `cad-fewer`'s value is a harness forcing knob applied through a container-only source patch; no shipped default equals it; adopting 70,000 moves the trigger **2.3–13.3× earlier**, inverting the measured win (§3). The *property* the change was meant to buy — compact as late as headroom allows — is **already true of the shipped default**. The `compact_threshold` half of the deliverable ("old value reachable via config, tests covering both") **is** delivered and under test. $0 spent, and no amount of spend changes this. |
+| 2 | DTU guardrail, both providers, anchors + anchors-amp-dev at pinned SHAs | **NOT-POSSIBLE** | **Executed:** the guardrail was fully priced before any spend against the S5 arm table (n=12, $2.13–$3.47/run, mean $2.65) and the 4-arm shape (2 bundles × 2 providers) the deliverable specifies; the `20260902-policy-validation` template was located; `infra.tsv` was checked and confirmed to hold no row for this lane. **Two independent reasons, either sufficient:** (i) no wire behavior changed, so there is nothing to guard — a guardrail catches an Anthropic cache regression from a raised trigger changing when the prefix is rebuilt, and nothing here changes that; (ii) the authority does not close — $15.89 needed at observed validity vs $12 available, and even at perfect validity the $1.40 residue cannot buy the $2.13 minimum re-run (§5). Not run for reason (i); reason (ii) recorded because the goal asks for the arithmetic on first read. Neither provider was silently dropped: **both** are unrun, for the same stated reason. |
 | 3 | DTUs destroyed after the run, ledger rows closed | **N/A — none created** | No DTU launched, no `infra.tsv` row for this lane. `sweep` never run. |
 | 4 | CHANGELOG/README line naming the measured numbers (74 vs 104 requests, 485 vs 562 s, $2.65 vs $2.58, S5 95.0 vs 94.4) | **DONE** | README §*Where the compaction trigger comes from*, full arm table plus the two limits from the source. Provenance is now readable without the tracker. |
 | 5 | DRAFT PR on origin, full module suite green | **DONE** | 97 passed. See `publication` block in `DONE.json` for the read-back branch/PR values. |
@@ -295,11 +258,12 @@ must run then, at an authority of at least $15.89.
 
 ## 7. What the owner should decide next
 
-0. **The item is released and back in the ready queue** (branch C). It should not be
-   re-claimed as written — its premise is falsified. Re-spec it, or close it as answered; see
-   `BLOCKED.md` §"What would unblock it" for the three options. Separately, worth considering
-   a fourth branch for the goal template ("provably mis-specified, do not re-queue"); two
-   lanes have now hit that gap, and this one had to mitigate it by hand.
+0. **The item is resolved; task (1) as written should not be re-issued** — its premise is
+   falsified and the item's own description now carries that banner. Re-spec it, or treat it
+   as answered; the three options are in §"What would unblock it" below. Separately, the goal
+   template needs a stated rule for which branch owns a *provably mis-specified* deliverable:
+   this lane produced five terminal-state revisions on zero new evidence because A-vs-C is
+   under-determined by the text as written.
 1. **Is "compact late" still wanted as a default?** If yes, the only shipped lever is
    `compact_threshold` (0.92 → higher), it is unmeasured, and its ceiling is ~19% fewer
    boundaries. That is a *new measurement*, not this item — and it needs a real guardrail at
