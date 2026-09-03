@@ -33,7 +33,7 @@ Provides straightforward in-memory conversation context management. This is the 
 - No persistence across sessions
 - Automatic compaction when approaching token limit (keeps system messages + last 10 messages)
 - **Preserves tool pairs as atomic units** during compaction (data integrity guarantee)
-- **Optional real-usage token meter** (`token_meter: "actual"` or `"hybrid"`, default off) drives the compaction trigger from real provider usage instead of the built-in estimator -- see [Real-usage token meter](#real-usage-token-meter-token_meter) below
+- **Optional real-usage token meter** (`token_meter: "actual"`, default off) drives the compaction trigger from real provider usage instead of the built-in estimator -- see [Real-usage token meter](#real-usage-token-meter-token_meter) below
 
 ## Configuration
 
@@ -155,92 +155,10 @@ existed. This mirrors context-handoff's own documented limitation that its
 measurement is retrospective (one-call lag): the meter describes the
 request that was *just* answered, not the one currently being assembled.
 
-### Hybrid mode (`token_meter: "hybrid"`)
-
-`"actual"` replaces the estimator wholesale with the provider's last
-reported total. That number is **retrospective by one call**: it describes
-the request that was just answered, so everything appended since -- the new
-user turn, the tool results from this turn's tool loop -- is invisible to it.
-
-`"hybrid"` is the shape `openai/codex` uses, which has no "estimate mode" at
-all:
-
-```
-total = provider_reported_total_from_the_last_llm_response   # kind='usage'
-      + estimate(items appended since that response)         # the un-billed tail only
-```
-
-The heuristic is still used, but only for the small, recent slice the
-provider has not priced yet -- never for the whole window, and never for the
-system prompt and tool schemas, which are both the largest block in the
-window and the block the provider has *definitely* already billed.
-
-On top of that shape it carries two things lifted from
-`deepseek-ai/deepseek-harness`:
-
-**1. Provenance on every count (`kind`).** Every number this module produces
-reports where it came from -- `'usage'`, `'estimated'`, or `'none'` -- in
-`_last_token_meter_stats["kind"]` and on the `context:token_meter` event.
-A consumer that acts *irreversibly* on a token count must branch on this
-rather than silently accepting an estimate.
-
-**2. A conservatism guard.** If the provider's total is *below* what the
-heuristic priced for the very content it billed, the anchor is not a
-trustworthy floor for this window: it is **rejected**, the (larger) full
-heuristic is reported instead, and the count is honestly marked
-`kind='estimated'`. The comparand is the estimate of the view that was
-actually **sent** on that request, not the full uncompacted history -- those
-are different numbers whenever compaction is active.
-
-And a third, from the same source: **refuse to guess.** The optional cache
-aggregates in the stats (`cache_aggregates`) are reported **only** when every
-usage event observed this session carried the underlying fields. One event
-missing them makes the aggregate `None` (undefined) rather than a partial sum
-that silently under-reports.
-
-#### G-METER-PROVENANCE
-
-In `"hybrid"` mode, **no irreversible action is taken on a count whose kind
-is not `'usage'`.** Firing compaction is irreversible in the ways that
-matter: it destroys the provider's prompt cache for at least one request,
-and it records sticky truncate/remove decisions that persist for the rest of
-the session. So when the count is `kind='estimated'` -- before the first
-response of the session, or when the conservatism guard rejected the anchor
--- the trigger **declines to fire** and waits for provider-anchored data.
-Refusals are counted in `_last_token_meter_stats["provenance_refusals"]`.
-
-There is exactly **one** escape, and it is recorded rather than hidden: if
-**no** anchor has ever arrived this session *and* the count has reached 100%
-of budget, refusing would guarantee a provider context-overflow failure on
-the next request, which is strictly worse than acting on an estimate. That
-path fires, logs a warning, and is counted separately in
-`provenance_overrides` -- so a gate can report it honestly instead of it
-looking like a clean anchored fire. It cannot mask a rejected anchor: it
-requires that no measurement exists at all.
-
-#### All three meters, every request
-
-`estimated_tokens`, `measured_tokens` and `hybrid_tokens` are computed on
-**every** request in **every** mode -- including the default -- and reported
-via `_last_token_meter_stats` and the `context:token_meter` event, alongside
-`anchor_tokens`, `anchor_rejected`, `tail_estimated_tokens` and
-`tail_messages`. Only *which one drives the trigger* changes with the mode.
-That is deliberate: it makes the estimate-vs-hybrid-vs-actual divergence
-measurable on a real workload without changing behaviour to measure it.
-
-#### Same sizing limitation as `"actual"`
-
-Only the **gate** uses the anchored number. `target_tokens` and every
-per-level termination check inside `_compact_ephemeral` are still the
-estimator, for the same reason as in `"actual"` mode: a provider-billed
-count for a hypothetical smaller message set does not exist without another
-round trip.
-
 ### Future default flip (pending validation)
 
-`token_meter` defaults to `"estimate"` specifically so it ships
-with **zero behavior change**. Flipping the default to `"actual"` or
-`"hybrid"` -- and
+`token_meter` defaults to `"estimate"` in this PR specifically so it ships
+with **zero behavior change**. Flipping the default to `"actual"` -- and
 potentially raising `compact_threshold` closer to the real ceiling now that
 it can be measured accurately -- is a follow-up, not part of this change. It
 should happen only after running the module's own eval harness against
