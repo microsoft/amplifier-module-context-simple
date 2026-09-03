@@ -209,11 +209,59 @@ config `summary_call_mode`; only consulted when compaction_strategy ==
     an explicit-breakpoint cache (Anthropic) needs, since the provider
     places its breakpoint at the last STABLE message -- i.e. exactly
     where this module's view ends.
-  • UNMEASURED. The gates (G-FORK-PREFIX / G-FORK-CACHED / G-FORK-COST /
-    G-FORK-NOBOUNDARY) are a separately funded eval; nothing in this
-    module claims a measured cache or cost win yet. What IS proven here
-    is structural: default byte-identity, main-line non-mutation, and
-    pure-append shape.
+  • NOW MEASURED, AND THE VERDICT IS "COST-NEUTRAL AS-IS". Lane 6da ran
+    the four gates end-to-end (S5-CRAC, n=3/arm, gpt-5.6-terra@medium)
+    and three of four FAILED. The cache mechanism is real -- a forked
+    call reads a median 85.7% of its own prompt from cache against
+    0.0% for a standalone one -- but total run cost moved -0.8%, i.e.
+    noise. WHY it cancels, and what to do about it, is the next section.
+    What was already proven here is structural and still holds: default
+    byte-identity, main-line non-mutation, and pure-append shape.
+
+Span-Size Predicate In Front Of The Fork (opt-in, default off -- see config
+`summary_fork_min_span_ratio`, and mode "auto"):
+  • THE PROBLEM IT SOLVES: fork mode as shipped forks EVERY summarization
+    it is aligned for, and lane 6da measured why that nets to zero. A
+    forked call is 4.5x cheaper per token ($0.00077 vs $0.00350 per 1k
+    own-prompt tokens) but its prompt is 5.2x bigger (median 26,620 vs
+    5,129 tokens), because it always carries the whole conversation
+    prefix. 4.5x cheaper x 5.2x more tokens ~= 1.0. The mechanism works
+    and pays for itself exactly.
+  • THE TRADE IS SPAN-SIZE DEPENDENT, and that is the lever. Measured:
+    a standalone call on a span >30,000 tokens costs $0.1410 mean; on a
+    span <=15,000 tokens, $0.0151. A forked call is roughly FLAT at
+    $0.0265 regardless, because what it pays for is the prefix, not the
+    span. So the fork wins ~5x on the tail and loses on the median.
+  • THE FIX: gate the fork on span size RELATIVE TO PREFIX size. A
+    standalone call pays for the SPAN at the uncached rate; a fork pays
+    for the PREFIX at the cached rate. Fork is cheaper exactly when
+    span/prefix > (cached rate / uncached rate) = 0.22. That is
+    DEFAULT_FORK_MIN_SPAN_RATIO, derived from the measured rates rather
+    than chosen -- see its definition for the derivation and two
+    independent cross-checks against the same table.
+  • WHY A RATIO AND NOT A TOKEN COUNT. Fork cost scales with the PREFIX,
+    which grows all session; standalone cost scales with the SPAN. The
+    break-even is therefore a ratio of two rates, and a fixed token
+    threshold is only correct at one prefix size. (At 6da's median
+    prefix the equivalent absolute threshold is ~5,900 span tokens; by
+    late session the same ratio is a much larger number.)
+  • `summary_fork_min_span_ratio: None` (DEFAULT) or `0` disables the
+    predicate entirely: not evaluated, no counter moved, fork mode
+    behaves exactly as it did before this feature. `summary_call_mode:
+    "auto"` is the one-word way to say "fork, predicate on, at the
+    measured default". An explicit ratio always wins over both.
+  • A DECLINE IS NOT A FALLBACK. The predicate is evaluated strictly
+    AFTER every alignment precondition, so it only ever sees forks that
+    would have worked, and it declines them on cost alone. Declines move
+    `fork_declines`; genuine refusals move `fork_fallbacks`; the two are
+    reported separately in `last_summary_call_stats` because a healthy
+    predicate and a broken fork would otherwise look identical.
+  • THE CAP THIS DOES NOT LIFT. 6da also found the fork rate structurally
+    capped at 45.5% (20/44) on a CLI workload: every turn is a fresh
+    process, so `note_request_sent()` has not been called when the first
+    summary trigger of the turn fires. The predicate runs after that
+    refusal and therefore CANNOT raise the fork rate -- only lower it.
+    It captures the tail win within whatever subset is forkable at all.
 
 Tool-result budget and spill (opt-in, default off -- see config
 `tool_result_budget_tokens` / `tool_result_shape` /
@@ -360,10 +408,62 @@ _VALID_COMPACTION_STRATEGIES = (
 # "inline" is accepted as an alias for "standalone": the lane brief that
 # commissioned this work named the default mode "inline" while the work
 # item named it "standalone". Both mean "today's behavior, unchanged".
+#
+# "auto" is "fork, but only when the span-size predicate says forking is
+# actually cheaper" -- see DEFAULT_FORK_MIN_SPAN_RATIO and the module
+# docstring "Span-size predicate in front of the fork".
 SUMMARY_CALL_MODE_STANDALONE = "standalone"
 SUMMARY_CALL_MODE_FORK = "fork"
-_VALID_SUMMARY_CALL_MODES = (SUMMARY_CALL_MODE_STANDALONE, SUMMARY_CALL_MODE_FORK)
+SUMMARY_CALL_MODE_AUTO = "auto"
+_VALID_SUMMARY_CALL_MODES = (
+    SUMMARY_CALL_MODE_STANDALONE,
+    SUMMARY_CALL_MODE_FORK,
+    SUMMARY_CALL_MODE_AUTO,
+)
 _SUMMARY_CALL_MODE_ALIASES = {"inline": SUMMARY_CALL_MODE_STANDALONE}
+# The modes under which a fork is even attempted. "auto" differs from
+# "fork" ONLY in which default the span-size predicate resolves to; every
+# alignment precondition is identical and is checked first.
+_FORK_CALL_MODES = (SUMMARY_CALL_MODE_FORK, SUMMARY_CALL_MODE_AUTO)
+
+# Break-even span:prefix ratio for the fork, DERIVED (not chosen) from the
+# per-token rates lane 6da measured end-to-end on S5-CRAC:
+#
+#     forked call:     $0.00077 per 1,000 own-prompt tokens
+#     standalone call: $0.00350 per 1,000 own-prompt tokens
+#
+# A standalone call's own prompt IS the span (its own ~955-char system
+# prompt plus a fresh rendering of the span). A forked call's own prompt is
+# the whole PREFIX -- which already contains the span; the appended
+# instruction is a rounding error. So, with S = span tokens and P = prefix
+# tokens, the fork is cheaper exactly when
+#
+#     P x 0.00077 < S x 0.00350   <=>   S / P > 0.22
+#
+# 0.22 is that ratio and nothing else. Two independent cross-checks against
+# the same measured table, both of which it passes:
+#
+#   • 6da's median span (5,129 tok) over its median fork prompt (26,620
+#     tok) is 0.193 -- just BELOW break-even, which is precisely why 6da
+#     measured the two arms cancelling "exactly" at the median.
+#   • 6da's span buckets: standalone spans <=15k cost $0.0151 mean (implied
+#     mean span ~4.3k, ratio ~0.16 -> predicate DECLINES, standalone wins,
+#     correct); standalone spans >30k cost $0.1410 mean (implied mean span
+#     ~40k, ratio >=0.67 -> predicate FORKS at a flat ~$0.027, correct, a
+#     5.3x win).
+#
+# Evidence: .amplifier/evaluation/probes/6da-summary-fork/FINDINGS.md §6
+# ("WHY G-FORK-COST FAILED -- the two effects cancel, exactly") in the
+# openai-evals-team-ci repo. It is a BREAK-EVEN, not a margin: it is the
+# point where the two calls cost the same. Raising it buys margin, lowering
+# it forks speculatively; both are one config value away.
+DEFAULT_FORK_MIN_SPAN_RATIO = 0.22
+
+# There is exactly one kind of predicate decline, and its message carries
+# per-call token counts. Deduping the announcement on the MESSAGE would
+# therefore dedupe nothing; it dedupes on this constant instead. See
+# _note_fork_declined.
+_FORK_DECLINE_KIND = "span-below-min-span-ratio"
 
 # How much of the span's final message is quoted back in the fork
 # instruction as the "summarize up to HERE" boundary marker. Long enough to
@@ -505,7 +605,7 @@ discovered during the conversation.
 def _normalize_summary_call_mode(value: Any) -> str:
     """Canonicalize a `summary_call_mode` config value.
 
-    Accepts the two real modes plus the documented "inline" alias for
+    Accepts the three real modes plus the documented "inline" alias for
     "standalone" (the commissioning lane brief and the work item named the
     same default differently -- see _SUMMARY_CALL_MODE_ALIASES). An
     unusable value logs a warning and falls back to "standalone", matching
@@ -522,6 +622,45 @@ def _normalize_summary_call_mode(value: Any) -> str:
         )
         return SUMMARY_CALL_MODE_STANDALONE
     return mode
+
+
+def _normalize_fork_min_span_ratio(value: Any) -> float | None:
+    """Canonicalize a `summary_fork_min_span_ratio` config value.
+
+    None (and 0, mirroring how `compact_clear_at_least` spells "off")
+    disables the predicate entirely: it is not evaluated, no counter moves,
+    and fork mode behaves exactly as it did before this feature existed.
+    Otherwise a positive real number, interpreted as span_tokens /
+    prefix_tokens.
+
+    Values > 1.0 are legal and meaningful -- the span is a SUBSET of the
+    prefix, so a ratio above 1.0 can never be met and is a deliberate "arm
+    the plumbing, never fork" setting. An unusable value (non-numeric,
+    negative, NaN) logs a warning and disables the predicate, matching how
+    every other knob in this module is validated: refusing to start is
+    worse than running at the old default and saying so.
+    """
+    if value is None:
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        logger.warning(
+            f"context-simple: unusable summary_fork_min_span_ratio {value!r} "
+            "(expected None or a positive number); the span-size predicate "
+            "is DISABLED and fork mode will fork whenever it is aligned"
+        )
+        return None
+    if ratio != ratio or ratio < 0:  # NaN or negative
+        logger.warning(
+            f"context-simple: unusable summary_fork_min_span_ratio {value!r} "
+            "(expected None or a positive number); the span-size predicate "
+            "is DISABLED and fork mode will fork whenever it is aligned"
+        )
+        return None
+    if ratio == 0:
+        return None
+    return ratio
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -582,15 +721,27 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               is the cheapest lever; see README "Known issue: boundary
               refire".
             - summary_call_mode: "standalone" (default, byte-identical to the
-              pre-existing summarizer call) or "fork" -- issue the
+              pre-existing summarizer call), "fork" -- issue the
               summarization ask as a pure append onto the prefix the main
               line already sent, so it can be cache-read instead of paying
-              fresh input tokens for the span. "inline" is accepted as an
-              alias for "standalone". Only consulted when
-              compaction_strategy == "summary". Fork mode additionally
-              requires the caller to have called note_request_sent(); see
-              module docstring "Cache-safe forking of the summarization
-              call".
+              fresh input tokens for the span -- or "auto", which is "fork"
+              gated by the span-size predicate at its measured break-even
+              default. "inline" is accepted as an alias for "standalone".
+              Only consulted when compaction_strategy == "summary". Fork
+              mode additionally requires the caller to have called
+              note_request_sent(); see module docstring "Cache-safe forking
+              of the summarization call".
+            - summary_fork_min_span_ratio: Span-size predicate in front of
+              the fork. None (default) or 0 disables it entirely -- fork
+              mode then forks whenever it is aligned, exactly as before.
+              A positive number is the minimum span_tokens/prefix_tokens
+              at which forking is worth it; below it the summarizer runs
+              standalone BY DESIGN (recorded, not counted as a fallback).
+              Unset under summary_call_mode "auto" it resolves to
+              DEFAULT_FORK_MIN_SPAN_RATIO (0.22, the break-even derived
+              from lane 6da's measured per-token rates). Only consulted
+              when a fork is otherwise possible; see module docstring
+              "Span-size predicate in front of the fork".
             - summarization_model: Model identifier passed to the summarizer's
               ChatRequest (default: None, i.e. provider default). Setting it
               CONFLICTS with summary_call_mode "fork" (a summarizer routed to
@@ -684,6 +835,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         compaction_strategy=compaction_strategy,
         summary_trigger=config.get("summary_trigger", 0.60),
         summary_call_mode=summary_call_mode,
+        summary_fork_min_span_ratio=config.get("summary_fork_min_span_ratio"),
         summarization_model=config.get("summarization_model"),
         summarization_prompt_path=config.get("summarization_prompt_path"),
         summarization_timeout_s=config.get("summarization_timeout_s", 30.0),
@@ -776,6 +928,7 @@ class SimpleContextManager:
         compaction_strategy: str = COMPACTION_STRATEGY_PROGRESSIVE,
         summary_trigger: float = 0.60,
         summary_call_mode: str = SUMMARY_CALL_MODE_STANDALONE,
+        summary_fork_min_span_ratio: float | None = None,
         summarization_model: str | None = None,
         summarization_prompt_path: str | None = None,
         summarization_timeout_s: float = 30.0,
@@ -842,15 +995,24 @@ class SimpleContextManager:
                 module docstring and README "Known issue: boundary
                 refire".
             summary_call_mode: "standalone" (default; the pre-existing
-                two-message summarizer call, byte-identical) or "fork" (the
+                two-message summarizer call, byte-identical), "fork" (the
                 same ask appended onto the main line's already-sent prefix
-                so the provider can cache-read it). "inline" is an accepted
-                alias for "standalone". Only consulted when
-                compaction_strategy == "summary". See module docstring
-                "Cache-safe forking of the summarization call" -- in
-                particular, fork mode needs note_request_sent() to have been
-                called, and falls back to standalone (loudly) when it has
-                not.
+                so the provider can cache-read it), or "auto" ("fork" with
+                the span-size predicate on at its measured break-even
+                default). "inline" is an accepted alias for "standalone".
+                Only consulted when compaction_strategy == "summary". See
+                module docstring "Cache-safe forking of the summarization
+                call" -- in particular, fork mode needs note_request_sent()
+                to have been called, and falls back to standalone (loudly)
+                when it has not.
+            summary_fork_min_span_ratio: Minimum span_tokens/prefix_tokens
+                at which a fork is worth issuing. None (default) or 0
+                disables the predicate entirely -- not evaluated, no
+                counter moved, fork mode unchanged from before this
+                feature. Unset under summary_call_mode "auto" it resolves
+                to DEFAULT_FORK_MIN_SPAN_RATIO. An explicit value always
+                wins, in either fork mode. See module docstring "Span-size
+                predicate in front of the fork".
             summarization_model: Model identifier for the summarizer's own
                 ChatRequest. None uses the provider's default model.
                 Incompatible with summary_call_mode "fork" -- a summarizer
@@ -916,6 +1078,13 @@ class SimpleContextManager:
             compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
         self.compaction_strategy = compaction_strategy
         self.summary_call_mode = _normalize_summary_call_mode(summary_call_mode)
+        # None means "predicate off". Kept as the RAW normalized config so
+        # `_effective_fork_min_span_ratio` can still tell "the caller said
+        # nothing" from "the caller said 0.22", which is the whole
+        # difference between mode "fork" and mode "auto".
+        self.summary_fork_min_span_ratio = _normalize_fork_min_span_ratio(
+            summary_fork_min_span_ratio
+        )
         self.summary_trigger = summary_trigger
         self.summarization_model = summarization_model
         self.summarization_prompt_path = summarization_prompt_path
@@ -1024,9 +1193,27 @@ class SimpleContextManager:
         # these to tell a real fork from a silently unforked one.
         self._last_summary_call: dict[str, Any] | None = None
         self._summary_fork_fallbacks: int = 0
+        # DELIBERATE declines by the span-size predicate, counted SEPARATELY
+        # from `_summary_fork_fallbacks` on purpose. A fallback means "a
+        # fork was wanted and could not be done" -- a defect signal an eval
+        # arm reads to detect silent unforking. A decline means "a fork was
+        # possible and the predicate judged it more expensive than the
+        # standalone call" -- the feature working. Summing them into one
+        # number would make a correctly-working predicate look exactly like
+        # a broken fork.
+        self._summary_fork_declines: int = 0
+        # What the predicate actually measured on the last summarizer call
+        # (None when it was not consulted). Surfaced through
+        # last_summary_call_stats so an eval arm can plot the realized
+        # span:prefix distribution and re-derive the threshold from its own
+        # data instead of trusting this module's default.
+        self._last_fork_span_measure: dict[str, Any] | None = None
         # Precondition names already warned about, so a session that can
         # never fork logs once per reason instead of once per summarization.
         self._fork_warned: set[str] = set()
+        # Same once-per-reason discipline for predicate declines, which are
+        # announced at INFO (they are by design, not a problem).
+        self._fork_declined_warned: set[str] = set()
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
         # most recent real usage observed via `llm:response`
@@ -1220,9 +1407,19 @@ class SimpleContextManager:
 
         None before the first one. Otherwise a dict with `mode_requested`,
         `mode_used`, `reason` (None when the requested mode was honored),
-        `prefix_messages`, and `fork_fallbacks` (session-cumulative). This
-        is how an eval arm distinguishes a real fork from a silently
-        unforked one WITHOUT patching the module.
+        `prefix_messages`, `fork_fallbacks` (session-cumulative),
+        `fork_declines` (session-cumulative, and NOT the same thing -- see
+        below), and `span_measure` (None unless the span-size predicate was
+        consulted; otherwise `span_tokens`, `prefix_tokens`, `span_ratio`,
+        `min_span_ratio`).
+
+        This is how an eval arm distinguishes a real fork from a silently
+        unforked one WITHOUT patching the module -- and, since the
+        predicate landed, a DECLINED fork (the predicate judging standalone
+        cheaper: working as designed) from a REFUSED one (a fork that was
+        wanted and could not be built: a defect signal). `span_measure`
+        additionally lets an arm plot the realized span:prefix distribution
+        and re-derive its own threshold from its own data.
         """
         return dict(self._last_summary_call) if self._last_summary_call else None
 
@@ -4170,7 +4367,105 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         """True only when a forked summarizer call is actually configured."""
         return (
             self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY
-            and self.summary_call_mode == SUMMARY_CALL_MODE_FORK
+            and self.summary_call_mode in _FORK_CALL_MODES
+        )
+
+    def _effective_fork_min_span_ratio(self) -> float | None:
+        """The span:prefix ratio this configuration actually gates on.
+
+        An explicit `summary_fork_min_span_ratio` always wins, in either
+        fork mode -- including under "auto", where setting it explicitly is
+        how you override the measured default. Left unset, "auto" resolves
+        to DEFAULT_FORK_MIN_SPAN_RATIO and plain "fork" resolves to None
+        (predicate off, PR #27 behavior unchanged).
+        """
+        if self.summary_fork_min_span_ratio is not None:
+            return self.summary_fork_min_span_ratio
+        if self.summary_call_mode == SUMMARY_CALL_MODE_AUTO:
+            return DEFAULT_FORK_MIN_SPAN_RATIO
+        return None
+
+    def _fork_span_measure(
+        self, span: list[dict[str, Any]], prefix: list[dict[str, Any]]
+    ) -> tuple[int, int, float | None]:
+        """(span_tokens, prefix_tokens, ratio) for the predicate.
+
+        Both sides use this module's own `_estimate_tokens`, the same unit
+        the rest of the compaction ladder is denominated in. The predicate
+        compares two counts produced by ONE estimator, so its verdict is
+        exact in its own units and never mixes an estimate with a
+        provider-reported figure. Ratio is None when the prefix measures
+        zero (nothing to divide by; the caller treats that as "no opinion").
+        """
+        span_tokens = self._estimate_tokens(span)
+        prefix_tokens = self._estimate_tokens(prefix)
+        if prefix_tokens <= 0:
+            return span_tokens, prefix_tokens, None
+        return span_tokens, prefix_tokens, span_tokens / prefix_tokens
+
+    def _fork_span_declined_reason(
+        self,
+        span_tokens: int,
+        prefix_tokens: int,
+        ratio: float | None,
+        threshold: float,
+    ) -> str | None:
+        """Why this fork is DECLINED as not worth issuing, or None to fork.
+
+        This is an economic judgement, not an alignment check -- it runs
+        strictly AFTER every `_fork_refusal_reason` branch, so by the time
+        it is consulted the fork is known to be correct and would work.
+        The question here is only whether it is cheaper.
+
+        THE ECONOMICS, in one line: a standalone call pays for the SPAN at
+        the uncached rate; a fork pays for the whole PREFIX at the cached
+        rate. Fork wins when span/prefix exceeds the ratio of those two
+        rates -- see DEFAULT_FORK_MIN_SPAN_RATIO for the measured
+        derivation. Below that line the fork is not merely a smaller win,
+        it is a LOSS, which is why it declines rather than shrugging.
+        """
+        if ratio is None:
+            # Prefix measured zero tokens. Nothing sane to divide by, and a
+            # zero-token prefix is not a prefix worth protecting from a
+            # cache rebuild either. Say nothing; let the fork proceed.
+            return None
+        if ratio >= threshold:
+            return None
+        return (
+            f"the span is {span_tokens} tok against a {prefix_tokens} tok "
+            f"prefix (ratio {ratio:.3f}), below the "
+            f"summary_fork_min_span_ratio of {threshold:.3f} -- forking "
+            "would re-pay for the whole prefix to save re-sending a span "
+            "smaller than that costs"
+        )
+
+    def _note_fork_declined(self, reason: str) -> None:
+        """Record and (once per decline KIND) announce a DECLINED fork.
+
+        Deliberately NOT `_note_fork_fallback`: this is the predicate doing
+        its job, so it moves its own counter and speaks at INFO rather than
+        WARNING. Conflating the two would make a working predicate
+        indistinguishable from the silent-unforking defect fork mode's
+        warnings exist to surface.
+
+        Note the dedupe key is the decline KIND, not the message. Every
+        decline message carries its own token counts, so deduping on the
+        message would dedupe nothing and emit a line per summarization --
+        which is precisely the log-spam `_note_fork_fallback`'s
+        once-per-reason discipline exists to avoid. The numbers still reach
+        anyone who wants them, on the DEBUG line and in
+        `last_summary_call_stats["span_measure"]`.
+        """
+        self._summary_fork_declines += 1
+        if _FORK_DECLINE_KIND in self._fork_declined_warned:
+            logger.debug(f"context-simple: summarizer fork declined again ({reason})")
+            return
+        self._fork_declined_warned.add(_FORK_DECLINE_KIND)
+        logger.info(
+            f"context-simple: summary_call_mode={self.summary_call_mode!r} could "
+            f"have forked this summarization but DECLINED -- {reason}. The "
+            "standalone call is the cheaper one here; this is the span-size "
+            "predicate working, not a failure. Logged once per distinct reason."
         )
 
     def _capture_fork_prefix(self) -> list[dict[str, Any]] | None:
@@ -4372,25 +4667,55 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         reason: str | None = None
 
         if self._fork_armed():
+            # Cleared inside the armed branch, never outside it: the default
+            # path must not so much as write a fork attribute (Group A).
+            self._last_fork_span_measure = None
             reason = self._fork_refusal_reason(messages_to_summarize, fork_prefix)
             if reason is None:
-                try:
-                    assert fork_prefix is not None  # guaranteed by the check above
-                    return (
-                        self._build_fork_request(
-                            messages_to_summarize, fork_prefix, prompt
-                        ),
-                        SUMMARY_CALL_MODE_FORK,
-                        None,
+                assert fork_prefix is not None  # guaranteed by the check above
+                # ORDER MATTERS. Alignment first (above), economics second
+                # (here). A misaligned fork is WRONG at any span size, so it
+                # must never be reachable by making the span big enough; and
+                # the predicate needs a real prefix to measure against, which
+                # the alignment checks are what guarantee.
+                threshold = self._effective_fork_min_span_ratio()
+                if threshold is not None:
+                    span_tokens, prefix_tokens, ratio = self._fork_span_measure(
+                        messages_to_summarize, fork_prefix
                     )
-                except Exception as e:
-                    # A prefix message this module never created (unexpected
-                    # content shape from a caller, say) can fail Message
-                    # validation. Falling back keeps the summary happening at
-                    # today's cost instead of turning a cache optimization
-                    # into a lost summary.
-                    reason = f"the forked request could not be built ({e!r})"
-            self._note_fork_fallback(reason)
+                    self._last_fork_span_measure = {
+                        "span_tokens": span_tokens,
+                        "prefix_tokens": prefix_tokens,
+                        "span_ratio": ratio,
+                        "min_span_ratio": threshold,
+                    }
+                    declined = self._fork_span_declined_reason(
+                        span_tokens, prefix_tokens, ratio, threshold
+                    )
+                    if declined is not None:
+                        self._note_fork_declined(declined)
+                        # Return through the standalone branch below WITHOUT
+                        # `_note_fork_fallback`: nothing went wrong here.
+                        reason = declined
+                if reason is None:
+                    try:
+                        return (
+                            self._build_fork_request(
+                                messages_to_summarize, fork_prefix, prompt
+                            ),
+                            SUMMARY_CALL_MODE_FORK,
+                            None,
+                        )
+                    except Exception as e:
+                        # A prefix message this module never created
+                        # (unexpected content shape from a caller, say) can
+                        # fail Message validation. Falling back keeps the
+                        # summary happening at today's cost instead of
+                        # turning a cache optimization into a lost summary.
+                        reason = f"the forked request could not be built ({e!r})"
+                        self._note_fork_fallback(reason)
+            else:
+                self._note_fork_fallback(reason)
 
         formatted = self._format_messages_for_summarization(messages_to_summarize)
         request = ChatRequest(
@@ -4475,6 +4800,16 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                     else 0
                 ),
                 "fork_fallbacks": self._summary_fork_fallbacks,
+                # Separate from fork_fallbacks on purpose -- see
+                # `_summary_fork_declines`. A run with declines>0 and
+                # fallbacks==0 is a healthy predicate; the reverse is a
+                # wiring defect. One number could not say which.
+                "fork_declines": self._summary_fork_declines,
+                "span_measure": (
+                    dict(self._last_fork_span_measure)
+                    if self._last_fork_span_measure
+                    else None
+                ),
             }
 
             if self._hooks is not None:
