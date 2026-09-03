@@ -55,66 +55,6 @@ Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
   • Ported from amplifier-module-context-handoff's proven `_on_llm_response`
     meter. See README "Real-usage token meter" for the full rationale.
 
-Worth-The-Rebuild Predicate (opt-in, default off -- see config
-`compact_clear_at_least`):
-  • THE PROBLEM IT SOLVES: the compaction trigger fires on a usage
-    THRESHOLD (`compact_threshold`) and never asks how many tokens the
-    compaction will actually free. Every compaction shrinks the request,
-    and on the OpenAI path a shrink is a guaranteed full cold rebuild of
-    the prompt cache (the cache matches forward from a cached entry, never
-    backward into one -- so a strict prefix of a cached request MISSES).
-    A boundary that frees 3k tokens therefore pays a full rebuild of an
-    ~18k-token pinned head plus everything after it to buy very little.
-    We currently take that trade silently, every time.
-  • THE FIX, lifted from Anthropic's context-editing API: `clear_at_least`
-    -- "If the API can't clear at least the specified amount, the strategy
-    will not be applied. This helps determine if context clearing is worth
-    breaking your prompt cache." Vendor-agnostic; implemented here
-    client-side, no API support required.
-  • `compact_clear_at_least: None` (DEFAULT) or `0` disables the predicate
-    entirely: not evaluated, no new event, no behavioural difference. The
-    default path is byte-identical to before this feature existed.
-  • An int >= 1 is an absolute token floor. A float in (0, 1) is a
-    FRACTION OF THE BUDGET, resolved per call (so it tracks the model's
-    real window rather than a hardcoded number).
-  • WHAT "freed" MEANS HERE, precisely: this module's ladder has no
-    separable plan/apply split -- it mutates an ephemeral copy level by
-    level, threading a running `current_tokens` through every rung. So the
-    predicate does not estimate a projection; it compares the count the
-    ladder ALREADY computes for the view it produced against the count of
-    the view this call would have returned had it decided nothing new
-    (the sticky baseline). That delta is the MARGINAL reclaim of this
-    boundary -- which is the right number, because what breaks the cache
-    is this view differing from the last one, not the distance from raw
-    history. It is exact for the ladder's own units, not a second
-    estimator (see _clear_at_least_required / _finalize_compaction_with_stats).
-  • ON REFUSAL: the new escalation is rolled back (the sticky
-    truncate/remove/stub decisions recorded during it are discarded), the
-    baseline view is returned unchanged, and `context:compaction-skipped`
-    is emitted. No `context:compaction` event fires, because no compaction
-    happened. `_last_compaction_stats` is untouched, so the tail notice
-    stays byte-stable across a skip.
-  • ESCALATION PATH -- this predicate can starve compaction, so it must
-    not become a silent hang. After `compact_max_consecutive_skips`
-    (default 3) consecutive refusals it FAILS LOUD: raises RuntimeError
-    naming what the ladder freed, what was required, the level it reached,
-    and the protected-set size that is holding the floor. Degrading
-    quietly instead would let an eval pass while the predicate had
-    silently stopped applying, which is the one outcome its gate
-    (G-CAL-NOSKIPHANG) is written to catch. Unreachable while the
-    predicate is disabled.
-  • Calls where sticky state alone was already sufficient (no NEW decision
-    made) are not judged and never count as a skip -- nothing was refused.
-
-Summary Shrink Guard (active whenever `compaction_strategy == "summary"`):
-  • Refuses to swap in a rolling summary that is not SMALLER than the span
-    of messages it replaces. A summary that grows the context is a silent
-    cost regression -- it pays a cache rebuild to make the request bigger.
-  • Lifted from deepseek-harness's compaction-basic region check. The
-    pending summary is discarded (the same graceful path a stale summary
-    already takes) and this pass falls back to progressive compaction.
-  • No config knob: there is no defensible reason to want the opposite.
-
 Summary Compaction Strategy (opt-in, default off -- see config
 `compaction_strategy`):
   • `compaction_strategy: "progressive"` (default) is this module's
@@ -305,13 +245,6 @@ _VALID_TOOL_RESULT_SHAPES = (TOOL_RESULT_SHAPE_HEAD, TOOL_RESULT_SHAPE_HEAD_TAIL
 # tokens rather than chars.
 _TOOL_RESULT_CHARS_PER_TOKEN = 4
 
-# Worth-the-rebuild predicate defaults (see module docstring). The predicate
-# is DISABLED by default -- `None` (and `0`) mean "today's behaviour exactly".
-# The skip cap exists solely so a predicate that can never be satisfied fails
-# loud instead of looping; it is unreachable while the predicate is disabled.
-DEFAULT_CLEAR_AT_LEAST = None
-DEFAULT_MAX_CONSECUTIVE_SKIPS = 3
-
 # The summary message's envelope source tag and metadata type marker. The
 # envelope is what makes foundation's is_real_user_message() classify this
 # role="user" message as NOT a real user turn (see module docstring); the
@@ -450,17 +383,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               falling back to the estimator before then. An unrecognized
               value falls back to "estimate" with a logged warning rather
               than crashing mount(). See module docstring.
-            - compact_clear_at_least: Worth-the-rebuild predicate in front of
-              compaction (default: None = disabled, today's behaviour
-              exactly). An int >= 1 is an absolute token floor; a float in
-              (0, 1) is a fraction of the budget. A compaction that would
-              free less than this is REFUSED and rolled back rather than
-              paying a full prompt-cache rebuild for a small reclaim. See
-              module docstring "Worth-The-Rebuild Predicate".
-            - compact_max_consecutive_skips: How many consecutive predicate
-              refusals are tolerated before failing loud with a RuntimeError
-              (default: 3). Only consulted when compact_clear_at_least is
-              enabled; unreachable otherwise.
             - compaction_strategy: "progressive" (default) or "summary". See
               module docstring "Summary compaction strategy". An
               unrecognized value falls back to "progressive" with a logged
@@ -553,12 +475,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
         output_reserve_fraction=config.get("output_reserve_fraction", 0.5),
         token_meter=token_meter,
-        compact_clear_at_least=config.get(
-            "compact_clear_at_least", DEFAULT_CLEAR_AT_LEAST
-        ),
-        compact_max_consecutive_skips=config.get(
-            "compact_max_consecutive_skips", DEFAULT_MAX_CONSECUTIVE_SKIPS
-        ),
         compaction_strategy=compaction_strategy,
         summary_trigger=config.get("summary_trigger", 0.60),
         summarization_model=config.get("summarization_model"),
@@ -648,8 +564,6 @@ class SimpleContextManager:
         compaction_notice_min_level: int = 1,
         output_reserve_fraction: float = 0.5,
         token_meter: str = TOKEN_METER_ESTIMATE,
-        compact_clear_at_least: int | float | None = DEFAULT_CLEAR_AT_LEAST,
-        compact_max_consecutive_skips: int = DEFAULT_MAX_CONSECUTIVE_SKIPS,
         compaction_strategy: str = COMPACTION_STRATEGY_PROGRESSIVE,
         summary_trigger: float = 0.60,
         summarization_model: str | None = None,
@@ -690,20 +604,6 @@ class SimpleContextManager:
                 session -- see module docstring "Real-Usage Token Meter").
                 An unrecognized value falls back to "estimate" with a
                 logged warning rather than raising.
-            compact_clear_at_least: Worth-the-rebuild predicate in front of
-                compaction. None (default) or 0 disables it entirely --
-                byte-identical to before this feature existed. An int >= 1
-                is an absolute token floor; a float in (0, 1) is a fraction
-                of the per-call budget. A compaction whose MARGINAL reclaim
-                is below the floor is refused and rolled back rather than
-                paying a full prompt-cache rebuild for a small reclaim. See
-                module docstring "Worth-The-Rebuild Predicate".
-            compact_max_consecutive_skips: Consecutive predicate refusals
-                tolerated before failing loud with RuntimeError (default 3).
-                Only consulted when compact_clear_at_least is enabled. A
-                value <= 0 is treated as 1 (refuse once, then fail) rather
-                than as "never fail", because "never fail" is the silent
-                hang this cap exists to prevent.
             compaction_strategy: "progressive" (default, byte-identical to
                 pre-existing behavior) or "summary" -- see module docstring
                 "Summary compaction strategy". An unrecognized value falls
@@ -764,12 +664,6 @@ class SimpleContextManager:
             )
             token_meter = TOKEN_METER_ESTIMATE
         self.token_meter = token_meter
-        self.compact_clear_at_least = compact_clear_at_least
-        # A cap of 0 or less would mean "tolerate unlimited refusals", i.e.
-        # exactly the silent starvation this cap exists to prevent. Clamp to
-        # 1 (refuse once, then fail loud) rather than honouring a value that
-        # disables the only safety net the predicate has.
-        self.compact_max_consecutive_skips = max(1, int(compact_max_consecutive_skips))
         if compaction_strategy not in _VALID_COMPACTION_STRATEGIES:
             logger.warning(
                 f"context-simple: unknown compaction_strategy {compaction_strategy!r} "
@@ -828,22 +722,6 @@ class SimpleContextManager:
         self._last_replayed_boundary: tuple[int, int] | None = None
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
-        # --- Worth-the-rebuild predicate state (compact_clear_at_least) ---
-        # `_clear_at_least_skips` counts CONSECUTIVE refusals; any accepted
-        # compaction resets it to 0. `_clear_at_least_pending` is call-scoped
-        # state handed from _compact_ephemeral to its single terminal choke
-        # point (_finalize_compaction_with_stats): the baseline view this
-        # call would have returned had it decided nothing new, that view's
-        # token count, and the sticky-decision snapshot to roll back to. It
-        # is always None outside a single _compact_ephemeral call, and stays
-        # None entirely while the predicate is disabled.
-        self._clear_at_least_skips: int = 0
-        self._clear_at_least_pending: dict[str, Any] | None = None
-        # True only for the remainder of a call whose escalation the
-        # predicate refused. Read by get_messages_for_request() so a
-        # refusal is not mistaken for a compaction boundary by the
-        # last-user replay. Always False while the predicate is disabled.
-        self._clear_at_least_last_refused: bool = False
         # --- Summary compaction strategy state (compaction_strategy == "summary") ---
         # Unused, and never touched, in the default "progressive" mode.
         self._cached_provider: Any = None
@@ -1169,17 +1047,7 @@ class SimpleContextManager:
             # suppressed (tail unsafe) or the replay lands first and the
             # notice's own guard then sees the replay -- a plain user
             # message with no tool_calls -- and proceeds correctly.
-            # A refused compaction is NOT a boundary. Without this check the
-            # replay would fire on a call where nothing was shed at all --
-            # `_current_compaction_boundary()` is unchanged by a refusal (by
-            # design: the verdict runs before `_sticky_level` is bumped), so
-            # on the first-ever refusal it still differs from the initial
-            # `None` and would look like a fresh boundary. Appending a
-            # verbatim user replay after a compaction that did not happen
-            # would both mislead the model and spend tokens the refusal
-            # exists to save. Always False while the predicate is disabled,
-            # so this cannot change existing behaviour.
-            if self.replay_last_user_on_compaction and not self._clear_at_least_last_refused:
+            if self.replay_last_user_on_compaction:
                 self._maybe_append_last_user_replay(compacted, effective_budget)
 
             if self.compaction_notice_enabled and self._last_compaction_stats:
@@ -1324,7 +1192,6 @@ class SimpleContextManager:
         self._sticky_level = 0
         self._last_compaction_stats = None
         self._last_replayed_boundary = None
-        self._reset_clear_at_least_state()
         self._reset_summary_strategy_state()
         logger.info(f"Restored {len(messages)} messages to context")
 
@@ -1347,7 +1214,6 @@ class SimpleContextManager:
         self._tool_name_by_call_id = {}
         self._spilled_paths = set()
         self._last_replayed_boundary = None
-        self._reset_clear_at_least_state()
         self._reset_summary_strategy_state()
         logger.info("Context cleared")
 
@@ -1860,194 +1726,6 @@ class SimpleContextManager:
                 result.append(dict(msg))
         return result
 
-    # --- Worth-the-rebuild predicate helpers (compact_clear_at_least) ---
-    #
-    # See the module docstring section "Worth-The-Rebuild Predicate" for the
-    # why. In short: every compaction shrinks the request, and a shrink is a
-    # guaranteed cold prompt-cache rebuild on the OpenAI path, so a boundary
-    # that frees very little is close to pure loss. This predicate refuses
-    # those boundaries. It is DISABLED by default and, while disabled,
-    # `_clear_at_least_pending` is never populated and no code path below the
-    # `required > 0` check is ever entered.
-
-    def _reset_clear_at_least_state(self) -> None:
-        """Drop predicate state -- called from clear() and set_messages().
-
-        The consecutive-skip streak is per-conversation: a resumed or cleared
-        session has a fresh message set, so a streak accumulated against the
-        old one says nothing about the new one and must not be inherited (it
-        would otherwise fail loud on the first refusal after a resume).
-        """
-        self._clear_at_least_skips = 0
-        self._clear_at_least_pending = None
-        self._clear_at_least_last_refused = False
-
-    def _clear_at_least_required(self, budget: int) -> int:
-        """Resolve `compact_clear_at_least` to an absolute token floor for
-        THIS call, or 0 meaning the predicate is disabled.
-
-          None / 0 / negative  -> 0 (disabled; today's behaviour exactly)
-          0 < value < 1        -> that FRACTION of `budget`, resolved per call
-          value >= 1           -> that many tokens, absolutely
-
-        The fraction form exists because a hardcoded token floor silently
-        means something completely different on a 200k window than on a 45k
-        one; a fraction tracks the real window.
-
-        The 1.0 boundary is deliberately read as ABSOLUTE, not as "100% of
-        budget": a floor of one entire budget can never be met by any
-        compaction, so reading it as a fraction would turn a plausible-looking
-        config into a guaranteed fail-loud. A malformed value disables the
-        predicate with a warning rather than raising -- consistent with how
-        this module handles every other unrecognized config value.
-        """
-        raw = self.compact_clear_at_least
-        if raw is None:
-            return 0
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"context-simple: compact_clear_at_least={raw!r} is not a number; "
-                f"disabling the worth-the-rebuild predicate for this session "
-                f"(compaction behaves exactly as if it were unset)."
-            )
-            return 0
-        if value <= 0:
-            return 0
-        if value < 1:
-            return int(budget * value) if budget > 0 else 0
-        return int(value)
-
-    def _snapshot_sticky_decisions(self) -> dict[str, set[int]]:
-        """Copy the three sticky decision sets so a refused escalation can be
-        rolled back exactly.
-
-        These sets are the ONLY durable state a progressive escalation writes
-        before it reaches `_finalize_compaction_with_stats` (which is where
-        the predicate runs). `_sticky_level`, `_last_compaction_stats` and the
-        `context:compaction` event are all written AFTER the predicate, so a
-        refusal leaves no trace of them at all -- which is what keeps the tail
-        compaction notice byte-stable across a skip.
-        """
-        return {
-            "removed": set(self._removed_seqs),
-            "truncated": set(self._truncated_seqs),
-            "stubbed": set(self._stubbed_seqs),
-        }
-
-    def _restore_sticky_decisions(self, snapshot: dict[str, set[int]]) -> None:
-        """Undo every sticky decision recorded since `snapshot` was taken."""
-        self._removed_seqs = set(snapshot["removed"])
-        self._truncated_seqs = set(snapshot["truncated"])
-        self._stubbed_seqs = set(snapshot["stubbed"])
-
-    async def _clear_at_least_verdict(
-        self,
-        final_messages: list[dict[str, Any]],
-        max_level_reached: int,
-    ) -> list[dict[str, Any]] | None:
-        """Judge a completed escalation against the worth-the-rebuild floor.
-
-        Returns None when the compaction is ACCEPTED (the caller finalizes
-        normally), or the baseline view to return INSTEAD when it is refused.
-        Raises RuntimeError when the consecutive-refusal cap is reached.
-
-        `freed` is the MARGINAL reclaim of this boundary: the count of the
-        view this call would have returned had it decided nothing new, minus
-        the count of the view the ladder actually produced. That is the right
-        comparand because what breaks the provider's cache is this view
-        differing from the last one -- not its distance from raw history.
-
-        Both sides are `_estimate_tokens` over a full message list, i.e. the
-        same units the ladder itself uses, recomputed exactly rather than read
-        off the ladder's running counter (which carries small deliberate
-        approximations, e.g. the flat ~18-token stub charge at level 8).
-        No second estimator is introduced.
-        """
-        pending = self._clear_at_least_pending
-        self._clear_at_least_pending = None
-        if pending is None:
-            # Predicate disabled, or this call made no new decision to judge.
-            return None
-
-        required: int = pending["required"]
-        baseline_tokens: int = pending["baseline_tokens"]
-        freed = baseline_tokens - self._estimate_tokens(final_messages)
-
-        if freed >= required:
-            self._clear_at_least_skips = 0
-            logger.debug(
-                f"context-simple: clear_at_least ALLOWED this boundary -- "
-                f"level {max_level_reached} frees {freed:,} tokens "
-                f"(floor {required:,})"
-            )
-            return None
-
-        # --- REFUSED: roll the escalation back completely ---
-        self._clear_at_least_last_refused = True
-        self._clear_at_least_skips += 1
-        self._restore_sticky_decisions(pending["sticky"])
-
-        baseline_view: list[dict[str, Any]] = pending["baseline_view"]
-        protected_tool_results_present = sum(
-            1 for m in baseline_view if m.get("role") == "tool"
-        )
-        protected_summary = (
-            f"protected_tool_results={self.protected_tool_results} "
-            f"(of {protected_tool_results_present} tool results in the view), "
-            f"protected_recent={self.protected_recent:.0%} "
-            f"of {len(baseline_view)} messages"
-        )
-
-        if self._clear_at_least_skips >= self.compact_max_consecutive_skips:
-            # FAIL LOUD, do not degrade. Continuing to skip would let usage
-            # climb until the provider hard-fails with an opaque
-            # context-overflow error; silently compacting anyway would let a
-            # run "pass" while the predicate had quietly stopped applying.
-            # Neither tells the operator which knob to move -- this does.
-            raise RuntimeError(
-                f"context-simple: compact_clear_at_least={self.compact_clear_at_least!r} "
-                f"could not be satisfied {self._clear_at_least_skips} consecutive times "
-                f"(cap: {self.compact_max_consecutive_skips}). The compaction ladder "
-                f"reached level {max_level_reached} and freed only {freed:,} tokens "
-                f"against a required floor of {required:,}. Protected set holding the "
-                f"floor: {protected_summary}. Baseline view is {baseline_tokens:,} "
-                f"tokens against a budget of {pending['budget']:,}. Lower "
-                f"compact_clear_at_least, lower protected_recent/protected_tool_results, "
-                f"or raise the budget -- compacting harder will not help."
-            )
-
-        logger.info(
-            f"context-simple: clear_at_least REFUSED this boundary -- level "
-            f"{max_level_reached} would free only {freed:,} tokens against a floor of "
-            f"{required:,}; not worth a full prompt-cache rebuild. Escalation rolled "
-            f"back; returning the unchanged view "
-            f"({self._clear_at_least_skips}/{self.compact_max_consecutive_skips} "
-            f"consecutive skips)."
-        )
-
-        if self._hooks is not None:
-            try:
-                await self._hooks.emit(
-                    "context:compaction-skipped",
-                    {
-                        "freed_tokens": freed,
-                        "required_tokens": required,
-                        "level_reached": max_level_reached,
-                        "consecutive_skips": self._clear_at_least_skips,
-                        "max_consecutive_skips": self.compact_max_consecutive_skips,
-                        "baseline_tokens": baseline_tokens,
-                        "budget": pending["budget"],
-                        "protected_recent": self.protected_recent,
-                        "protected_tool_results": self.protected_tool_results,
-                    },
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"Could not emit compaction-skipped event: {e}")
-
-        return baseline_view
-
     async def _compact_ephemeral(
         self, budget: int, source_messages: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
@@ -2077,13 +1755,6 @@ class SimpleContextManager:
             source_messages: Messages to compact. If None, uses self.messages.
                              This allows compacting factory-generated message lists.
         """
-        # The worth-the-rebuild predicate's comparand is strictly
-        # call-scoped. Clear it up front so a value left behind by an
-        # earlier call that raised can never be consumed by this one.
-        # A no-op while the predicate is disabled (it is never set).
-        self._clear_at_least_pending = None
-        self._clear_at_least_last_refused = False
-
         messages_to_compact = (
             source_messages if source_messages is not None else self.messages
         )
@@ -2239,38 +1910,6 @@ class SimpleContextManager:
                 budget,
                 target_tokens,
             )
-
-        # === WORTH-THE-REBUILD PREDICATE: capture the comparand ===
-        #
-        # This is the last point at which nothing new has been decided.
-        # `working_messages` here is exactly what this call would return if
-        # it escalated no further (the sticky baseline), and `current_tokens`
-        # is exactly its token count -- `_estimate_tokens` is a per-message
-        # sum, so system_tokens + non_system_tokens IS the count of the
-        # combined list, not an approximation of it.
-        #
-        # Placed AFTER both early returns on purpose: a call where sticky
-        # state alone was already sufficient decided nothing, so there is
-        # nothing to judge and it must never count as a skip. The
-        # summary-swap-only path is likewise not judged here -- a swap has
-        # already mutated self.messages irreversibly by this point, so it
-        # cannot be rolled back; that path is governed by the summary shrink
-        # guard in _swap_in_pending_summary instead.
-        #
-        # The verdict itself runs in _finalize_compaction_with_stats, the
-        # single terminal choke point every escalation level returns through
-        # -- and BEFORE that method records stats or emits
-        # `context:compaction`, so a refused escalation never emits an event
-        # claiming a compaction that did not happen.
-        clear_at_least_required = self._clear_at_least_required(budget)
-        if clear_at_least_required > 0:
-            self._clear_at_least_pending = {
-                "required": clear_at_least_required,
-                "baseline_view": system_messages + list(working_messages),
-                "baseline_tokens": current_tokens,
-                "sticky": self._snapshot_sticky_decisions(),
-                "budget": budget,
-            }
 
         logger.info(
             f"Compacting context (new escalation): {old_count} raw messages, {old_tokens:,} raw tokens "
@@ -2969,17 +2608,6 @@ class SimpleContextManager:
         # === CRITICAL: Prepend system messages to final result ===
         # System messages were extracted before compaction and must be restored
         final_messages = system_messages + working_messages
-
-        # === WORTH-THE-REBUILD PREDICATE: the verdict ===
-        # Runs before ANY durable effect of this method (sticky level,
-        # stats, `context:compaction` event), so a refusal leaves no trace
-        # that a compaction occurred. Returns None -- and costs nothing but
-        # a None check -- while the predicate is disabled.
-        refused_view = await self._clear_at_least_verdict(
-            final_messages, max_level_reached
-        )
-        if refused_view is not None:
-            return refused_view
 
         final_tokens = self._estimate_tokens(final_messages)
         system_count = len(system_messages)
@@ -4024,52 +3652,11 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             )
             return non_system_messages, False
 
-        absorbed_messages = [
-            msg for msg in non_system_messages if self._extract_seq(msg) in absorb_seqs
-        ]
+        for msg in non_system_messages:
+            if self._extract_seq(msg) in absorb_seqs:
+                self._record_removed(msg)
+
         summary_message = self._make_summary_message(pending["text"])
-
-        # === SHRINK GUARD (deepseek-harness compaction-basic, region.ts) ===
-        #
-        # Refuse a summary that is not SMALLER than the span it replaces. Such
-        # a swap is a pure loss twice over: it pays a full cold prompt-cache
-        # rebuild (any shrink or edit invalidates the cached prefix) AND ends
-        # up with a bigger request than it started with -- a silent cost
-        # regression with no upside whatsoever. Nothing in this module
-        # previously checked it; a terse span plus a verbose 5-section summary
-        # is entirely capable of growing.
-        #
-        # Both sides are measured as full message dicts through the same
-        # `_estimate_tokens` the rest of the ladder uses, so the comparison is
-        # apples-to-apples (metadata overhead counted on both sides).
-        #
-        # There is no config knob for this: there is no defensible reason to
-        # want a summary that makes the context bigger. On refusal the pending
-        # summary is DISCARDED and this pass falls back to progressive
-        # compaction -- exactly the graceful path a stale summary already
-        # takes, not a failure.
-        #
-        # `_make_summary_message` has already consumed a `_seq` for the message
-        # being discarded. That gap is deliberately left rather than rewound:
-        # sequence ids need only be unique and monotonic (see
-        # _apply_sticky_decisions / _hybrid_split), and rewinding a shared
-        # counter is a worse hazard than an unused number.
-        absorbed_tokens = self._estimate_tokens(absorbed_messages)
-        summary_tokens = self._estimate_tokens([summary_message])
-        if summary_tokens >= absorbed_tokens:
-            logger.warning(
-                f"context-simple: REFUSING summary swap -- the summary is "
-                f"{summary_tokens:,} tokens against the {absorbed_tokens:,} tokens "
-                f"of the {len(absorbed_messages)} messages it would replace, so it "
-                f"would GROW the context while still paying a full prompt-cache "
-                f"rebuild. Discarding it; falling back to progressive compaction "
-                f"for this pass."
-            )
-            return non_system_messages, False
-
-        for msg in absorbed_messages:
-            self._record_removed(msg)
-
         self.messages.append(summary_message)
         self._summary_absorbed_count += len(absorb_seqs)
 
