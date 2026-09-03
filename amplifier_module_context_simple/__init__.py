@@ -31,280 +31,16 @@ Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
     arrived this session (falling back to the estimator before then, or
     whenever hooks/events are unavailable). Default is `"estimate"`, which
     keeps behavior byte-identical to before this feature existed.
-  • Set `token_meter: "hybrid"` to ANCHOR on the provider's own reported
-    total from the last response and apply the heuristic ONLY to items
-    appended since that anchor (openai/codex's shape), carrying the
-    PROVENANCE of the resulting number -- `kind` in
-    {'usage','estimated','none'} -- on every count
-    (deepseek-harness's shape). Two guards ride with it:
-      - CONSERVATISM: if the provider total is below what the heuristic
-        priced for the same billed content, the anchor is rejected and
-        the count is honestly marked kind='estimated'.
-      - REFUSE TO GUESS: optional cache aggregates are reported only when
-        EVERY usage event this session carried them; otherwise undefined.
-    G-METER-PROVENANCE: in this mode no irreversible action (the
-    compaction trigger) is taken on a count that is not kind='usage'.
-    The single recorded escape -- no anchor has EVER arrived AND the
-    count has reached 100% of budget, where refusing would guarantee a
-    provider hard-failure -- fires, logs a warning, and is counted
-    separately as a provenance OVERRIDE rather than a clean fire.
-  • ALL THREE meters (estimate / actual / hybrid) are computed on every
-    request in EVERY mode and reported via `_last_token_meter_stats` and
-    the `context:token_meter` event, so their divergence is measurable
-    without changing which one drives the trigger.
   • Ported from amplifier-module-context-handoff's proven `_on_llm_response`
     meter. See README "Real-usage token meter" for the full rationale.
-
-Worth-The-Rebuild Predicate (opt-in, default off -- see config
-`compact_clear_at_least`):
-  • THE PROBLEM IT SOLVES: the compaction trigger fires on a usage
-    THRESHOLD (`compact_threshold`) and never asks how many tokens the
-    compaction will actually free. Every compaction shrinks the request,
-    and on the OpenAI path a shrink is a guaranteed full cold rebuild of
-    the prompt cache (the cache matches forward from a cached entry, never
-    backward into one -- so a strict prefix of a cached request MISSES).
-    A boundary that frees 3k tokens therefore pays a full rebuild of an
-    ~18k-token pinned head plus everything after it to buy very little.
-    We currently take that trade silently, every time.
-  • THE FIX, lifted from Anthropic's context-editing API: `clear_at_least`
-    -- "If the API can't clear at least the specified amount, the strategy
-    will not be applied. This helps determine if context clearing is worth
-    breaking your prompt cache." Vendor-agnostic; implemented here
-    client-side, no API support required.
-  • `compact_clear_at_least: None` (DEFAULT) or `0` disables the predicate
-    entirely: not evaluated, no new event, no behavioural difference. The
-    default path is byte-identical to before this feature existed.
-  • An int >= 1 is an absolute token floor. A float in (0, 1) is a
-    FRACTION OF THE BUDGET, resolved per call (so it tracks the model's
-    real window rather than a hardcoded number).
-  • WHAT "freed" MEANS HERE, precisely: this module's ladder has no
-    separable plan/apply split -- it mutates an ephemeral copy level by
-    level, threading a running `current_tokens` through every rung. So the
-    predicate does not estimate a projection; it compares the count the
-    ladder ALREADY computes for the view it produced against the count of
-    the view this call would have returned had it decided nothing new
-    (the sticky baseline). That delta is the MARGINAL reclaim of this
-    boundary -- which is the right number, because what breaks the cache
-    is this view differing from the last one, not the distance from raw
-    history. It is exact for the ladder's own units, not a second
-    estimator (see _clear_at_least_required / _finalize_compaction_with_stats).
-  • ON REFUSAL: the new escalation is rolled back (the sticky
-    truncate/remove/stub decisions recorded during it are discarded), the
-    baseline view is returned unchanged, and `context:compaction-skipped`
-    is emitted. No `context:compaction` event fires, because no compaction
-    happened. `_last_compaction_stats` is untouched, so the tail notice
-    stays byte-stable across a skip.
-  • ESCALATION PATH -- this predicate can starve compaction, so it must
-    not become a silent hang. After `compact_max_consecutive_skips`
-    (default 3) consecutive refusals it FAILS LOUD: raises RuntimeError
-    naming what the ladder freed, what was required, the level it reached,
-    and the protected-set size that is holding the floor. Degrading
-    quietly instead would let an eval pass while the predicate had
-    silently stopped applying, which is the one outcome its gate
-    (G-CAL-NOSKIPHANG) is written to catch. Unreachable while the
-    predicate is disabled.
-  • Calls where sticky state alone was already sufficient (no NEW decision
-    made) are not judged and never count as a skip -- nothing was refused.
-
-Summary Shrink Guard (active whenever `compaction_strategy == "summary"`):
-  • Refuses to swap in a rolling summary that is not SMALLER than the span
-    of messages it replaces. A summary that grows the context is a silent
-    cost regression -- it pays a cache rebuild to make the request bigger.
-  • Lifted from deepseek-harness's compaction-basic region check. The
-    pending summary is discarded (the same graceful path a stale summary
-    already takes) and this pass falls back to progressive compaction.
-  • No config knob: there is no defensible reason to want the opposite.
-
-Summary Compaction Strategy (opt-in, default off -- see config
-`compaction_strategy`):
-  • `compaction_strategy: "progressive"` (default) is this module's
-    existing truncate/remove ladder, completely unchanged -- byte-identical
-    to before this feature existed.
-  • `compaction_strategy: "summary"` absorbs the oldest non-protected span
-    into an LLM-generated rolling summary instead of truncating/removing
-    it. The IDEAS (structured 5-section prompt, early-async-trigger
-    design) are lifted from amplifier-bundle-context-managed's rolling
-    summarizer; ALL plumbing is rebuilt on this module's own sticky/_seq
-    machinery rather than that donor's index-based splice-and-swap -- see
-    the "Summary compaction strategy" section in
-    _select_summary_absorb_seqs/_snap_absorb_boundary/
-    _swap_in_pending_summary below for why, and README "Summary
-    compaction strategy" for the measured donor defects this avoids
-    (a dropped tool-call/result pair, and a `role: "system"` summary tier
-    that measurably busted the provider's system-prompt cache breakpoint).
-  • The summary message is role="user" (never "system"), wrapped in a
-    `<system-reminder source="context-summary">` envelope, and persists as
-    stable history (not ephemeral, unlike the tail compaction notice).
-  • MOTIVATED by retention (the progressive ladder is lossy; a summary
-    keeps a lossy-but-real account of the absorbed span). It is NOT a
-    cache-cost play: like the progressive ladder, this still shrinks what
-    the model sees each turn, which under a grow-only cache is still a
-    cold rebuild at the moment of absorption.
-  • MEASURED (T0/T1 eval, n=3 vs n=5, S5-CRAC -- see README "Summary
-    compaction strategy" for the full table): the mechanism is validated
-    (zero tool-pair errors; agent system prompt byte-stable, 1 hash/run;
-    append-only) but NO retention benefit is demonstrated -- 94.0 vs 94.4
-    on a SATURATED metric (both arms 40/40 constraints, 20/20
-    post-compaction, every run). Absence of evidence, not evidence of
-    parity-by-design; a discriminating scenario does not exist yet.
-  • KNOWN ISSUE, measured: +83% run cost and +84% compaction boundaries
-    vs the progressive baseline, via a boundary-refire loop (absorbing a
-    span shrinks the request below summary_trigger, so it refires
-    sooner). The summarizer itself is only 8-11% of run cost. Not fixed
-    here; see README for the candidate levers (cooldown / absolute floor
-    / trigger hysteresis). OPT-IN, EXPERIMENTAL -- do not enable by
-    default.
-
-Cache-safe forking of the summarization call (opt-in, default off -- see
-config `summary_call_mode`; only consulted when compaction_strategy ==
-"summary"):
-  • THE PROBLEM. The summarizer's request is, today, a STANDALONE two
-    message call: its own ~955-char system prompt plus a freshly
-    formatted plain-text rendering of the span being absorbed. It shares
-    not one byte of prefix with the main line, so every token of the span
-    is billed as FRESH input -- even though the provider is already
-    holding that exact span in a warm cache for the main conversation.
-  • THE SHAPE THAT FIXES IT. `summary_call_mode: "fork"` re-issues the
-    same ask as a PURE APPEND onto the prefix the main line already sent:
-    [ ...the exact messages of the last request... ] + [ one user message
-    carrying the summarization instruction ]. Pure append is the one
-    mutation measured as a cache HIT under the grow-only rule (probe P4:
-    identical-repeat 9,789 HIT, pure-append 9,789 HIT, strict truncation
-    0 MISS, middle-drop 0 MISS). The span itself is NOT re-sent -- it is
-    already in the appended-to prefix; re-sending it would cost exactly
-    what standalone costs today PLUS the prefix, i.e. a regression.
-  • THE PROMPT MOVES INTO THE USER MESSAGE. The standalone call puts the
-    summarization prompt in a `role: "system"` message. A fork MUST NOT:
-    providers hoist every system-role message into a single top-level
-    system block, so a per-summarization system message would rewrite the
-    cached system prefix -- the exact failure mode already documented for
-    the summary tier and the compaction notice. In fork mode the prompt
-    rides the appended `role: "user"` message instead.
-  • THE MAIN LINE IS NEVER TOUCHED. The forked request is built from a
-    read-only snapshot. No `_seq` is consumed, nothing is appended to
-    `self.messages`, no sticky/removal state moves, and `_last_sent_estimate`
-    (the hybrid meter's conservatism comparand) is NOT rewritten -- which
-    is why the fork calls `_strip_internal_metadata` directly rather than
-    `_finalize_view`. The summary that eventually lands is produced by the
-    unchanged `_swap_in_pending_summary` path.
-  • A SILENTLY UNFORKED FORK IS THE FAILURE MODE THAT MATTERS. If the
-    forked request does not reproduce the parent's prefix byte-for-byte
-    it wins nothing AND pays for the whole conversation -- strictly worse
-    than standalone. So the fork is attempted ONLY when every alignment
-    precondition holds, and any miss falls back to the standalone call
-    LOUDLY (a warning naming the precondition, a counter, and the mode
-    actually used reported on `context:post_summarize` and in
-    `last_summary_call_stats`). It never silently half-forks.
-  • THE PRECONDITION YOU MUST WIRE. Tool specs are part of the cached
-    prefix (they are serialized ahead of the system block), and this
-    module is handed messages, never tools. So a caller that wants fork
-    mode MUST hand over the request it actually sent, via the optional
-    public `note_request_sent(messages=..., tools=..., model=...)` seam.
-    Without it the fork refuses (warning, once) and standalone is used.
-    Supplying `messages` too gives exact parity with what went on the
-    wire -- including any hook-injected tail the orchestrator appended
-    after this module returned its view, which is what an implicit,
-    match-forward-only cache (OpenAI) requires. With only `tools`, the
-    fork appends to this module's own last returned view, which is what
-    an explicit-breakpoint cache (Anthropic) needs, since the provider
-    places its breakpoint at the last STABLE message -- i.e. exactly
-    where this module's view ends.
-  • UNMEASURED. The gates (G-FORK-PREFIX / G-FORK-CACHED / G-FORK-COST /
-    G-FORK-NOBOUNDARY) are a separately funded eval; nothing in this
-    module claims a measured cache or cost win yet. What IS proven here
-    is structural: default byte-identity, main-line non-mutation, and
-    pure-append shape.
-
-Tool-result budget and spill (opt-in, default off -- see config
-`tool_result_budget_tokens` / `tool_result_shape` /
-`tool_result_budget_by_tool` / `tool_result_exempt_tools` /
-`tool_result_spill_dir`):
-  • The truncation rung of the progressive ladder historically kept
-    `content[:250]` -- 250 characters, HEAD ONLY, ~62 estimator tokens.
-    The only shipped reference implementation available to compare
-    against (codex) keeps a ~10,000-token budget, HEAD + TAIL, with an
-    explicit truncation marker. We were ~160x below it, and keeping the
-    head is the part that hurts: for `pytest`, `grep`, `git log` and
-    build output the ANSWER IS IN THE TAIL.
-  • MEASURED (step 0 of this change, two existing capture roots, 17
-    sessions, 2,479 tool results, char-denominated, confidence:
-    measured): tool-result content is 46.4% / 47.3% of all transcript
-    characters; individual results run p50 412 / p90 7,904 / p99 ~31.7k
-    / max 52.3k chars; 63-65% of every tool result exceeds today's
-    250-char budget, and today's budget discards ~91% of all
-    tool-result content it touches.
-  • `tool_result_budget_tokens: int` replaces the char budget with a
-    TOKEN-denominated one (chars/token constants are tokenizer-version
-    specific and drift; a char budget silently changes meaning across a
-    model version). Default `None` = the pre-existing `truncate_chars`
-    path, byte-identical.
-  • `tool_result_shape: "head" | "head_tail"` -- `"head_tail"` splits
-    the budget in half and keeps both ends with an explicit
-    `...[N chars omitted]...` marker between them, so the model can never
-    reason from a truncated result without knowing it was truncated.
-    Default `"head"`.
-  • `tool_result_budget_by_tool: dict[str, int]` -- per-tool token
-    budgets, resolved by tool name; takes precedence over the global
-    budget. Default `{}`.
-  • `tool_result_exempt_tools: list[str]` -- these tool results are
-    NEVER truncated (the value-order names loaded skills explicitly).
-    Default `[]`.
-  • `tool_result_spill_dir: path` -- when set, the FULL original result
-    is written to a content-addressed file under this directory and the
-    replacement text points the model at it, so the truncated middle is
-    recoverable through the ordinary file tools with no new retrieval
-    tool. Default `None` (nothing is ever written).
-  • DETERMINISM, load-bearing: the replacement text (including the spill
-    pointer) is a pure function of the message's content plus config. It
-    NEVER depends on whether the spill write succeeded, because
-    `_apply_sticky_decisions` re-derives it on every single request and a
-    pointer that changed after a failed-then-successful write would
-    mutate an already-cached prefix -- which, under a grow-only prompt
-    cache, is a full cold rebuild. A failed write yields a pointer to a
-    missing file (visible, recoverable) rather than a silent byte change.
-
-Last-User Replay After a Compaction Boundary (opt-in, default off -- see
-config `replay_last_user_on_compaction`):
-  • MOTIVATION (design lens): the highest-value retained tier is the
-    USER'S OWN VERBATIMS. A compaction boundary can leave the most recent
-    user instruction sitting far from the attention-strongest tail
-    position, behind a wall of tool results the ladder chose to keep.
-  • When enabled AND a compaction boundary actually occurs, this APPENDS
-    (never moves, never removes) a copy of the most recent real user
-    message as the last item before the dynamic tail (the compaction
-    notice), wrapped in a `<system-reminder source="context-replay">`
-    envelope so it reads as a reminder of a standing instruction and is
-    never mistaken for a NEW request.
-  • APPEND-ONLY BY CONSTRUCTION -- the measured cache-HIT shape. Nothing
-    before the append point moves, no `_seq` is consumed, no sticky
-    decision is touched, and `self.messages` is never modified. The
-    replay is ephemeral (metadata.ephemeral=True), so it joins the
-    compaction notice in the Anthropic provider's trailing-ephemeral
-    exclusion walk and does not displace the cache breakpoint.
-  • Tool-pair integrity untouched: it uses the SAME tail guard as the
-    compaction notice and skips entirely when the view ends on an
-    assistant message with unanswered tool_calls.
-  • FIRES ONCE PER BOUNDARY, not once per request: the boundary identity
-    is (sticky progressive level, summary-absorbed count), so a request
-    that merely re-applies an existing sticky decision does not re-emit.
-  • NOT MEASURED. This is a mechanism, shipped default-off, with NO
-    quality evidence behind it: the retention scenario that could
-    discriminate (S7) does not exist yet, and S5-CRAC is saturated
-    (40/40 constraints, 20/20 post-compaction in every arm of every
-    probe 1-6). Do not enable by default, and do not claim a quality
-    benefit, until a discriminating eval has run.
 """
 
 # Amplifier module metadata
 __amplifier_module_type__ = "context"
 
-import asyncio
-import hashlib
-import json
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import Any
 
 from amplifier_core import ModuleCoordinator
@@ -318,228 +54,7 @@ logger = logging.getLogger(__name__)
 # SimpleContextManager._measure_working_tokens.
 TOKEN_METER_ESTIMATE = "estimate"
 TOKEN_METER_ACTUAL = "actual"
-TOKEN_METER_HYBRID = "hybrid"
-_VALID_TOKEN_METERS = (
-    TOKEN_METER_ESTIMATE,
-    TOKEN_METER_ACTUAL,
-    TOKEN_METER_HYBRID,
-)
-
-# Provenance of a token count (`kind`), reported on EVERY count this module
-# produces -- lifted from deepseek-harness's `baseline.kind`. "usage" means
-# the number is anchored on the provider's own reported usage;
-# "estimated" means it came from the len(str)//4 heuristic (in whole or in
-# part, or the anchor was rejected by the conservatism guard); "none" means
-# there was nothing to price. G-METER-PROVENANCE: in `hybrid` mode, no
-# irreversible action may be taken on a count whose kind is not "usage".
-METER_KIND_USAGE = "usage"
-METER_KIND_ESTIMATED = "estimated"
-METER_KIND_NONE = "none"
-
-# compaction_strategy config values. "progressive" (default) preserves the
-# existing truncate/remove ladder exactly (byte-identical -- see module
-# docstring "Summary compaction strategy"). "summary" opts in to absorbing
-# the oldest non-protected span into an LLM-generated rolling summary
-# instead of truncating/removing it outright.
-COMPACTION_STRATEGY_PROGRESSIVE = "progressive"
-COMPACTION_STRATEGY_SUMMARY = "summary"
-_VALID_COMPACTION_STRATEGIES = (
-    COMPACTION_STRATEGY_PROGRESSIVE,
-    COMPACTION_STRATEGY_SUMMARY,
-)
-
-# summary_call_mode config values -- HOW the summarizer's own LLM call is
-# shaped when compaction_strategy == "summary". "standalone" (default) is
-# byte-identical to the pre-existing behavior: its own tiny two-message
-# request (system prompt + formatted span), sharing nothing with the main
-# line. "fork" issues the SAME summarization ask as a PURE APPEND onto the
-# prefix the main line already sent, so the provider's prompt cache can be
-# read instead of paying fresh input tokens for the span. See module
-# docstring "Cache-safe forking of the summarization call".
-#
-# "inline" is accepted as an alias for "standalone": the lane brief that
-# commissioned this work named the default mode "inline" while the work
-# item named it "standalone". Both mean "today's behavior, unchanged".
-# Where a forked summarizer call's prefix came from, reported verbatim on
-# `last_summary_call_stats["prefix_source"]`. This distinction is not
-# cosmetic: only ONE of these two sources carries positive evidence that
-# the array was ever on the wire.
-#
-#   "wire_record"  -- the caller's own note_request_sent(messages=...)
-#                     record. The caller told us it sent exactly this.
-#   "module_view"  -- this module's last RETURNED view. Whether it was
-#                     actually sent is unknown to this module: an
-#                     orchestrator may append a tail to it, or discard it
-#                     entirely and re-fetch a fresh view before sending
-#                     (amplifier's loop-streaming does exactly that, 1-3
-#                     times per sent request). A superseded view was never
-#                     on the wire, so forking onto one is a guaranteed
-#                     cache miss wearing a correct-looking API call.
-FORK_PREFIX_SOURCE_WIRE = "wire_record"
-FORK_PREFIX_SOURCE_VIEW = "module_view"
-
-SUMMARY_CALL_MODE_STANDALONE = "standalone"
-SUMMARY_CALL_MODE_FORK = "fork"
-_VALID_SUMMARY_CALL_MODES = (SUMMARY_CALL_MODE_STANDALONE, SUMMARY_CALL_MODE_FORK)
-_SUMMARY_CALL_MODE_ALIASES = {"inline": SUMMARY_CALL_MODE_STANDALONE}
-
-# How much of the span's final message is quoted back in the fork
-# instruction as the "summarize up to HERE" boundary marker. Long enough to
-# be unambiguous in a real transcript, short enough that it is never a
-# material share of the appended (uncached) tail.
-_FORK_BOUNDARY_EXCERPT_CHARS = 300
-
-# tool_result_shape config values. "head" (default) keeps the leading slice
-# only -- the pre-existing behavior. "head_tail" splits the budget in half
-# and keeps both ends with an explicit omission marker between them. See
-# module docstring "Tool-result budget and spill".
-TOOL_RESULT_SHAPE_HEAD = "head"
-TOOL_RESULT_SHAPE_HEAD_TAIL = "head_tail"
-_VALID_TOOL_RESULT_SHAPES = (TOOL_RESULT_SHAPE_HEAD, TOOL_RESULT_SHAPE_HEAD_TAIL)
-
-# Chars-per-token constant used to convert a token-denominated tool-result
-# budget into the char slice actually taken. Deliberately the SAME constant
-# this module's own estimator uses (_estimate_tokens: len(str(msg)) // 4), so
-# a budget expressed in tokens and the token accounting the compaction ladder
-# runs on cannot drift apart. This is an estimator, not a tokenizer: see
-# README "Tool-result budget" for why the budget is nevertheless expressed in
-# tokens rather than chars.
-_TOOL_RESULT_CHARS_PER_TOKEN = 4
-
-# Worth-the-rebuild predicate defaults (see module docstring). The predicate
-# is DISABLED by default -- `None` (and `0`) mean "today's behaviour exactly".
-# The skip cap exists solely so a predicate that can never be satisfied fails
-# loud instead of looping; it is unreachable while the predicate is disabled.
-DEFAULT_CLEAR_AT_LEAST = None
-DEFAULT_MAX_CONSECUTIVE_SKIPS = 3
-
-# The summary message's envelope source tag and metadata type marker. The
-# envelope is what makes foundation's is_real_user_message() classify this
-# role="user" message as NOT a real user turn (see module docstring); the
-# metadata type marker is how this module recognizes its own past summary
-# messages (so they are never re-absorbed into a later summary).
-_SUMMARY_ENVELOPE_SOURCE = "context-summary"
-_SUMMARY_METADATA_TYPE = "context_summary"
-
-# The last-user-replay envelope's source tag and metadata source marker
-# (opt-in `replay_last_user_on_compaction`; see module docstring
-# "Last-User Replay After a Compaction Boundary").
-_REPLAY_ENVELOPE_SOURCE = "context-replay"
-
-# Any `<system-reminder ...>` opener, attributed or bare. See
-# _is_real_user_message for why the bare-tag check is not sufficient.
-_REMINDER_ENVELOPE_PREFIX = "<system-reminder"
-
-
-def _is_real_user_message(entry: dict[str, Any]) -> bool:
-    """Whether `entry` is a genuine human-authored user turn.
-
-    Mirrors `amplifier_foundation.session.is_real_user_message` (role is
-    "user", no `tool_call_id`, content not a reminder envelope), plus one
-    hardening clause.
-
-    VENDORED, NOT IMPORTED, on purpose: this module declares no runtime
-    dependencies (pyproject `dependencies = []`). A soft import of
-    foundation would make this predicate's behavior depend on whether an
-    undeclared package happens to be installed in the host environment --
-    two silently different code paths for the same config. Instead the
-    logic lives here and `tests/test_replay_last_user.py` asserts parity
-    against the real foundation function whenever foundation IS
-    importable, so drift is caught by a failing test rather than assumed
-    away.
-
-    HARDENING, and it is load-bearing: foundation 1.0.0
-    (session/messages.py:95, 103) rejects only content beginning with the
-    BARE `<system-reminder>` tag. An ATTRIBUTED envelope -- including this
-    module's own `<system-reminder source="context-summary">` summary
-    message and the `context-replay` message this feature emits -- does
-    NOT match that check and is classified by foundation as a real user
-    turn. (The comment at `_SUMMARY_ENVELOPE_SOURCE` and the docstring of
-    `_make_summary_message` both assert the opposite; they are wrong on
-    this point as of foundation 1.0.0.) Replaying a synthetic envelope as
-    if it were the user's own words -- or worse, replaying a replay -- is
-    precisely the failure this feature must never produce, so this
-    predicate rejects any content opening with `<system-reminder`
-    regardless of attributes. That makes it strictly STRONGER than
-    foundation's: every message foundation rejects, this rejects too.
-    """
-    if entry.get("role") != "user":
-        return False
-
-    if "tool_call_id" in entry:
-        return False
-
-    content = entry.get("content", "")
-
-    if isinstance(content, str):
-        if content.strip().startswith(_REMINDER_ENVELOPE_PREFIX):
-            return False
-    elif isinstance(content, list):
-        for block in content:
-            if isinstance(block, dict):
-                text = block.get("text", "")
-                if isinstance(text, str) and text.strip().startswith(
-                    _REMINDER_ENVELOPE_PREFIX
-                ):
-                    return False
-
-    return True
-
-# Default 5-section summarization prompt, lifted near-verbatim from
-# amplifier-bundle-context-managed's modules/context-managed/__init__.py:71-97
-# (the donor's structured summarization prompt -- see README "Summary
-# compaction strategy" for full provenance). The donor's two
-# `read_transcript` tool references are deliberately dropped: this module
-# ships no transcript tool, and pointing an agent at a tool that does not
-# exist would be actively misleading. File-overridable via
-# `summarization_prompt_path`, mirroring the donor's own
-# `summarization_prompt_path` config knob.
-DEFAULT_SUMMARIZATION_PROMPT = """\
-Produce a compact summary of the conversation so far. Use the following sections:
-
-## User Requests & Decisions
-List the key requests made by the user and any important decisions reached.
-
-## Files Examined or Modified
-List files that were read, analyzed, or modified during the conversation.
-
-## Errors Encountered & Resolutions
-Describe any errors, failures, or unexpected behavior encountered, and how they were resolved.
-
-## Current Task State
-Describe the current state of work -- what has been completed, what is in progress, and what remains.
-
-## Key Technical Details
-Note any important technical constraints, patterns, configurations, or implementation details
-discovered during the conversation.
-
-## Guidelines
-- Be factual and concise. Do not speculate beyond what the conversation contains.
-- Preserve numeric values, file paths, error messages, and command outputs exactly.
-- Each section may be omitted if there is nothing to report for it.
-"""
-
-
-def _normalize_summary_call_mode(value: Any) -> str:
-    """Canonicalize a `summary_call_mode` config value.
-
-    Accepts the two real modes plus the documented "inline" alias for
-    "standalone" (the commissioning lane brief and the work item named the
-    same default differently -- see _SUMMARY_CALL_MODE_ALIASES). An
-    unusable value logs a warning and falls back to "standalone", matching
-    how every other enum in this module is validated: a context manager
-    that refuses to start is worse than one that runs at the old default
-    and says so.
-    """
-    mode = _SUMMARY_CALL_MODE_ALIASES.get(value, value)
-    if mode not in _VALID_SUMMARY_CALL_MODES:
-        logger.warning(
-            f"context-simple: unknown summary_call_mode {value!r} (expected "
-            f"one of {_VALID_SUMMARY_CALL_MODES!r}); falling back to "
-            f"{SUMMARY_CALL_MODE_STANDALONE!r}"
-        )
-        return SUMMARY_CALL_MODE_STANDALONE
-    return mode
+_VALID_TOKEN_METERS = (TOKEN_METER_ESTIMATE, TOKEN_METER_ACTUAL)
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -561,92 +76,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - compaction_notice_verbosity: Notice detail level - "minimal", "normal", "verbose" (default: "normal")
             - compaction_notice_min_level: Only show notice if compaction level >= this (default: 1)
             - output_reserve_fraction: Fraction of max_output_tokens to reserve for responses (default: 0.5)
-            - token_meter: "estimate" (default), "actual" or "hybrid".
-              "estimate" is byte-identical to pre-existing behavior.
-              "hybrid" anchors on the provider's own reported total and
-              estimates only the un-billed tail, carrying provenance
-              (`kind`) that gates irreversible actions -- see module
-              docstring. "actual" drives the
+            - token_meter: "estimate" (default) or "actual". "estimate" is
+              byte-identical to pre-existing behavior. "actual" drives the
               compaction trigger from real provider usage (input_tokens +
               cache_write_tokens, observed via the `llm:response` hook)
               once at least one response has been observed this session,
               falling back to the estimator before then. An unrecognized
               value falls back to "estimate" with a logged warning rather
               than crashing mount(). See module docstring.
-            - compact_clear_at_least: Worth-the-rebuild predicate in front of
-              compaction (default: None = disabled, today's behaviour
-              exactly). An int >= 1 is an absolute token floor; a float in
-              (0, 1) is a fraction of the budget. A compaction that would
-              free less than this is REFUSED and rolled back rather than
-              paying a full prompt-cache rebuild for a small reclaim. See
-              module docstring "Worth-The-Rebuild Predicate".
-            - compact_max_consecutive_skips: How many consecutive predicate
-              refusals are tolerated before failing loud with a RuntimeError
-              (default: 3). Only consulted when compact_clear_at_least is
-              enabled; unreachable otherwise.
-            - compaction_strategy: "progressive" (default) or "summary". See
-              module docstring "Summary compaction strategy". An
-              unrecognized value falls back to "progressive" with a logged
-              warning rather than crashing mount().
-            - summary_trigger: Usage fraction (0.0-1.0) at which the summary
-              strategy starts an async background summarization call, well
-              ahead of compact_threshold so it has time to finish before
-              tokens must actually be shed (default: 0.60). Only consulted
-              when compaction_strategy == "summary". KNOWN ISSUE: because
-              absorbing a span shrinks the request back below this
-              fraction, an aggressive (low) trigger refires sooner and
-              measurably multiplies compaction boundaries -- +84%
-              boundaries / +83% run cost in the T0/T1 eval. Raising this
-              is the cheapest lever; see README "Known issue: boundary
-              refire".
-            - summary_call_mode: "standalone" (default, byte-identical to the
-              pre-existing summarizer call) or "fork" -- issue the
-              summarization ask as a pure append onto the prefix the main
-              line already sent, so it can be cache-read instead of paying
-              fresh input tokens for the span. "inline" is accepted as an
-              alias for "standalone". Only consulted when
-              compaction_strategy == "summary". Fork mode additionally
-              requires the caller to have called note_request_sent(); see
-              module docstring "Cache-safe forking of the summarization
-              call".
-            - summarization_model: Model identifier passed to the summarizer's
-              ChatRequest (default: None, i.e. provider default). Setting it
-              CONFLICTS with summary_call_mode "fork" (a summarizer routed to
-              a different model cannot read the main line's cache) and makes
-              the fork fall back to standalone, loudly.
-            - summarization_prompt_path: Path to a file overriding
-              DEFAULT_SUMMARIZATION_PROMPT (default: None).
-            - summarization_timeout_s: Seconds to wait for the summarizer's
-              provider.complete() call before treating it as a failure and
-              falling back to progressive compaction for that pass
-              (default: 30.0).
-            - tool_result_budget_tokens: Token budget kept when truncating a
-              tool result (default: None = use the legacy `truncate_chars`
-              char budget, byte-identical to before this feature existed).
-              Setting it switches that tool result to the token-denominated
-              path. See module docstring "Tool-result budget and spill".
-            - tool_result_shape: "head" (default) or "head_tail". "head_tail"
-              splits the budget in half and keeps both ends with an explicit
-              `...[N chars omitted]...` marker. An unrecognized value falls
-              back to "head" with a logged warning rather than crashing
-              mount().
-            - tool_result_budget_by_tool: Per-tool token budgets keyed by tool
-              name (default: {}). Takes precedence over
-              tool_result_budget_tokens for a matching tool. Entries whose
-              value is not a positive int are dropped with a logged warning.
-            - tool_result_exempt_tools: Tool names whose results are NEVER
-              truncated (default: []). Recommended for skill-type outputs.
-            - tool_result_spill_dir: Directory to write the FULL original tool
-              result into when it is truncated, so the truncated middle stays
-              recoverable via the ordinary file tools (default: None = nothing
-              is ever written and no pointer appears in any message).
-            - replay_last_user_on_compaction: bool (default: False). When
-              True, append a reminder-wrapped copy of the most recent real
-              user message at the tail once per compaction boundary. See
-              module docstring "Last-User Replay After a Compaction
-              Boundary". False is byte-identical to pre-existing behavior.
-              NOT MEASURED -- shipped default-off pending a discriminating
-              retention eval (S7).
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -663,21 +100,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         token_meter = TOKEN_METER_ESTIMATE
 
-    compaction_strategy = config.get(
-        "compaction_strategy", COMPACTION_STRATEGY_PROGRESSIVE
-    )
-    if compaction_strategy not in _VALID_COMPACTION_STRATEGIES:
-        logger.warning(
-            f"context-simple: unknown compaction_strategy {compaction_strategy!r} "
-            f"(expected one of {_VALID_COMPACTION_STRATEGIES!r}); falling back to "
-            f"{COMPACTION_STRATEGY_PROGRESSIVE!r}"
-        )
-        compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
-
-    summary_call_mode = _normalize_summary_call_mode(
-        config.get("summary_call_mode", SUMMARY_CALL_MODE_STANDALONE)
-    )
-
     context = SimpleContextManager(
         max_tokens=config.get("max_tokens", 200_000),
         compact_threshold=config.get("compact_threshold", 0.92),
@@ -693,26 +115,6 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         compaction_notice_min_level=config.get("compaction_notice_min_level", 1),
         output_reserve_fraction=config.get("output_reserve_fraction", 0.5),
         token_meter=token_meter,
-        compact_clear_at_least=config.get(
-            "compact_clear_at_least", DEFAULT_CLEAR_AT_LEAST
-        ),
-        compact_max_consecutive_skips=config.get(
-            "compact_max_consecutive_skips", DEFAULT_MAX_CONSECUTIVE_SKIPS
-        ),
-        compaction_strategy=compaction_strategy,
-        summary_trigger=config.get("summary_trigger", 0.60),
-        summary_call_mode=summary_call_mode,
-        summarization_model=config.get("summarization_model"),
-        summarization_prompt_path=config.get("summarization_prompt_path"),
-        summarization_timeout_s=config.get("summarization_timeout_s", 30.0),
-        tool_result_budget_tokens=config.get("tool_result_budget_tokens"),
-        tool_result_shape=config.get("tool_result_shape", TOOL_RESULT_SHAPE_HEAD),
-        tool_result_budget_by_tool=config.get("tool_result_budget_by_tool"),
-        tool_result_exempt_tools=config.get("tool_result_exempt_tools"),
-        tool_result_spill_dir=config.get("tool_result_spill_dir"),
-        replay_last_user_on_compaction=bool(
-            config.get("replay_last_user_on_compaction", False)
-        ),
         hooks=getattr(coordinator, "hooks", None),
     )
 
@@ -789,20 +191,6 @@ class SimpleContextManager:
         compaction_notice_min_level: int = 1,
         output_reserve_fraction: float = 0.5,
         token_meter: str = TOKEN_METER_ESTIMATE,
-        compact_clear_at_least: int | float | None = DEFAULT_CLEAR_AT_LEAST,
-        compact_max_consecutive_skips: int = DEFAULT_MAX_CONSECUTIVE_SKIPS,
-        compaction_strategy: str = COMPACTION_STRATEGY_PROGRESSIVE,
-        summary_trigger: float = 0.60,
-        summary_call_mode: str = SUMMARY_CALL_MODE_STANDALONE,
-        summarization_model: str | None = None,
-        summarization_prompt_path: str | None = None,
-        summarization_timeout_s: float = 30.0,
-        tool_result_budget_tokens: int | None = None,
-        tool_result_shape: str = TOOL_RESULT_SHAPE_HEAD,
-        tool_result_budget_by_tool: dict[str, int] | None = None,
-        tool_result_exempt_tools: list[str] | None = None,
-        tool_result_spill_dir: str | None = None,
-        replay_last_user_on_compaction: bool = False,
         hooks: Any = None,
     ):
         """
@@ -825,76 +213,11 @@ class SimpleContextManager:
                 responses (0.0-1.0, default: 0.5). Lower values give more context
                 budget at the cost of less headroom for long responses.
             token_meter: "estimate" (default, byte-identical to pre-existing
-                behavior), "hybrid" (provider-anchored total + heuristic
-                for the un-billed tail, with provenance gating
-                irreversible actions), or "actual" (compaction trigger uses real provider
+                behavior) or "actual" (compaction trigger uses real provider
                 usage from the `llm:response` hook once observed this
                 session -- see module docstring "Real-Usage Token Meter").
                 An unrecognized value falls back to "estimate" with a
                 logged warning rather than raising.
-            compact_clear_at_least: Worth-the-rebuild predicate in front of
-                compaction. None (default) or 0 disables it entirely --
-                byte-identical to before this feature existed. An int >= 1
-                is an absolute token floor; a float in (0, 1) is a fraction
-                of the per-call budget. A compaction whose MARGINAL reclaim
-                is below the floor is refused and rolled back rather than
-                paying a full prompt-cache rebuild for a small reclaim. See
-                module docstring "Worth-The-Rebuild Predicate".
-            compact_max_consecutive_skips: Consecutive predicate refusals
-                tolerated before failing loud with RuntimeError (default 3).
-                Only consulted when compact_clear_at_least is enabled. A
-                value <= 0 is treated as 1 (refuse once, then fail) rather
-                than as "never fail", because "never fail" is the silent
-                hang this cap exists to prevent.
-            compaction_strategy: "progressive" (default, byte-identical to
-                pre-existing behavior) or "summary" -- see module docstring
-                "Summary compaction strategy". An unrecognized value falls
-                back to "progressive" with a logged warning rather than
-                raising.
-            summary_trigger: Usage fraction (0.0-1.0) at which the summary
-                strategy kicks off an async background summarization call.
-                Only consulted when compaction_strategy == "summary".
-                KNOWN ISSUE (measured): a low trigger refires soon after
-                each absorption shrinks the request, multiplying
-                compaction boundaries (+84%) and run cost (+83%) -- see
-                module docstring and README "Known issue: boundary
-                refire".
-            summary_call_mode: "standalone" (default; the pre-existing
-                two-message summarizer call, byte-identical) or "fork" (the
-                same ask appended onto the main line's already-sent prefix
-                so the provider can cache-read it). "inline" is an accepted
-                alias for "standalone". Only consulted when
-                compaction_strategy == "summary". See module docstring
-                "Cache-safe forking of the summarization call" -- in
-                particular, fork mode needs note_request_sent() to have been
-                called, and falls back to standalone (loudly) when it has
-                not.
-            summarization_model: Model identifier for the summarizer's own
-                ChatRequest. None uses the provider's default model.
-                Incompatible with summary_call_mode "fork" -- a summarizer
-                pointed at another model reads no cache the main line wrote,
-                so the fork falls back to standalone rather than pretending.
-            summarization_prompt_path: Path to a file overriding
-                DEFAULT_SUMMARIZATION_PROMPT. None uses the built-in prompt.
-            summarization_timeout_s: Seconds to wait for the summarizer's
-                provider.complete() call before treating it as a failure.
-            tool_result_budget_tokens: Token budget kept when truncating a
-                tool result. None (default) keeps the pre-existing
-                `truncate_chars` char budget, byte-identical.
-            tool_result_shape: "head" (default, pre-existing behavior) or
-                "head_tail". An unrecognized value falls back to "head" with
-                a logged warning rather than raising.
-            tool_result_budget_by_tool: Per-tool token budgets keyed by tool
-                name; takes precedence over tool_result_budget_tokens.
-            tool_result_exempt_tools: Tool names whose results are never
-                truncated.
-            tool_result_spill_dir: Directory the full original result is
-                written to when truncated. None (default) writes nothing.
-            replay_last_user_on_compaction: When True, append a
-                reminder-wrapped copy of the most recent real user message
-                at the tail once per compaction boundary (default: False,
-                byte-identical to pre-existing behavior). See module
-                docstring "Last-User Replay After a Compaction Boundary".
             hooks: Optional hooks instance for emitting observability events
                 and (always, when present) recording real usage for the
                 token meter via `llm:response` -- see `_on_llm_response`.
@@ -919,137 +242,8 @@ class SimpleContextManager:
             )
             token_meter = TOKEN_METER_ESTIMATE
         self.token_meter = token_meter
-        self.compact_clear_at_least = compact_clear_at_least
-        # A cap of 0 or less would mean "tolerate unlimited refusals", i.e.
-        # exactly the silent starvation this cap exists to prevent. Clamp to
-        # 1 (refuse once, then fail loud) rather than honouring a value that
-        # disables the only safety net the predicate has.
-        self.compact_max_consecutive_skips = max(1, int(compact_max_consecutive_skips))
-        if compaction_strategy not in _VALID_COMPACTION_STRATEGIES:
-            logger.warning(
-                f"context-simple: unknown compaction_strategy {compaction_strategy!r} "
-                f"(expected one of {_VALID_COMPACTION_STRATEGIES!r}); falling back to "
-                f"{COMPACTION_STRATEGY_PROGRESSIVE!r}"
-            )
-            compaction_strategy = COMPACTION_STRATEGY_PROGRESSIVE
-        self.compaction_strategy = compaction_strategy
-        self.summary_call_mode = _normalize_summary_call_mode(summary_call_mode)
-        self.summary_trigger = summary_trigger
-        self.summarization_model = summarization_model
-        self.summarization_prompt_path = summarization_prompt_path
-        self.summarization_timeout_s = summarization_timeout_s
-        # --- Tool-result budget / shape / spill (all default no-op) ---
-        # Every one of these is validated the same way the other enums in
-        # this module are: an unusable value logs a warning and falls back to
-        # the pre-existing behavior rather than crashing mount(). A context
-        # manager that refuses to start is worse than one that runs at the
-        # old default and says so.
-        self.tool_result_budget_tokens = self._validate_budget_tokens(
-            tool_result_budget_tokens
-        )
-        if tool_result_shape not in _VALID_TOOL_RESULT_SHAPES:
-            logger.warning(
-                f"context-simple: unknown tool_result_shape {tool_result_shape!r} "
-                f"(expected one of {_VALID_TOOL_RESULT_SHAPES!r}); falling back to "
-                f"{TOOL_RESULT_SHAPE_HEAD!r}"
-            )
-            tool_result_shape = TOOL_RESULT_SHAPE_HEAD
-        self.tool_result_shape = tool_result_shape
-        self.tool_result_budget_by_tool = self._validate_budget_by_tool(
-            tool_result_budget_by_tool
-        )
-        self.tool_result_exempt_tools = frozenset(
-            str(t) for t in (tool_result_exempt_tools or []) if str(t)
-        )
-        self.tool_result_spill_dir = (
-            str(tool_result_spill_dir) if tool_result_spill_dir else None
-        )
-        # tool_call_id -> tool name, harvested from assistant tool_calls so a
-        # tool RESULT (which carries only the id) can be matched to a per-tool
-        # budget or exemption. Only populated when at least one of those two
-        # knobs is configured -- in the default configuration this map stays
-        # empty and add_message() does no extra work at all.
-        self._tool_name_by_call_id: dict[str, str] = {}
-        # Spill paths already written this session, so the same result is not
-        # re-written on every request (_apply_sticky_decisions re-derives the
-        # replacement text for every sticky-truncated message, every call).
-        self._spilled_paths: set[str] = set()
-        self.replay_last_user_on_compaction = replay_last_user_on_compaction
-        # Boundary identity of the most recent compaction boundary whose
-        # last-user replay was actually emitted, or None. Compared against
-        # the CURRENT boundary identity to make the replay fire once per
-        # BOUNDARY rather than once per request -- see
-        # _current_compaction_boundary / _maybe_append_last_user_replay.
-        # Never touched unless replay_last_user_on_compaction is True.
-        self._last_replayed_boundary: tuple[int, int] | None = None
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
-        # --- Worth-the-rebuild predicate state (compact_clear_at_least) ---
-        # `_clear_at_least_skips` counts CONSECUTIVE refusals; any accepted
-        # compaction resets it to 0. `_clear_at_least_pending` is call-scoped
-        # state handed from _compact_ephemeral to its single terminal choke
-        # point (_finalize_compaction_with_stats): the baseline view this
-        # call would have returned had it decided nothing new, that view's
-        # token count, and the sticky-decision snapshot to roll back to. It
-        # is always None outside a single _compact_ephemeral call, and stays
-        # None entirely while the predicate is disabled.
-        self._clear_at_least_skips: int = 0
-        self._clear_at_least_pending: dict[str, Any] | None = None
-        # True only for the remainder of a call whose escalation the
-        # predicate refused. Read by get_messages_for_request() so a
-        # refusal is not mistaken for a compaction boundary by the
-        # last-user replay. Always False while the predicate is disabled.
-        self._clear_at_least_last_refused: bool = False
-        # --- Summary compaction strategy state (compaction_strategy == "summary") ---
-        # Unused, and never touched, in the default "progressive" mode.
-        self._cached_provider: Any = None
-        self._is_summarizing: bool = False
-        self._pending_summary: dict[str, Any] | None = None
-        self._summarization_failures: int = 0
-        self._summarization_task: "asyncio.Task[None] | None" = None
-        self._summary_absorbed_count: int = 0
-        # --- Cache-safe summarizer fork state (summary_call_mode == "fork") ---
-        # ALL of these stay None/0/False unless BOTH compaction_strategy ==
-        # "summary" AND summary_call_mode == "fork"; nothing below is even
-        # written in any other configuration (see _finalize_view), which is
-        # what makes the default path byte-identical by construction rather
-        # than by inspection.
-        #
-        # `_last_request_view` is this module's own last returned view, kept
-        # PRE-strip (it still carries `_seq`) so the fork can verify the span
-        # it was asked to summarize is actually present in the prefix it is
-        # about to append to. `_sent_*` is the richer, optional truth handed
-        # over by the caller through note_request_sent().
-        #
-        # `_view_serial` / `_sent_serial` exist for one reason: a caller
-        # that wires note_request_sent() ONCE (at startup, in a helper that
-        # only runs on the first turn) would otherwise hand the fork a
-        # request from turn 1 to append to on turn 40. That prefix is not
-        # the parent's prefix any more, so appending to it is a guaranteed
-        # miss AND a wasted cache write -- a silent misalignment wearing a
-        # correct-looking API call. Matching serials is how "the caller told
-        # us about THIS request" is distinguished from "the caller told us
-        # about SOME request, once".
-        self._last_request_view: list[dict[str, Any]] | None = None
-        self._view_serial: int = 0
-        self._sent_messages: list[dict[str, Any]] | None = None
-        self._sent_serial: int | None = None
-        self._sent_tools: Any = None
-        self._sent_tools_supplied: bool = False
-        self._sent_model: str | None = None
-        # Which of the two sources the last captured fork prefix came from
-        # (FORK_PREFIX_SOURCE_*). Reported on `last_summary_call_stats` so a
-        # measurement can tell a wire-parity fork from a module-view fork
-        # WITHOUT reconstructing it from the provider's request log.
-        self._fork_prefix_source: str | None = None
-        # Observability: what the LAST summarizer call actually did, and how
-        # many times a requested fork had to fall back. An eval arm reads
-        # these to tell a real fork from a silently unforked one.
-        self._last_summary_call: dict[str, Any] | None = None
-        self._summary_fork_fallbacks: int = 0
-        # Precondition names already warned about, so a session that can
-        # never fork logs once per reason instead of once per summarization.
-        self._fork_warned: set[str] = set()
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
         # most recent real usage observed via `llm:response`
@@ -1061,31 +255,6 @@ class SimpleContextManager:
         # "estimate" mode -- see README "Real-usage token meter".
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
-        # --- Hybrid meter state (token_meter == "hybrid") ---
-        # `_anchor_seq` is `_next_seq` frozen at the moment the anchor was
-        # recorded: every message whose `_seq` is >= it was appended AFTER
-        # the request the provider billed, so it is exactly the un-billed
-        # tail the heuristic is still allowed to price (codex's shape).
-        # `_anchor_estimate` is what the heuristic said about the view that
-        # was actually SENT on that request -- the comparand for the
-        # conservatism guard (deepseek's shape). `_last_sent_estimate` is
-        # the running value that becomes `_anchor_estimate` when the next
-        # llm:response arrives.
-        self._anchor_seq: int | None = None
-        self._anchor_estimate: int | None = None
-        self._last_sent_estimate: int | None = None
-        self._last_hybrid_tokens: int | None = None
-        self._last_hybrid_kind: str = METER_KIND_NONE
-        # Refuse-to-guess accounting for optional cache aggregates: they are
-        # reported ONLY when every usage event seen this session carried
-        # them, else undefined (None). Never partially summed.
-        self._usage_events: int = 0
-        self._usage_events_with_cache: int = 0
-        self._usage_cache_read_total: int = 0
-        self._usage_cache_write_total: int = 0
-        # G-METER-PROVENANCE accounting (observability; see _should_compact).
-        self._provenance_refusals: int = 0
-        self._provenance_overrides: int = 0
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
 
         # --- Sticky compaction decision state ---
@@ -1140,12 +309,6 @@ class SimpleContextManager:
         }
         self._next_seq += 1
 
-        # Harvest tool_call_id -> tool name for per-tool budgets/exemptions.
-        # Gated on config: in the default configuration this is a single
-        # boolean check and nothing else.
-        if self._per_tool_config_active():
-            self._harvest_tool_names(message)
-
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
 
@@ -1177,87 +340,6 @@ class SimpleContextManager:
         self._system_prompt_factory = factory
         logger.info("System prompt factory registered - will refresh on each request")
 
-    def note_request_sent(
-        self,
-        messages: list[dict[str, Any]] | None = None,
-        *,
-        tools: Any = None,
-        model: str | None = None,
-    ) -> None:
-        """OPTIONAL. Tell this module what request the caller actually sent.
-
-        This exists for exactly one reason: `summary_call_mode: "fork"`
-        re-issues the summarization ask as a PURE APPEND onto the prefix the
-        main line already sent, and this module cannot see that prefix in
-        full. It is handed messages; it is never handed the tool specs, and
-        it never sees the hook-injected tail an orchestrator may append
-        AFTER `get_messages_for_request()` returns. Both are part of what a
-        provider caches -- tool specs are serialized ahead of the system
-        block -- so a fork built without them is not an append onto the
-        cached prefix at all, and would pay full price for the whole
-        conversation. That is strictly worse than the standalone call it
-        replaces, so fork mode refuses to run without this.
-
-        Completely inert unless BOTH compaction_strategy == "summary" AND
-        summary_call_mode == "fork". Never mutates history: nothing here
-        enters `self.messages`, consumes a `_seq`, or moves any compaction
-        state. Callers that do not know about it lose nothing.
-
-        Call it EVERY request, not once. The most recent `messages` record
-        is the only array this module has positive evidence was ever on the
-        wire, so it is what a fork appends to -- a one-time wiring would
-        have turn 40's fork append to turn 1's request. That case is not
-        silently rerouted (rerouting is what produced the never-sent-array
-        bug); it is caught exactly, by the span-presence check, and refused
-        LOUDLY as a standalone call with a named reason.
-
-        Calling it more than once per request is harmless, and so is
-        serving the view more than once per request: extra views do not
-        invalidate the record. `last_summary_call_stats` reports
-        `prefix_views_since_send` so that re-fetching is observable rather
-        than inferred.
-
-        Args:
-            messages: The exact message array sent, if known. Gives the fork
-                byte-parity with the wire -- required for an implicit,
-                match-forward-only cache (OpenAI, whose measured behavior
-                misses on anything that is not a strict superset of a cached
-                request). Omit it and the fork appends to this module's own
-                last returned view instead, which is what an
-                explicit-breakpoint cache (Anthropic) needs, since the
-                breakpoint lands on the last STABLE message -- exactly where
-                this module's view ends, before any ephemeral injection.
-            tools: The tool specs sent, in the order sent. Passing this at
-                all -- even as None or [] for a genuinely tool-free session
-                -- is what arms fork mode; "not supplied" and "supplied as
-                empty" are deliberately distinguishable, because guessing
-                between them is how a fork silently misaligns.
-            model: The resolved model, if the caller knows it. Pins the
-                fork to the same model the parent used; a summarizer routed
-                elsewhere reads no cache the main line wrote.
-        """
-        if messages is not None:
-            self._sent_messages = list(messages)
-            self._sent_serial = self._view_serial
-        self._sent_tools = list(tools) if isinstance(tools, list) else tools
-        self._sent_tools_supplied = True
-        if model is not None:
-            self._sent_model = model
-
-    @property
-    def last_summary_call_stats(self) -> dict[str, Any] | None:
-        """What the most recent summarizer call actually did.
-
-        None before the first one. Otherwise a dict with `mode_requested`,
-        `mode_used`, `reason` (None when the requested mode was honored),
-        `prefix_messages`, `prefix_source` (FORK_PREFIX_SOURCE_*, None when
-        not forked), `prefix_views_since_send`, and `fork_fallbacks`
-        (session-cumulative). This is how an eval arm distinguishes a real
-        fork from a silently unforked one -- and a wire-parity fork from a
-        module-view one -- WITHOUT patching the module.
-        """
-        return dict(self._last_summary_call) if self._last_summary_call else None
-
     async def get_messages_for_request(
         self,
         token_budget: int | None = None,
@@ -1286,13 +368,6 @@ class SimpleContextManager:
             Messages ready for LLM request, compacted if necessary.
         """
         budget = self._calculate_budget(token_budget, provider)
-
-        # Summary compaction strategy needs a provider handle to call the
-        # summarizer -- cache the latest one seen (mirrors how the donor
-        # module caches it, context-managed:365-367). No-op in the default
-        # "progressive" mode.
-        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY and provider is not None:
-            self._cached_provider = provider
 
         # Reserve token budget for potential compaction notice (if enabled)
         effective_budget = budget
@@ -1341,62 +416,21 @@ class SimpleContextManager:
             # Static mode: use messages as-is (may include stored system messages)
             working_messages = list(self.messages)
 
-        (
-            token_count,
-            meter_source,
-            estimated_tokens,
-            meter,
-        ) = self._measure_working_tokens(working_messages)
+        token_count, meter_source, estimated_tokens = self._measure_working_tokens(
+            working_messages
+        )
         self._last_token_meter_stats = {
             "mode": self.token_meter,
             "source": meter_source,
-            # Provenance of `used_tokens` -- present on 100% of counts, in
-            # every mode (G-METER-PROVENANCE).
-            "kind": meter["kind"],
             "used_tokens": token_count,
-            # All three meters, computed simultaneously on every request,
-            # regardless of which one is actually driving the trigger. This is
-            # what makes the estimate-vs-hybrid-vs-actual divergence
-            # measurable without changing behaviour (POC-05 G-METER-DELTA).
             "estimated_tokens": estimated_tokens,
             "measured_tokens": self._last_measured_prompt_tokens,
-            "hybrid_tokens": meter["hybrid_tokens"],
-            "hybrid_kind": meter["hybrid_kind"],
-            "anchor_tokens": meter["anchor_tokens"],
-            "anchor_estimate": meter["anchor_estimate"],
-            "anchor_rejected": meter["anchor_rejected"],
-            "tail_estimated_tokens": meter["tail_estimated_tokens"],
-            "tail_messages": meter["tail_messages"],
-            # Undefined (None) unless EVERY usage event this session reported
-            # cache fields -- refuse to guess, never a partial sum.
-            "cache_aggregates": self._cache_aggregates(),
-            "provenance_refusals": self._provenance_refusals,
-            "provenance_overrides": self._provenance_overrides,
             "budget": effective_budget,
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
 
-        # Observability emit: lets an eval harness capture all three meters
-        # per request without patching this module. Never raises, never
-        # changes the view that is returned.
-        if self._hooks is not None:
-            try:
-                await self._hooks.emit(
-                    "context:token_meter", dict(self._last_token_meter_stats)
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.debug(f"Could not emit context:token_meter event: {e}")
-
-        # Summary compaction strategy: trigger an async background
-        # summarization call EARLY (well before compact_threshold, so it has
-        # time to finish -- see module docstring "Summary compaction
-        # strategy" and _maybe_trigger_summary_compaction). No-op in the
-        # default "progressive" mode. Never raises, never blocks this turn.
-        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY:
-            await self._maybe_trigger_summary_compaction(token_count, effective_budget)
-
         # Check if compaction needed (using effective budget with notice reserve deducted)
-        if self._should_compact(token_count, effective_budget, meter["kind"]):
+        if self._should_compact(token_count, effective_budget):
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
                 effective_budget, working_messages
@@ -1436,31 +470,6 @@ class SimpleContextManager:
             # state) -- so on calls between escalations, this tail addition is
             # byte-identical, and everything before it (the real prefix) is
             # completely undisturbed either way.
-            # Append the last-user replay BEFORE the compaction notice, so
-            # the notice stays the final item (the "dynamic tail"). Opt-in
-            # and a complete no-op when off -- see module docstring
-            # "Last-User Replay After a Compaction Boundary".
-            #
-            # Ordering note (deliberate, and it is the reason there is no
-            # interaction bug between the two tail appends): the replay
-            # applies the SAME unanswered-tool_calls tail guard the notice
-            # does, evaluated on the PRE-replay tail. So either both are
-            # suppressed (tail unsafe) or the replay lands first and the
-            # notice's own guard then sees the replay -- a plain user
-            # message with no tool_calls -- and proceeds correctly.
-            # A refused compaction is NOT a boundary. Without this check the
-            # replay would fire on a call where nothing was shed at all --
-            # `_current_compaction_boundary()` is unchanged by a refusal (by
-            # design: the verdict runs before `_sticky_level` is bumped), so
-            # on the first-ever refusal it still differs from the initial
-            # `None` and would look like a fresh boundary. Appending a
-            # verbatim user replay after a compaction that did not happen
-            # would both mislead the model and spend tokens the refusal
-            # exists to save. Always False while the predicate is disabled,
-            # so this cannot change existing behaviour.
-            if self.replay_last_user_on_compaction and not self._clear_at_least_last_refused:
-                self._maybe_append_last_user_replay(compacted, effective_budget)
-
             if self.compaction_notice_enabled and self._last_compaction_stats:
                 level = self._last_compaction_stats.get("strategy_level", 0)
                 # GUARD: never append into an unanswered tool_calls turn.
@@ -1509,9 +518,9 @@ class SimpleContextManager:
             # Strip internal bookkeeping at the module boundary -- everything
             # above this point (sticky decisions, token accounting) still runs
             # on messages carrying `_seq`; only what leaves has it removed.
-            return self._finalize_view(compacted)
+            return self._strip_internal_metadata(compacted)
 
-        return self._finalize_view(working_messages)
+        return self._strip_internal_metadata(working_messages)
 
     # Metadata keys that are internal bookkeeping only and must never cross
     # the module boundary into a provider-facing view. `_seq` is sticky
@@ -1579,32 +588,17 @@ class SimpleContextManager:
         produced the transcript.
         """
         restamped: list[dict[str, Any]] = []
-        per_tool_active = self._per_tool_config_active()
-        self._tool_name_by_call_id = {}
         for i, msg in enumerate(messages):
             meta = dict(msg.get("metadata") or {})
             meta["_seq"] = i
             restamped.append({**msg, "metadata": meta})
-            # Rebuild the id->name map from the restored history, so a
-            # resumed session resolves per-tool budgets exactly as the
-            # original session did. No-op unless a per-tool knob is set.
-            if per_tool_active:
-                self._harvest_tool_names(msg)
         self.messages = restamped
         self._next_seq = len(restamped)
-        # Seqs were just restamped from 0, so any anchor split recorded
-        # against the OLD numbering is meaningless -- and worse, would
-        # silently classify restored history as an un-billed tail. Drop it;
-        # the meter re-anchors on the next llm:response.
-        self._reset_hybrid_meter_state()
         self._removed_seqs = set()
         self._truncated_seqs = set()
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
-        self._last_replayed_boundary = None
-        self._reset_clear_at_least_state()
-        self._reset_summary_strategy_state()
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:
@@ -1618,51 +612,7 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
-        self._reset_hybrid_meter_state()
-        # Per-tool name map belongs to the cleared conversation. The spill
-        # cache is only a write-skip memo -- the files themselves are
-        # content-addressed and deliberately NOT deleted here (a resumed or
-        # forked session may still hold a pointer to one; see README).
-        self._tool_name_by_call_id = {}
-        self._spilled_paths = set()
-        self._last_replayed_boundary = None
-        self._reset_clear_at_least_state()
-        self._reset_summary_strategy_state()
         logger.info("Context cleared")
-
-    def _reset_summary_strategy_state(self) -> None:
-        """Reset all `compaction_strategy == "summary"` state -- called from
-        both set_messages() and clear() so a resumed/cleared session never
-        carries stale in-flight summarization state across the reset. A
-        no-op in the default "progressive" mode (the fields are simply
-        never populated in the first place).
-
-        Cancels any in-flight background summarization task rather than
-        leaving it to run against a context that has just been reset out
-        from under it.
-        """
-        if self._summarization_task is not None and not self._summarization_task.done():
-            self._summarization_task.cancel()
-        self._cached_provider = None
-        self._is_summarizing = False
-        self._pending_summary = None
-        self._summarization_failures = 0
-        self._summarization_task = None
-        self._summary_absorbed_count = 0
-        # Fork state is history-derived: a reset session's old prefix is not
-        # a prefix of anything any more, and the caller's note_request_sent()
-        # facts describe a request that no longer relates to this history.
-        # Keeping either would be exactly the stale-alignment bug fork mode
-        # exists to refuse. `_summary_fork_fallbacks` is a session-cumulative
-        # observability counter and deliberately survives.
-        self._last_request_view = None
-        self._view_serial = 0
-        self._sent_messages = None
-        self._sent_serial = None
-        self._sent_tools = None
-        self._sent_tools_supplied = False
-        self._sent_model = None
-        self._fork_prefix_source = None
 
     async def should_compact(self) -> bool:
         """Check if context should be compacted.
@@ -1682,54 +632,10 @@ class SimpleContextManager:
         """
         pass
 
-    def _should_compact(
-        self, token_count: int, budget: int, kind: str | None = None
-    ) -> bool:
-        """Check if context should be compacted.
-
-        `kind` is the PROVENANCE of `token_count` (see METER_KIND_*). It is
-        only consulted in `token_meter: "hybrid"` mode, where G-METER-PROVENANCE
-        applies: firing compaction is an irreversible action (it destroys the
-        provider's prompt cache for at least one request and permanently
-        records sticky truncate/remove decisions), so it may NOT be taken on a
-        number the provider never anchored.
-
-        The one deliberate escape, recorded rather than hidden: if NO anchor
-        has ever arrived this session AND the count has reached 100% of
-        budget, refusing would guarantee a provider hard-failure on the very
-        next request, which is strictly worse than acting on an estimate. That
-        path fires, logs a warning, and is counted separately in
-        `_provenance_overrides` so a gate reports it honestly instead of it
-        looking like a clean pass. It cannot mask a guard-rejected anchor: it
-        requires that no measurement exists at all.
-        """
+    def _should_compact(self, token_count: int, budget: int) -> bool:
+        """Check if context should be compacted."""
         usage = token_count / budget if budget > 0 else 0
         should = usage >= self.compact_threshold
-        if (
-            should
-            and self.token_meter == TOKEN_METER_HYBRID
-            and kind is not None
-            and kind != METER_KIND_USAGE
-        ):
-            if self._last_measured_prompt_tokens is None and usage >= 1.0:
-                self._provenance_overrides += 1
-                logger.warning(
-                    f"context-simple: token_meter='hybrid' firing compaction on an "
-                    f"UNANCHORED count ({token_count:,} tokens = {usage:.1%} of "
-                    f"budget) because no provider usage has been observed this "
-                    f"session and the count has reached the hard ceiling; "
-                    f"refusing would guarantee a context-overflow failure. "
-                    f"Recorded as a provenance override, not a clean fire."
-                )
-                return True
-            self._provenance_refusals += 1
-            logger.info(
-                f"context-simple: token_meter='hybrid' REFUSING to fire compaction "
-                f"on kind={kind!r} ({token_count:,} tokens = {usage:.1%} of budget) "
-                f"-- G-METER-PROVENANCE: no irreversible action on an un-anchored "
-                f"number. Waiting for provider-reported usage."
-            )
-            return False
         if should:
             logger.info(
                 f"Context at {usage:.1%} capacity ({token_count:,}/{budget:,} tokens), "
@@ -1746,19 +652,8 @@ class SimpleContextManager:
         In token_meter="actual" mode with a real measurement available, the
         REAL measurement decides this, not `estimated_tokens` -- see module
         docstring "Real-Usage Token Meter" and _measure_working_tokens for
-        the identical mode/fallback logic. In token_meter="hybrid" mode the
-        hybrid number decides it, but ONLY when that number is anchored
-        (kind == 'usage'); an estimated hybrid count falls through to the
-        estimator branch rather than driving an escalation -- the same
-        G-METER-PROVENANCE rule _should_compact applies to the outer trigger.
-        Falls back to `estimated_tokens` in "estimate" mode, or whenever no
-        real measurement has arrived yet.
-
-        NOTE (unchanged from "actual" mode, and equally true here): only the
-        GATE uses the anchored number. The SIZING of the reduction --
-        target_tokens and every per-level termination check -- is still the
-        estimator throughout, because a billed token count for a hypothetical
-        smaller message set does not exist without another round-trip.
+        the identical mode/fallback logic. Falls back to `estimated_tokens`
+        in "estimate" mode, or whenever no real measurement has arrived yet.
         """
         if budget <= 0:
             return False
@@ -1767,207 +662,18 @@ class SimpleContextManager:
             and self._last_measured_prompt_tokens is not None
         ):
             return (self._last_measured_prompt_tokens / budget) >= self.compact_threshold
-        if (
-            self.token_meter == TOKEN_METER_HYBRID
-            and self._last_hybrid_tokens is not None
-            and self._last_hybrid_kind == METER_KIND_USAGE
-        ):
-            return (self._last_hybrid_tokens / budget) >= self.compact_threshold
         return (estimated_tokens / budget) >= self.compact_threshold
-
-    def _reset_hybrid_meter_state(self) -> None:
-        """Drop every hybrid-meter reading. Called from clear() and from
-        set_messages() (which restamps `_seq` from 0, invalidating any
-        recorded anchor split). Observability-only in the default
-        "estimate" mode -- these fields never drive that mode's trigger."""
-        self._anchor_seq = None
-        self._anchor_estimate = None
-        self._last_sent_estimate = None
-        self._last_hybrid_tokens = None
-        self._last_hybrid_kind = METER_KIND_NONE
-        self._usage_events = 0
-        self._usage_events_with_cache = 0
-        self._usage_cache_read_total = 0
-        self._usage_cache_write_total = 0
-
-    def _finalize_view(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-        """Strip internal metadata and record the heuristic price of the view
-        that is actually being SENT.
-
-        That recorded number is the conservatism guard's comparand: when the
-        next `llm:response` arrives, its provider total describes THIS view,
-        so "is the provider total below what the heuristic would say for the
-        same content?" is only a meaningful question against the estimate of
-        the view that was sent -- not against the full, uncompacted history.
-        """
-        view = self._strip_internal_metadata(messages)
-        self._last_sent_estimate = self._estimate_tokens(view)
-        # Remember the PRE-strip list (it still carries `_seq`) so a forked
-        # summarizer call can both reproduce this exact view byte-for-byte
-        # AND verify the span it was asked to summarize is present in it.
-        # Guarded so the default path allocates nothing new and stays
-        # byte-identical by construction, not by inspection.
-        if self._fork_armed():
-            self._last_request_view = list(messages)
-            self._view_serial += 1
-        return view
-
-    def _cache_aggregates(self) -> dict[str, int] | None:
-        """Session cache aggregates, or None if UNDEFINED.
-
-        Refuse-to-guess rule, lifted from deepseek-harness's
-        `deriveTurnTokenUsage`: an optional aggregate is reported only when
-        EVERY usage event observed this session reported the underlying
-        fields. One event missing them makes the aggregate undefined -- a
-        partial sum that silently under-reports is worse than no number.
-        """
-        if self._usage_events == 0:
-            return None
-        if self._usage_events_with_cache != self._usage_events:
-            return None
-        return {
-            "events": self._usage_events,
-            "cache_read_tokens": self._usage_cache_read_total,
-            "cache_write_tokens": self._usage_cache_write_total,
-        }
-
-    def _hybrid_split(
-        self, working_messages: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-        """Split `working_messages` into (billed prefix, un-billed tail) at
-        the recorded anchor.
-
-        A message belongs to the tail iff it carries a `_seq` >= `_anchor_seq`
-        -- i.e. it was appended after the request the provider billed.
-        Messages with no `_seq` at all (the factory-generated system prompt)
-        are treated as PREFIX: they were part of the billed request, and
-        pricing them into the tail on top of an anchor that already contains
-        them would double-count the single largest block in the window.
-        """
-        if self._anchor_seq is None:
-            return list(working_messages), []
-        prefix: list[dict[str, Any]] = []
-        tail: list[dict[str, Any]] = []
-        for msg in working_messages:
-            seq = self._extract_seq(msg)
-            if seq is not None and seq >= self._anchor_seq:
-                tail.append(msg)
-            else:
-                prefix.append(msg)
-        return prefix, tail
-
-    def _measure_hybrid(
-        self, working_messages: list[dict[str, Any]], estimated_tokens: int
-    ) -> dict[str, Any]:
-        """Compute the hybrid (provider-anchored + provenance) token count.
-
-            total = provider_reported_total_from_the_last_llm_response
-                  + estimate(items appended since that response)
-
-        This is codex's shape (never price the whole window by heuristic when
-        the provider has already said what the window cost; heuristic only the
-        un-billed tail) with deepseek's provenance and conservatism guard
-        bolted on.
-
-        Returns a dict carrying the number AND its provenance. Computed on
-        every request in every mode, so the estimate-vs-hybrid-vs-actual
-        divergence is observable without changing which meter drives the
-        trigger.
-
-        Guards:
-          * CONSERVATISM -- if the provider's total is BELOW what the
-            heuristic priced for the same sent content, the anchor is not
-            trustworthy as a floor; reject it, report the (larger) full
-            heuristic, and mark kind='estimated'. Never let a number that may
-            under-state occupancy authorise an irreversible action.
-          * REFUSE TO GUESS -- with no anchor at all this is honestly
-            kind='estimated', not a hybrid number wearing a usage label.
-        """
-        if not working_messages:
-            return {
-                "hybrid_tokens": 0,
-                "hybrid_kind": METER_KIND_NONE,
-                "anchor_tokens": None,
-                "anchor_estimate": None,
-                "anchor_rejected": False,
-                "tail_estimated_tokens": 0,
-                "tail_messages": 0,
-                "reason": "no_messages",
-            }
-
-        anchor = self._last_measured_prompt_tokens
-        if anchor is None:
-            return {
-                "hybrid_tokens": estimated_tokens,
-                "hybrid_kind": METER_KIND_ESTIMATED,
-                "anchor_tokens": None,
-                "anchor_estimate": None,
-                "anchor_rejected": False,
-                "tail_estimated_tokens": None,
-                "tail_messages": None,
-                "reason": "no_anchor",
-            }
-
-        _prefix, tail = self._hybrid_split(working_messages)
-        tail_estimate = self._estimate_tokens(tail)
-
-        if anchor <= 0:
-            # A non-positive provider total is not a measurement of anything.
-            # OBSERVED LIVE, not hypothetical: during this feature's own
-            # divergence capture a provider returned HTTP 200 with an
-            # all-zero usage block mid-run (input_tokens=0, output_tokens=0)
-            # on a ~38k-token request. Trusting that as an anchor would have
-            # asserted the context was EMPTY. The comparand guard below
-            # catches it whenever a sent-estimate exists; this catches the
-            # case where one does not.
-            return {
-                "hybrid_tokens": estimated_tokens,
-                "hybrid_kind": METER_KIND_ESTIMATED,
-                "anchor_tokens": anchor,
-                "anchor_estimate": self._anchor_estimate,
-                "anchor_rejected": True,
-                "tail_estimated_tokens": tail_estimate,
-                "tail_messages": len(tail),
-                "reason": "anchor_non_positive",
-            }
-
-        if self._anchor_estimate is not None and anchor < self._anchor_estimate:
-            # Conservatism guard fired: the provider total is smaller than the
-            # heuristic price of the very content it billed, so it cannot be
-            # trusted as a floor for this window.
-            return {
-                "hybrid_tokens": estimated_tokens,
-                "hybrid_kind": METER_KIND_ESTIMATED,
-                "anchor_tokens": anchor,
-                "anchor_estimate": self._anchor_estimate,
-                "anchor_rejected": True,
-                "tail_estimated_tokens": tail_estimate,
-                "tail_messages": len(tail),
-                "reason": "anchor_below_heuristic",
-            }
-
-        return {
-            "hybrid_tokens": anchor + tail_estimate,
-            "hybrid_kind": METER_KIND_USAGE,
-            "anchor_tokens": anchor,
-            "anchor_estimate": self._anchor_estimate,
-            "anchor_rejected": False,
-            "tail_estimated_tokens": tail_estimate,
-            "tail_messages": len(tail),
-            "reason": None,
-        }
 
     def _measure_working_tokens(
         self, working_messages: list[dict[str, Any]]
-    ) -> tuple[int, str, int, dict[str, Any]]:
-        """Return (token_count, source, estimated_tokens, meter) used to
-        evaluate the compaction trigger this call.
+    ) -> tuple[int, str, int]:
+        """Return (token_count, source, estimated_tokens) used to evaluate
+        the compaction trigger this call.
 
         `estimated_tokens` is ALWAYS the len(str)//4 heuristic over
-        `working_messages` (see _estimate_tokens), and `meter` ALWAYS carries
-        the hybrid number too -- both computed unconditionally so all three
-        meters (estimate / actual / hybrid) are observable per request via
-        `_last_token_meter_stats` regardless of mode.
+        `working_messages` (see _estimate_tokens) -- computed unconditionally
+        so the estimator-vs-real-usage drift this meter exists to close is
+        observable via `_last_token_meter_stats` regardless of mode.
 
         `token_count`/`source` are what actually drives `_should_compact`:
 
@@ -1979,41 +685,16 @@ class SimpleContextManager:
           `llm:response` (input_tokens + cache_write_tokens -- see
           `_on_llm_response`), source "measured", if one has arrived this
           session; otherwise falls back to `estimated_tokens`, source
-          "estimate".
-        - token_meter == "hybrid": the provider-anchored total plus a
-          heuristic price for the un-billed tail, source "hybrid" -- see
-          `_measure_hybrid`. Its provenance (`kind`) rides along and gates
-          irreversible actions in `_should_compact`.
-
-        `meter["kind"]` is the provenance of the RETURNED `token_count` (not
-        of the hybrid number, which is reported separately as `hybrid_kind`)
-        -- so 100% of counts this module produces carry a provenance, in
-        every mode.
+          "estimate" (before the first response of the session, or
+          whenever hooks/events are unavailable).
         """
         estimated_tokens = self._estimate_tokens(working_messages)
-        hybrid = self._measure_hybrid(working_messages, estimated_tokens)
-        self._last_hybrid_tokens = hybrid["hybrid_tokens"]
-        self._last_hybrid_kind = hybrid["hybrid_kind"]
-
         if (
             self.token_meter == TOKEN_METER_ACTUAL
             and self._last_measured_prompt_tokens is not None
         ):
-            meter = {**hybrid, "kind": METER_KIND_USAGE}
-            return (
-                self._last_measured_prompt_tokens,
-                "measured",
-                estimated_tokens,
-                meter,
-            )
-
-        if self.token_meter == TOKEN_METER_HYBRID:
-            meter = {**hybrid, "kind": hybrid["hybrid_kind"]}
-            return hybrid["hybrid_tokens"], "hybrid", estimated_tokens, meter
-
-        kind = METER_KIND_NONE if not working_messages else METER_KIND_ESTIMATED
-        meter = {**hybrid, "kind": kind}
-        return estimated_tokens, "estimate", estimated_tokens, meter
+            return self._last_measured_prompt_tokens, "measured", estimated_tokens
+        return estimated_tokens, "estimate", estimated_tokens
 
     async def _on_llm_response(self, event: str, data: dict[str, Any]) -> Any:
         """Hook handler for the canonical `llm:response` event -- records the
@@ -2055,20 +736,6 @@ class SimpleContextManager:
         if isinstance(input_tokens, int | float):
             total = int(input_tokens) + int(cache_write_tokens)
             self._last_measured_prompt_tokens = total
-            # Hybrid meter bookkeeping (no-op for the trigger unless
-            # token_meter == "hybrid"; recorded always so the hybrid number
-            # is observable in every mode -- see _measure_hybrid).
-            self._anchor_seq = self._next_seq
-            self._anchor_estimate = self._last_sent_estimate
-            self._usage_events += 1
-            cache_read = usage.get("cache_read_tokens")
-            cache_write_reported = usage.get("cache_write_tokens")
-            if isinstance(cache_read, int | float) and isinstance(
-                cache_write_reported, int | float
-            ):
-                self._usage_events_with_cache += 1
-                self._usage_cache_read_total += int(cache_read)
-                self._usage_cache_write_total += int(cache_write_reported)
             logger.debug(
                 f"context-simple: token_meter recorded real usage from "
                 f"llm:response -- input_tokens={int(input_tokens):,} + "
@@ -2161,194 +828,6 @@ class SimpleContextManager:
                 result.append(dict(msg))
         return result
 
-    # --- Worth-the-rebuild predicate helpers (compact_clear_at_least) ---
-    #
-    # See the module docstring section "Worth-The-Rebuild Predicate" for the
-    # why. In short: every compaction shrinks the request, and a shrink is a
-    # guaranteed cold prompt-cache rebuild on the OpenAI path, so a boundary
-    # that frees very little is close to pure loss. This predicate refuses
-    # those boundaries. It is DISABLED by default and, while disabled,
-    # `_clear_at_least_pending` is never populated and no code path below the
-    # `required > 0` check is ever entered.
-
-    def _reset_clear_at_least_state(self) -> None:
-        """Drop predicate state -- called from clear() and set_messages().
-
-        The consecutive-skip streak is per-conversation: a resumed or cleared
-        session has a fresh message set, so a streak accumulated against the
-        old one says nothing about the new one and must not be inherited (it
-        would otherwise fail loud on the first refusal after a resume).
-        """
-        self._clear_at_least_skips = 0
-        self._clear_at_least_pending = None
-        self._clear_at_least_last_refused = False
-
-    def _clear_at_least_required(self, budget: int) -> int:
-        """Resolve `compact_clear_at_least` to an absolute token floor for
-        THIS call, or 0 meaning the predicate is disabled.
-
-          None / 0 / negative  -> 0 (disabled; today's behaviour exactly)
-          0 < value < 1        -> that FRACTION of `budget`, resolved per call
-          value >= 1           -> that many tokens, absolutely
-
-        The fraction form exists because a hardcoded token floor silently
-        means something completely different on a 200k window than on a 45k
-        one; a fraction tracks the real window.
-
-        The 1.0 boundary is deliberately read as ABSOLUTE, not as "100% of
-        budget": a floor of one entire budget can never be met by any
-        compaction, so reading it as a fraction would turn a plausible-looking
-        config into a guaranteed fail-loud. A malformed value disables the
-        predicate with a warning rather than raising -- consistent with how
-        this module handles every other unrecognized config value.
-        """
-        raw = self.compact_clear_at_least
-        if raw is None:
-            return 0
-        try:
-            value = float(raw)
-        except (TypeError, ValueError):
-            logger.warning(
-                f"context-simple: compact_clear_at_least={raw!r} is not a number; "
-                f"disabling the worth-the-rebuild predicate for this session "
-                f"(compaction behaves exactly as if it were unset)."
-            )
-            return 0
-        if value <= 0:
-            return 0
-        if value < 1:
-            return int(budget * value) if budget > 0 else 0
-        return int(value)
-
-    def _snapshot_sticky_decisions(self) -> dict[str, set[int]]:
-        """Copy the three sticky decision sets so a refused escalation can be
-        rolled back exactly.
-
-        These sets are the ONLY durable state a progressive escalation writes
-        before it reaches `_finalize_compaction_with_stats` (which is where
-        the predicate runs). `_sticky_level`, `_last_compaction_stats` and the
-        `context:compaction` event are all written AFTER the predicate, so a
-        refusal leaves no trace of them at all -- which is what keeps the tail
-        compaction notice byte-stable across a skip.
-        """
-        return {
-            "removed": set(self._removed_seqs),
-            "truncated": set(self._truncated_seqs),
-            "stubbed": set(self._stubbed_seqs),
-        }
-
-    def _restore_sticky_decisions(self, snapshot: dict[str, set[int]]) -> None:
-        """Undo every sticky decision recorded since `snapshot` was taken."""
-        self._removed_seqs = set(snapshot["removed"])
-        self._truncated_seqs = set(snapshot["truncated"])
-        self._stubbed_seqs = set(snapshot["stubbed"])
-
-    async def _clear_at_least_verdict(
-        self,
-        final_messages: list[dict[str, Any]],
-        max_level_reached: int,
-    ) -> list[dict[str, Any]] | None:
-        """Judge a completed escalation against the worth-the-rebuild floor.
-
-        Returns None when the compaction is ACCEPTED (the caller finalizes
-        normally), or the baseline view to return INSTEAD when it is refused.
-        Raises RuntimeError when the consecutive-refusal cap is reached.
-
-        `freed` is the MARGINAL reclaim of this boundary: the count of the
-        view this call would have returned had it decided nothing new, minus
-        the count of the view the ladder actually produced. That is the right
-        comparand because what breaks the provider's cache is this view
-        differing from the last one -- not its distance from raw history.
-
-        Both sides are `_estimate_tokens` over a full message list, i.e. the
-        same units the ladder itself uses, recomputed exactly rather than read
-        off the ladder's running counter (which carries small deliberate
-        approximations, e.g. the flat ~18-token stub charge at level 8).
-        No second estimator is introduced.
-        """
-        pending = self._clear_at_least_pending
-        self._clear_at_least_pending = None
-        if pending is None:
-            # Predicate disabled, or this call made no new decision to judge.
-            return None
-
-        required: int = pending["required"]
-        baseline_tokens: int = pending["baseline_tokens"]
-        freed = baseline_tokens - self._estimate_tokens(final_messages)
-
-        if freed >= required:
-            self._clear_at_least_skips = 0
-            logger.debug(
-                f"context-simple: clear_at_least ALLOWED this boundary -- "
-                f"level {max_level_reached} frees {freed:,} tokens "
-                f"(floor {required:,})"
-            )
-            return None
-
-        # --- REFUSED: roll the escalation back completely ---
-        self._clear_at_least_last_refused = True
-        self._clear_at_least_skips += 1
-        self._restore_sticky_decisions(pending["sticky"])
-
-        baseline_view: list[dict[str, Any]] = pending["baseline_view"]
-        protected_tool_results_present = sum(
-            1 for m in baseline_view if m.get("role") == "tool"
-        )
-        protected_summary = (
-            f"protected_tool_results={self.protected_tool_results} "
-            f"(of {protected_tool_results_present} tool results in the view), "
-            f"protected_recent={self.protected_recent:.0%} "
-            f"of {len(baseline_view)} messages"
-        )
-
-        if self._clear_at_least_skips >= self.compact_max_consecutive_skips:
-            # FAIL LOUD, do not degrade. Continuing to skip would let usage
-            # climb until the provider hard-fails with an opaque
-            # context-overflow error; silently compacting anyway would let a
-            # run "pass" while the predicate had quietly stopped applying.
-            # Neither tells the operator which knob to move -- this does.
-            raise RuntimeError(
-                f"context-simple: compact_clear_at_least={self.compact_clear_at_least!r} "
-                f"could not be satisfied {self._clear_at_least_skips} consecutive times "
-                f"(cap: {self.compact_max_consecutive_skips}). The compaction ladder "
-                f"reached level {max_level_reached} and freed only {freed:,} tokens "
-                f"against a required floor of {required:,}. Protected set holding the "
-                f"floor: {protected_summary}. Baseline view is {baseline_tokens:,} "
-                f"tokens against a budget of {pending['budget']:,}. Lower "
-                f"compact_clear_at_least, lower protected_recent/protected_tool_results, "
-                f"or raise the budget -- compacting harder will not help."
-            )
-
-        logger.info(
-            f"context-simple: clear_at_least REFUSED this boundary -- level "
-            f"{max_level_reached} would free only {freed:,} tokens against a floor of "
-            f"{required:,}; not worth a full prompt-cache rebuild. Escalation rolled "
-            f"back; returning the unchanged view "
-            f"({self._clear_at_least_skips}/{self.compact_max_consecutive_skips} "
-            f"consecutive skips)."
-        )
-
-        if self._hooks is not None:
-            try:
-                await self._hooks.emit(
-                    "context:compaction-skipped",
-                    {
-                        "freed_tokens": freed,
-                        "required_tokens": required,
-                        "level_reached": max_level_reached,
-                        "consecutive_skips": self._clear_at_least_skips,
-                        "max_consecutive_skips": self.compact_max_consecutive_skips,
-                        "baseline_tokens": baseline_tokens,
-                        "budget": pending["budget"],
-                        "protected_recent": self.protected_recent,
-                        "protected_tool_results": self.protected_tool_results,
-                    },
-                )
-            except Exception as e:  # pragma: no cover - defensive
-                logger.warning(f"Could not emit compaction-skipped event: {e}")
-
-        return baseline_view
-
     async def _compact_ephemeral(
         self, budget: int, source_messages: list[dict[str, Any]] | None = None
     ) -> list[dict[str, Any]]:
@@ -2378,13 +857,6 @@ class SimpleContextManager:
             source_messages: Messages to compact. If None, uses self.messages.
                              This allows compacting factory-generated message lists.
         """
-        # The worth-the-rebuild predicate's comparand is strictly
-        # call-scoped. Clear it up front so a value left behind by an
-        # earlier call that raised can never be consumed by this one.
-        # A no-op while the predicate is disabled (it is never set).
-        self._clear_at_least_pending = None
-        self._clear_at_least_last_refused = False
-
         messages_to_compact = (
             source_messages if source_messages is not None else self.messages
         )
@@ -2401,22 +873,6 @@ class SimpleContextManager:
         non_system_messages = [
             msg for msg in messages_to_compact if msg.get("role") != "system"
         ]
-
-        # Summary compaction strategy: if a background summarization call
-        # has completed since the last escalation, absorb its span NOW --
-        # before sticky decisions are (re-)applied, so the new removals and
-        # the new summary message are both visible to this call's
-        # _apply_sticky_decisions() below. No-op (did_summary_swap stays
-        # False) in the default "progressive" mode, and a no-op whenever
-        # compaction_strategy == "summary" but nothing is pending yet. See
-        # module docstring "Summary compaction strategy".
-        did_summary_swap = False
-        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY and (
-            self._pending_summary is not None
-        ):
-            non_system_messages, did_summary_swap = await self._swap_in_pending_summary(
-                non_system_messages
-            )
 
         # UNITS CONVENTION (see the block comment below): every "are we under
         # target yet?" comparison in this method and its helpers is TOTAL vs
@@ -2502,7 +958,7 @@ class SimpleContextManager:
         # sizing of that escalation is only as good as the estimator was
         # before this meter existed.
         needs_escalation = self._exceeds_threshold(current_tokens, budget)
-        if not needs_escalation and not did_summary_swap:
+        if not needs_escalation:
             # Sticky state alone already keeps us under the threshold that
             # triggered compaction in the first place -- nothing NEW needs
             # deciding this call. Return the already-decided view unchanged;
@@ -2515,63 +971,6 @@ class SimpleContextManager:
                 f"(no new decisions this call; cumulative level so far: {self._sticky_level})"
             )
             return final_messages
-
-        if not needs_escalation:
-            # Summary swap alone (see above) already brought us back under
-            # threshold this call -- no progressive level is needed. Still
-            # route through _finalize_compaction_with_stats (rather than the
-            # cheap early-return above) so _last_compaction_stats/hooks
-            # observe that something DID change this call.
-            # max_level_reached=0 records "no progressive level was needed".
-            logger.info(
-                f"Summary compaction alone reached target: {old_count} raw messages, "
-                f"{old_tokens:,} raw tokens -> {len(working_messages)} messages, "
-                f"{current_tokens:,} tokens"
-            )
-            return await self._finalize_compaction_with_stats(
-                working_messages,
-                system_messages,
-                old_count,
-                old_tokens,
-                0,
-                0,
-                0,
-                0,
-                budget,
-                target_tokens,
-            )
-
-        # === WORTH-THE-REBUILD PREDICATE: capture the comparand ===
-        #
-        # This is the last point at which nothing new has been decided.
-        # `working_messages` here is exactly what this call would return if
-        # it escalated no further (the sticky baseline), and `current_tokens`
-        # is exactly its token count -- `_estimate_tokens` is a per-message
-        # sum, so system_tokens + non_system_tokens IS the count of the
-        # combined list, not an approximation of it.
-        #
-        # Placed AFTER both early returns on purpose: a call where sticky
-        # state alone was already sufficient decided nothing, so there is
-        # nothing to judge and it must never count as a skip. The
-        # summary-swap-only path is likewise not judged here -- a swap has
-        # already mutated self.messages irreversibly by this point, so it
-        # cannot be rolled back; that path is governed by the summary shrink
-        # guard in _swap_in_pending_summary instead.
-        #
-        # The verdict itself runs in _finalize_compaction_with_stats, the
-        # single terminal choke point every escalation level returns through
-        # -- and BEFORE that method records stats or emits
-        # `context:compaction`, so a refused escalation never emits an event
-        # claiming a compaction that did not happen.
-        clear_at_least_required = self._clear_at_least_required(budget)
-        if clear_at_least_required > 0:
-            self._clear_at_least_pending = {
-                "required": clear_at_least_required,
-                "baseline_view": system_messages + list(working_messages),
-                "baseline_tokens": current_tokens,
-                "sticky": self._snapshot_sticky_decisions(),
-                "budget": budget,
-            }
 
         logger.info(
             f"Compacting context (new escalation): {old_count} raw messages, {old_tokens:,} raw tokens "
@@ -2955,13 +1354,6 @@ class SimpleContextManager:
             msg = messages[i]
             if msg.get("role") != "tool":  # Verify it's still a tool message
                 continue
-            if self._tool_result_is_exempt(msg):
-                # Skipped BEFORE _record_truncated so an exempt result is
-                # never marked truncated (which would inflate the reported
-                # truncation count and pin a permanent sticky decision that
-                # does nothing). No-op unless tool_result_exempt_tools is
-                # configured.
-                continue
             if not msg.get("_truncated"):
                 if true_total is None:
                     # First mutation in this call: establish the true baseline
@@ -3271,17 +1663,6 @@ class SimpleContextManager:
         # System messages were extracted before compaction and must be restored
         final_messages = system_messages + working_messages
 
-        # === WORTH-THE-REBUILD PREDICATE: the verdict ===
-        # Runs before ANY durable effect of this method (sticky level,
-        # stats, `context:compaction` event), so a refusal leaves no trace
-        # that a compaction occurred. Returns None -- and costs nothing but
-        # a None check -- while the predicate is disabled.
-        refused_view = await self._clear_at_least_verdict(
-            final_messages, max_level_reached
-        )
-        if refused_view is not None:
-            return refused_view
-
         final_tokens = self._estimate_tokens(final_messages)
         system_count = len(system_messages)
         tool_use_count = sum(1 for m in final_messages if m.get("tool_calls"))
@@ -3366,11 +1747,6 @@ class SimpleContextManager:
             "protected_recent": self.protected_recent,
             "protected_tool_results": self.protected_tool_results,
         }
-        if self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY:
-            # Only surfaced in "summary" mode -- keeps the default
-            # "progressive" mode's stats dict shape byte-identical to
-            # before this feature existed.
-            stats["messages_absorbed_by_summary"] = self._summary_absorbed_count
         self._last_compaction_stats = stats
 
         # Emit event if hooks available
@@ -3382,263 +1758,20 @@ class SimpleContextManager:
 
         return final_messages
 
-    # --- Tool-result budget / shape / spill helpers ---
-    #
-    # Every one of these is a no-op in the default configuration. See the
-    # module docstring "Tool-result budget and spill" for the measured
-    # rationale and the determinism constraint that shapes the spill design.
-
-    @staticmethod
-    def _validate_budget_tokens(value: Any) -> int | None:
-        """Coerce `tool_result_budget_tokens` to a positive int, or None.
-
-        None (the default) means "keep the pre-existing char budget".
-        Anything unusable logs a warning and becomes None -- i.e. falls back
-        to today's behavior rather than raising at mount time.
-        """
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, int) or value < 1:
-            logger.warning(
-                f"context-simple: tool_result_budget_tokens must be a positive "
-                f"int, got {value!r}; falling back to the truncate_chars "
-                f"char budget"
-            )
-            return None
-        return value
-
-    @staticmethod
-    def _validate_budget_by_tool(value: Any) -> dict[str, int]:
-        """Coerce `tool_result_budget_by_tool` to {tool_name: positive int}.
-
-        Unusable entries are dropped INDIVIDUALLY with a warning naming the
-        offending key, so one bad entry never silently discards the whole map
-        (and never crashes mount()).
-        """
-        if not value:
-            return {}
-        if not isinstance(value, dict):
-            logger.warning(
-                f"context-simple: tool_result_budget_by_tool must be a dict, "
-                f"got {type(value).__name__}; ignoring it"
-            )
-            return {}
-        cleaned: dict[str, int] = {}
-        for name, budget in value.items():
-            if (
-                isinstance(budget, bool)
-                or not isinstance(budget, int)
-                or budget < 1
-                or not str(name)
-            ):
-                logger.warning(
-                    f"context-simple: tool_result_budget_by_tool[{name!r}] must "
-                    f"be a positive int, got {budget!r}; dropping this entry"
-                )
-                continue
-            cleaned[str(name)] = budget
-        return cleaned
-
-    def _per_tool_config_active(self) -> bool:
-        """True when any knob needs a tool RESULT matched to a tool NAME."""
-        return bool(self.tool_result_budget_by_tool or self.tool_result_exempt_tools)
-
-    def _harvest_tool_names(self, message: dict[str, Any]) -> None:
-        """Record tool_call_id -> tool name from an assistant message.
-
-        A tool result carries only `tool_call_id`; the NAME lives on the
-        assistant message that requested the call. This harvests the mapping
-        incrementally as history is appended, so per-tool budget lookup is
-        O(1) and never rescans history. Handles both the OpenAI
-        (`{"id", "function": {"name"}}`) and Anthropic-ish
-        (`{"id", "name"}`) tool_call shapes -- the same two shapes
-        _format_messages_for_summarization already handles.
-
-        Called only when a per-tool knob is configured: in the default
-        configuration this never runs.
-        """
-        for tc in message.get("tool_calls") or []:
-            if not isinstance(tc, dict):
-                continue
-            call_id = tc.get("id") or tc.get("tool_call_id")
-            if "function" in tc and isinstance(tc["function"], dict):
-                name = tc["function"].get("name")
-            else:
-                name = tc.get("name") or tc.get("tool")
-            if call_id and name:
-                self._tool_name_by_call_id[str(call_id)] = str(name)
-
-    def _resolve_tool_name(self, msg: dict[str, Any]) -> str | None:
-        """Best-effort tool name for a tool RESULT message.
-
-        Three sources, in order of directness. Returning None simply means
-        no per-tool rule can apply to this message -- it falls through to the
-        global budget, which is the safe direction.
-        """
-        name = msg.get("name")
-        if isinstance(name, str) and name:
-            return name
-        meta_name = (msg.get("metadata") or {}).get("tool_name")
-        if isinstance(meta_name, str) and meta_name:
-            return meta_name
-        call_id = msg.get("tool_call_id")
-        if call_id:
-            return self._tool_name_by_call_id.get(str(call_id))
-        return None
-
-    def _tool_result_is_exempt(self, msg: dict[str, Any]) -> bool:
-        """True if this tool result must never be truncated."""
-        if not self.tool_result_exempt_tools:
-            return False
-        name = self._resolve_tool_name(msg)
-        return name is not None and name in self.tool_result_exempt_tools
-
-    def _resolve_tool_result_budget(self, msg: dict[str, Any]) -> tuple[int, str]:
-        """Return (budget_chars, shape) for one tool result.
-
-        Precedence: per-tool budget > global token budget > the pre-existing
-        `truncate_chars` char budget. The shape knob applies to whichever
-        budget won -- there is deliberately no per-tool shape, because a
-        per-tool budget with a global shape already covers every case the
-        reference implementations express, and a second per-tool map would
-        double the config surface for no measured gain.
-        """
-        budget_tokens: int | None = None
-        if self.tool_result_budget_by_tool:
-            name = self._resolve_tool_name(msg)
-            if name is not None:
-                budget_tokens = self.tool_result_budget_by_tool.get(name)
-        if budget_tokens is None:
-            budget_tokens = self.tool_result_budget_tokens
-        if budget_tokens is None:
-            # Nothing configured: the pre-existing char budget, head-only.
-            # This is the byte-identical default path.
-            return self.truncate_chars, TOOL_RESULT_SHAPE_HEAD
-        return budget_tokens * _TOOL_RESULT_CHARS_PER_TOKEN, self.tool_result_shape
-
-    def _spill_pointer(self, msg: dict[str, Any], content: str) -> str | None:
-        """Write the full result to the spill dir; return its path, or None.
-
-        DETERMINISM (load-bearing -- see module docstring): the returned path
-        is a pure function of `content` (+ the message's stable `_seq`) and
-        is returned REGARDLESS of whether the write succeeded. This method is
-        re-entered for every sticky-truncated message on every request; if
-        the pointer text tracked write success, one transient disk error
-        would change the bytes of an already-sent message and cold-rebuild
-        the prompt cache. A dangling pointer is visible and recoverable; a
-        silently mutated prefix is neither.
-
-        Content-addressing also makes the write idempotent across a resumed
-        or forked session: the same result always lands at the same path.
-        """
-        if not self.tool_result_spill_dir:
-            return None
-        digest = hashlib.sha256(content.encode("utf-8", errors="replace")).hexdigest()[
-            :16
-        ]
-        seq = self._extract_seq(msg)
-        stem = (
-            f"tool-result-{seq:06d}-{digest}"
-            if isinstance(seq, int)
-            else f"tool-result-{digest}"
-        )
-        path = Path(self.tool_result_spill_dir) / f"{stem}.txt"
-        path_str = str(path)
-        if path_str in self._spilled_paths:
-            return path_str
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            if not path.exists():
-                # Write-then-rename so a reader (the agent, via its file
-                # tools) can never observe a half-written spill file.
-                tmp = path.parent / f"{path.name}.{id(self):x}.tmp"
-                tmp.write_text(content, encoding="utf-8")
-                tmp.replace(path)
-            self._spilled_paths.add(path_str)
-        except Exception as e:
-            # Deliberately NOT fatal and deliberately NOT reflected in the
-            # returned pointer -- see the determinism note above.
-            logger.warning(
-                f"context-simple: could not spill tool result to {path_str}: {e}. "
-                f"The pointer is still emitted (byte-stability); the file may "
-                f"be missing."
-            )
-        return path_str
-
-    def _format_truncated_tool_result(
-        self,
-        content: str,
-        budget_chars: int,
-        shape: str,
-        original_tokens: int,
-        spill_path: str | None,
-    ) -> str:
-        """Build the replacement text for one over-budget tool result.
-
-        BYTE-IDENTITY CONTRACT: with `budget_chars == self.truncate_chars`,
-        `shape == "head"` and `spill_path is None` -- i.e. the default
-        configuration -- this returns EXACTLY the string this module has
-        always returned. tests/test_tool_result_budget.py pins that literally.
-        """
-        recovery = (
-            f"read {spill_path} for the full result"
-            if spill_path
-            else "call tool again if needed"
-        )
-        header = f"[truncated: ~{original_tokens:,} tokens - {recovery}]"
-
-        if shape != TOOL_RESULT_SHAPE_HEAD_TAIL:
-            return f"{header} {content[:budget_chars]}..."
-
-        # head_tail: split the budget in half, keep both ends, and say
-        # explicitly how much vanished in between. The marker matters as much
-        # as the tail does -- a model must never reason from a truncated
-        # result without knowing that it is truncated.
-        head_chars = budget_chars // 2
-        tail_chars = budget_chars - head_chars
-        # content[-0:] is the WHOLE string, not the empty one; guard it.
-        tail = content[-tail_chars:] if tail_chars else ""
-        omitted = len(content) - head_chars - tail_chars
-        return (
-            f"{header} {content[:head_chars]}"
-            f"\n...[{omitted:,} chars omitted]...\n"
-            f"{tail}"
-        )
-
     def _truncate_tool_result(self, msg: dict[str, Any]) -> dict[str, Any]:
         """
         Truncate a tool result message to reduce token count.
 
         Returns a NEW dict - does not modify the original.
-
-        Deterministic: called once per over-budget tool result during an
-        escalation, and again for every sticky-truncated message on every
-        subsequent request (_apply_sticky_decisions). Same input, same bytes,
-        every time -- that is what the returned view's prefix stability rests
-        on.
         """
         content = msg.get("content", "")
-        if not isinstance(content, str):
-            return msg
-        if self._tool_result_is_exempt(msg):
-            # No-op unless tool_result_exempt_tools is configured.
-            return msg
-
-        budget_chars, shape = self._resolve_tool_result_budget(msg)
-        # CHARS BEFORE LINES: the gate below is, and has always been, a pure
-        # character count. There is no line-based cap anywhere in this path,
-        # so the "a file could have 2 lines that are each 10MB" failure mode
-        # is structurally impossible here rather than merely unlikely.
-        if len(content) <= budget_chars:
+        if not isinstance(content, str) or len(content) <= self.truncate_chars:
             return msg
 
         original_tokens = len(content) // 4
-        spill_path = self._spill_pointer(msg, content)
         return {
             **msg,
-            "content": self._format_truncated_tool_result(
-                content, budget_chars, shape, original_tokens, spill_path
-            ),
+            "content": f"[truncated: ~{original_tokens:,} tokens - call tool again if needed] {content[: self.truncate_chars]}...",
             "_truncated": True,
             "_original_tokens": original_tokens,
         }
@@ -3758,982 +1891,6 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                 '- Some user messages may be stubbed as "[User message compacted...]"\n'
                 "- If context is critical, consider asking user to clarify their current goal"
             )
-
-    # ------------------------------------------------------------------
-    # Last-user replay (`replay_last_user_on_compaction: true`)
-    # ------------------------------------------------------------------
-    #
-    # Opt-in, default off, and a complete no-op when off: the ONLY call
-    # site is guarded by `if self.replay_last_user_on_compaction` inside
-    # the compaction branch of get_messages_for_request(), so in the
-    # default configuration none of the code below ever executes and the
-    # returned view is byte-identical to before this feature existed.
-
-    def _current_compaction_boundary(self) -> tuple[int, int]:
-        """Identity of the compaction boundary the view currently reflects.
-
-        A "boundary" is a real escalation of what has been shed, not a
-        request: the progressive ladder's cumulative sticky level, paired
-        with how many messages the summary strategy has absorbed. Both
-        are monotonic within a session and both already exist -- this
-        introduces no new state to keep in sync.
-
-        A request that merely re-applies existing sticky decisions leaves
-        both components unchanged, which is exactly what makes the replay
-        fire once per boundary instead of once per request.
-        """
-        return (self._sticky_level, self._summary_absorbed_count)
-
-    @staticmethod
-    def _replay_text(msg: dict[str, Any]) -> str:
-        """Plain text of a user message, for string and block-list content.
-
-        Returns "" when there is no text to replay (e.g. an image-only
-        block list), which the caller treats as "nothing to say, skip".
-        """
-        content = msg.get("content")
-        if isinstance(content, str):
-            return content
-        if isinstance(content, list):
-            parts = [
-                block["text"]
-                for block in content
-                if isinstance(block, dict) and isinstance(block.get("text"), str)
-            ]
-            return "\n".join(part for part in parts if part)
-        return ""
-
-    def _maybe_append_last_user_replay(
-        self, compacted: list[dict[str, Any]], budget: int
-    ) -> None:
-        """Append one reminder-wrapped copy of the most recent real user
-        message to the tail of `compacted`, in place, if all guards pass.
-
-        Guards, and why each exists:
-
-        1. ONCE PER BOUNDARY -- skip when this boundary's replay already
-           went out (see _current_compaction_boundary).
-        2. TOOL-PAIR ATOMICITY -- skip when the view ends on an assistant
-           message with unanswered tool_calls, for exactly the reason the
-           compaction notice does: a user-role message landing between a
-           tool_use and its tool_result is rejected or mishandled by
-           providers. Skipping is free; the boundary stays unmarked and
-           the replay goes out on the next request instead.
-        3. NOT ALREADY THE TAIL -- if the last real user message IS the
-           final item, a copy would be a pure duplicate that says nothing
-           the model cannot already see in the strongest position.
-        4. NOTHING TO SAY -- no real user message in view, or no text in
-           it.
-        5. NOT A STUB -- a Level-8 stub (`_stubbed`) is not the user's
-           words, it is a placeholder REPLACING them. The envelope below
-           calls its payload "a verbatim copy of your most recent
-           instruction"; emitting a stub under that sentence would make
-           the envelope lie. DEFENCE IN DEPTH, and deliberately so: this
-           branch is UNREACHABLE as of this commit, because the ladder
-           protects the last user message from stubbing at every level
-           (`i != last_user_idx` in _remove_messages_with_protection, and
-           `first_user_idx != last_user_idx` at Level 8). The guard exists
-           so this feature's honesty does not silently depend on a
-           protection rule enforced 600 lines away in code it does not
-           own. tests/test_replay_last_user.py exercises it directly
-           rather than pretending a natural fixture reaches it.
-        6. BUDGET -- compaction has just finished shedding tokens to hit
-           `budget`; a large pasted user message (a file, a log) could
-           push the request straight back over it. Skip rather than
-           overshoot what compaction just paid for.
-
-        Sourced from the COMPACTED VIEW, not from self.messages, on
-        purpose: the view is post-sticky-decision, so this can never
-        resurrect content compaction deliberately shed (e.g. a Level-8
-        stub of a first-and-only user message replays as the stub, not as
-        the original text it replaced).
-
-        Mutates only the caller's local view list. self.messages, `_seq`
-        allocation, and every sticky decision set are untouched.
-        """
-        boundary = self._current_compaction_boundary()
-        if boundary == self._last_replayed_boundary:
-            return
-
-        if not compacted or compacted[-1].get("tool_calls"):
-            return
-
-        source = next(
-            (msg for msg in reversed(compacted) if _is_real_user_message(msg)), None
-        )
-        if source is None or source is compacted[-1] or source.get("_stubbed"):
-            return
-
-        text = self._replay_text(source)
-        if not text.strip():
-            return
-
-        replay = {
-            "role": "user",
-            "content": (
-                f'<system-reminder source="{_REPLAY_ENVELOPE_SOURCE}">\n'
-                "This is a verbatim copy of your most recent instruction, "
-                "repeated here because context compaction has moved it far "
-                "from the end of the conversation. It is NOT a new request "
-                "-- do not answer it again if it is already handled.\n\n"
-                f"{text}\n"
-                "</system-reminder>"
-            ),
-            "metadata": {
-                "source": _REPLAY_ENVELOPE_SOURCE,
-                "ephemeral": True,
-            },
-        }
-
-        projected = self._estimate_tokens(compacted) + self._estimate_tokens([replay])
-        if budget > 0 and projected > budget:
-            logger.debug(
-                "Skipping last-user replay this request: it would put the "
-                f"view at ~{projected:,} tokens against a {budget:,} budget "
-                "that compaction just shed tokens to reach"
-            )
-            return
-
-        compacted.append(replay)
-        self._last_replayed_boundary = boundary
-        logger.debug(
-            f"Appended last-user replay at tail for compaction boundary {boundary}"
-        )
-
-    # ------------------------------------------------------------------
-    # Summary compaction strategy (`compaction_strategy: "summary"`)
-    # ------------------------------------------------------------------
-    #
-    # Opt-in alternative to the progressive truncate/remove ladder above.
-    # Lifts the IDEAS from amplifier-bundle-context-managed's rolling
-    # summarizer -- the structured 5-section prompt, the early-async-trigger
-    # design -- but rebuilds ALL plumbing on this module's own sticky/_seq
-    # primitives instead of that donor module's index-based splice-and-swap:
-    #
-    #   - absorbed messages are recorded via _record_removed(), the SAME
-    #     mechanism progressive Levels 3/5/7/8 already use, so
-    #     _apply_sticky_decisions() replays the absorption byte-identically
-    #     on every subsequent call. Candidates are keyed by each message's
-    #     permanent `_seq`, never by list index/offset, so there is no
-    #     "stale boundary" class of bug here at all -- contrast the donor's
-    #     `offset_at_creation` drift-guard, which existed only because ITS
-    #     design tracked absolute indices in the first place.
-    #   - the summary itself is stamped with a fresh `_seq` exactly like
-    #     add_message() would (see _make_summary_message), and is APPENDED
-    #     to self.messages -- never spliced in -- so self.messages remains
-    #     a strict, append-only log and this module's "compaction never
-    #     modifies self.messages" invariant is never violated.
-    #   - the summary is role="user" (never "system"), wrapped in a
-    #     <system-reminder source="context-summary"> envelope, and is
-    #     NOT marked ephemeral -- it is meant to persist as stable history,
-    #     unlike the (ephemeral, tail-only) compaction notice above. A
-    #     role="system" summary tier is what measurably busted the donor's
-    #     own provider-level system-prompt cache breakpoint (see README
-    #     "Summary compaction strategy" for the measured numbers); this fix
-    #     is non-negotiable, not cosmetic.
-    #   - the absorb boundary is snapped (_snap_absorb_boundary) so an
-    #     assistant tool_calls message and every one of its tool results
-    #     are absorbed together or not at all -- reusing the same
-    #     tool_call_id identity fields _check_tool_pair_removable already
-    #     keys on, not the donor's adjacent-index-only heuristic (the exact
-    #     gap that let the donor split a live call/result pair in practice).
-
-    def _get_summarization_prompt(self) -> str:
-        """Return the summarization prompt.
-
-        Reads from `summarization_prompt_path` if configured and the file
-        exists, mirroring the donor's own file-override knob. Falls back to
-        DEFAULT_SUMMARIZATION_PROMPT on any OSError, logging a warning --
-        never raises.
-        """
-        if self.summarization_prompt_path:
-            try:
-                return Path(self.summarization_prompt_path).read_text()
-            except OSError as e:
-                logger.warning(
-                    f"context-simple: could not read summarization_prompt_path "
-                    f"{self.summarization_prompt_path!r}: {e}; falling back to "
-                    "the built-in DEFAULT_SUMMARIZATION_PROMPT"
-                )
-        return DEFAULT_SUMMARIZATION_PROMPT
-
-    def _format_messages_for_summarization(
-        self, messages: list[dict[str, Any]]
-    ) -> str:
-        """Format messages into the plain-text transcript the summarizer
-        reads. Each message becomes '[role]: content'; tool results are
-        linked back to their call via '[tool_result for {tool_call_id}]:
-        ...'; tool_calls are rendered as '[tool_call: name(args)]' with
-        arguments truncated to 500 chars. Adapted from the donor's
-        `_format_messages_for_summarization`.
-        """
-        lines: list[str] = []
-        for msg in messages:
-            role = msg.get("role", "unknown")
-            content = msg.get("content", "")
-            if isinstance(content, list):
-                parts = []
-                for block in content:
-                    if isinstance(block, dict):
-                        text = block.get("text", "")
-                        if text:
-                            parts.append(text)
-                    elif hasattr(block, "text"):
-                        parts.append(block.text)
-                content = "\n".join(parts)
-
-            if role == "tool":
-                tc_id = msg.get("tool_call_id", "")
-                line = f"[tool_result for {tc_id}]: {content}"
-            else:
-                line = f"[{role}]: {content}"
-
-            extra_lines: list[str] = []
-            for tc in msg.get("tool_calls") or []:
-                if not isinstance(tc, dict):
-                    continue
-                if "function" in tc:
-                    name = tc["function"].get("name", "unknown_tool")
-                    raw_args = tc["function"].get("arguments", "{}")
-                else:
-                    name = tc.get("name") or tc.get("tool", "unknown_tool")
-                    raw_args = tc.get("input") or tc.get("arguments") or {}
-                if isinstance(raw_args, str):
-                    arg_str = raw_args
-                else:
-                    arg_str = json.dumps(raw_args, separators=(",", ":"))
-                if len(arg_str) > 500:
-                    arg_str = arg_str[:500] + "..."
-                extra_lines.append(f"  [tool_call: {name}({arg_str})]")
-
-            lines.append("\n".join([line, *extra_lines]) if extra_lines else line)
-
-        return "\n\n".join(lines)
-
-    def _extract_text_from_response(self, response: Any) -> str:
-        """Join every text-bearing content block in a ChatResponse. Blocks
-        without a `.text` attribute (tool calls, thinking, etc.) are
-        silently skipped."""
-        parts = []
-        for block in getattr(response, "content", None) or []:
-            text = getattr(block, "text", None)
-            if text:
-                parts.append(text)
-        return "".join(parts)
-
-    async def _maybe_trigger_summary_compaction(
-        self, token_count: int, effective_budget: int
-    ) -> None:
-        """Start an async background summarization call if usage has
-        crossed `summary_trigger` and nothing is already in flight/pending.
-
-        Mirrors the donor's early-trigger design (default 0.60, well ahead
-        of compact_threshold) so the LLM call has time to finish before
-        tokens must actually be shed -- see _swap_in_pending_summary, which
-        performs the actual absorption once this completes. Never raises,
-        never blocks this turn: the provider call itself happens inside an
-        asyncio.create_task, off the critical path.
-        """
-        if self._is_summarizing or self._pending_summary is not None:
-            return
-        if self._cached_provider is None:
-            logger.debug(
-                "context-simple: skipping summary trigger -- no cached "
-                "provider yet (first get_messages_for_request() of the "
-                "session hasn't run, or the caller never passes one)"
-            )
-            return
-        if effective_budget <= 0:
-            return
-
-        usage_fraction = token_count / effective_budget
-        if usage_fraction < self.summary_trigger:
-            return
-
-        target_tokens = int(effective_budget * self.target_usage)
-        if token_count <= target_tokens:
-            return
-        excess_tokens = token_count - target_tokens
-
-        seqs = self._select_summary_absorb_seqs(excess_tokens)
-        if not seqs:
-            logger.debug(
-                "context-simple: summary trigger fired but nothing eligible "
-                "to absorb yet (too little non-protected history)"
-            )
-            return
-
-        # Snapshot the fork prefix HERE, synchronously, rather than letting
-        # the background task read it whenever it happens to be scheduled.
-        # `_last_request_view` is rewritten on every request; a task that
-        # read it later would append to a prefix chosen by scheduling order.
-        # Capturing at trigger time makes the forked request a pure function
-        # of this moment -- deterministic, and therefore testable. None in
-        # every configuration but fork.
-        fork_prefix = self._capture_fork_prefix()
-
-        self._is_summarizing = True
-        self._summarization_task = asyncio.create_task(
-            self._run_summary_compaction_task(seqs, fork_prefix=fork_prefix)
-        )
-
-    def _select_summary_absorb_seqs(self, excess_tokens: int) -> list[int] | None:
-        """Select a prefix of the oldest, still-live, non-protected,
-        non-system messages to summarize, sized to shed roughly
-        `excess_tokens`, snapped so a tool_calls/tool-result pair is never
-        split (_snap_absorb_boundary). Returns the ordered list of `_seq`
-        ids to absorb, or None if nothing qualifies.
-
-        Excludes: system messages (never compacted, handled separately),
-        messages already absorbed/removed by a prior escalation, and this
-        module's own past summary messages (never re-summarized -- each
-        escalation produces its own standalone summary; see module
-        docstring for why this PR does not implement tier merging).
-        """
-        live = [
-            m
-            for m in self.messages
-            if m.get("role") != "system"
-            and self._extract_seq(m) not in self._removed_seqs
-            and (m.get("metadata") or {}).get("type") != _SUMMARY_METADATA_TYPE
-        ]
-        if not live:
-            return None
-
-        last_user_idx = None
-        for i, m in enumerate(live):
-            if m.get("role") == "user":
-                last_user_idx = i
-
-        protected_boundary = int(len(live) * (1 - self.protected_recent))
-        if last_user_idx is not None:
-            protected_boundary = min(protected_boundary, last_user_idx)
-        if protected_boundary <= 0:
-            return None
-
-        accumulated = 0
-        end_idx = 0
-        for i in range(protected_boundary):
-            accumulated += len(str(live[i])) // 4
-            end_idx = i + 1
-            if accumulated >= excess_tokens:
-                break
-
-        end_idx = self._snap_absorb_boundary(live, end_idx, protected_boundary)
-        if end_idx <= 0:
-            return None
-
-        seqs = [self._extract_seq(m) for m in live[:end_idx]]
-        return [s for s in seqs if s is not None] or None
-
-    def _snap_absorb_boundary(
-        self,
-        live: list[dict[str, Any]],
-        end_idx: int,
-        protected_boundary: int,
-    ) -> int:
-        """Adjust `end_idx` (an exclusive boundary into `live`) so an
-        assistant tool_calls message and every one of its tool results are
-        absorbed together, or not absorbed at all -- and so the boundary
-        never crosses into the protected tail (index >= protected_boundary).
-
-        Reuses the same identity fields _check_tool_pair_removable keys on
-        (`tool_calls[].id` / `tool_call_id`), applied to a single
-        contiguous prefix boundary instead of scattered removal candidates.
-        This is the fix for the donor's exact production failure: its
-        `_snap_to_tool_pair_boundary` only checked whether the immediately
-        NEXT message had role "tool" -- an adjacency heuristic that misses
-        non-adjacent results and does no protected-boundary accounting at
-        all, which is how it shipped dropping a `function_call` while
-        keeping its `function_call_output` (InvalidRequestError, see
-        README "Summary compaction strategy").
-        """
-        if end_idx <= 0:
-            return 0
-
-        id_map: dict[str, list[int]] = {}
-        for idx, msg in enumerate(live):
-            tcid = msg.get("tool_call_id")
-            if tcid:
-                id_map.setdefault(tcid, []).append(idx)
-
-        def result_indices(assistant_msg: dict[str, Any]) -> list[int]:
-            idxs: list[int] = []
-            for tc in assistant_msg.get("tool_calls") or []:
-                tc_id = tc.get("id") or tc.get("tool_call_id")
-                if tc_id:
-                    idxs.extend(id_map.get(tc_id, []))
-            return idxs
-
-        # Bounded fixed-point: each iteration either grows end_idx (capped
-        # at protected_boundary) or shrinks it to exclude exactly one
-        # unabsorbable call -- never both for the same call twice -- so
-        # this always terminates within len(live) iterations.
-        for _ in range(len(live) + 1):
-            max_needed = end_idx
-            overflow_call_idx: int | None = None
-            for i in range(end_idx):
-                msg = live[i]
-                if msg.get("role") == "assistant" and msg.get("tool_calls"):
-                    for k in result_indices(msg):
-                        if k >= max_needed:
-                            max_needed = k + 1
-                        if k >= protected_boundary and overflow_call_idx is None:
-                            overflow_call_idx = i
-            if max_needed <= protected_boundary:
-                return max_needed
-            # Can't extend past the protected tail without splitting a
-            # pair -- drop the first offending call (and, transitively,
-            # everything after it in this round) rather than ever crossing
-            # the boundary or absorbing a call without its result.
-            end_idx = overflow_call_idx if overflow_call_idx is not None else 0
-            if end_idx <= 0:
-                return 0
-        return 0  # defensive; unreachable given the termination argument above
-
-    # --- Cache-safe fork of the summarizer call (summary_call_mode) --------
-    #
-    # Everything from here to _run_summary_compaction_task is inert unless
-    # BOTH compaction_strategy == "summary" AND summary_call_mode == "fork".
-    # The default path never calls any of it (see _build_summary_request's
-    # first branch), which is what makes "default is byte-identical" a
-    # structural property rather than a claim.
-
-    def _fork_armed(self) -> bool:
-        """True only when a forked summarizer call is actually configured."""
-        return (
-            self.compaction_strategy == COMPACTION_STRATEGY_SUMMARY
-            and self.summary_call_mode == SUMMARY_CALL_MODE_FORK
-        )
-
-    def _capture_fork_prefix(self) -> list[dict[str, Any]] | None:
-        """Snapshot the message array a forked call would append to.
-
-        Uses the caller's own `note_request_sent(messages=...)` record when
-        there is one -- byte-parity with the wire, including any tail the
-        orchestrator injected after this module returned. Only when the
-        caller has never supplied a message array does this fall back to
-        the module's own last returned view, which is where an
-        explicit-breakpoint provider places its cache breakpoint.
-
-        WHY THERE IS NO SILENT DOWNGRADE BETWEEN THE TWO (the bug this
-        replaced): the previous implementation preferred the wire record
-        only while `_sent_serial == _view_serial`, and substituted
-        `_last_request_view` whenever that equality failed. That equality
-        asks "have any views been served since the caller last confirmed a
-        send?" -- which conflates two situations a view counter cannot tell
-        apart, and gets the important one backwards.
-
-        A real orchestrator serves the view MORE THAN ONCE per sent request
-        (amplifier's loop-streaming re-fetches after persisting an ephemeral
-        injection -- `get_messages_for_request()` at three separate call
-        sites in one iteration). The summary trigger is evaluated inside
-        EVERY one of those calls. On the second and third, the serials no
-        longer match, and the old code swapped the caller's genuine wire
-        array for `_last_request_view` -- which at that instant holds a view
-        that was built, superseded by the re-fetch, and NEVER SENT.
-
-        Measured on the wire (model_performance-6da, 20 forked calls):
-        9 appended to a request the provider actually saw; the other 11
-        appended to an array that was never sent as any request. The
-        substitution was invisible from outside -- `mode_used` reported
-        "fork" either way.
-
-        The asymmetry that settles it: the wire record is the only source
-        carrying positive evidence that it was ever on the wire, so it is
-        never traded for one that carries none. Staleness in the wire record
-        is still caught, but by an EXACT check rather than a proxy: a record
-        too old to contain the span being absorbed fails
-        `_prefix_contains_span` and refuses LOUDLY (standalone + warning +
-        counter), which is the outcome a fork that cannot be byte-aligned is
-        supposed to have.
-        """
-        if not self._fork_armed():
-            return None
-        if self._sent_messages is not None:
-            self._fork_prefix_source = FORK_PREFIX_SOURCE_WIRE
-            if self._sent_serial != self._view_serial:
-                # Not an error, and deliberately not a substitution: the
-                # caller has served extra views since confirming this send
-                # (a re-fetch, or a view that was never sent at all). The
-                # last CONFIRMED array is still the best-evidenced prefix.
-                logger.debug(
-                    "context-simple: fork prefix is the caller's recorded "
-                    f"wire array from view {self._sent_serial} (now at view "
-                    f"{self._view_serial}); {self._view_serial - (self._sent_serial or 0)} "
-                    "view(s) have been served since it was confirmed sent, "
-                    "which is normal for an orchestrator that re-fetches the "
-                    "view within a single request"
-                )
-            return list(self._sent_messages)
-        if self._last_request_view is not None:
-            self._fork_prefix_source = FORK_PREFIX_SOURCE_VIEW
-            return list(self._last_request_view)
-        self._fork_prefix_source = None
-        return None
-
-    @staticmethod
-    def _message_identity(msg: dict[str, Any]) -> tuple[str, str, str]:
-        """A content-level identity for a message, used only to check span
-        presence when the prefix came from a caller and therefore had its
-        internal `_seq` already stripped."""
-        return (
-            str(msg.get("role", "")),
-            str(msg.get("content", "")),
-            str(msg.get("tool_call_id", "")),
-        )
-
-    def _prefix_contains_span(
-        self, prefix: list[dict[str, Any]], span: list[dict[str, Any]]
-    ) -> bool:
-        """Is every message of the span actually present in the prefix?
-
-        A fork does NOT re-send the span -- the whole point is that the span
-        is already inside the prefix being appended to. If it is not (a
-        compaction removed it between the last request and this trigger),
-        the forked call would be asking the model to summarize text it
-        cannot see. Checked by `_seq` when the prefix carries them, and by
-        content identity when it came from a caller (post-strip).
-        """
-        prefix_seqs = {self._extract_seq(m) for m in prefix} - {None}
-        span_seqs = {self._extract_seq(m) for m in span} - {None}
-        if span_seqs and span_seqs <= prefix_seqs:
-            return True
-        present = {self._message_identity(m) for m in prefix}
-        return all(self._message_identity(m) in present for m in span)
-
-    def _fork_refusal_reason(
-        self,
-        messages_to_summarize: list[dict[str, Any]],
-        fork_prefix: list[dict[str, Any]] | None,
-    ) -> str | None:
-        """Why this summarization CANNOT be forked, or None if it can.
-
-        Every branch here is a case where the forked request would not be a
-        true append onto the parent's cached prefix. A fork that misses pays
-        for the entire conversation as fresh input -- strictly worse than
-        the standalone call it replaces -- so each of these falls back
-        rather than half-forking.
-        """
-        if not self._sent_tools_supplied:
-            return (
-                "note_request_sent() has never been called, so the tool specs "
-                "the parent sent are unknown; tool specs are serialized ahead "
-                "of the system block, so a fork without them is not an append "
-                "onto the cached prefix at all"
-            )
-        if self.summarization_model:
-            return (
-                f"summarization_model={self.summarization_model!r} points the "
-                "summarizer at a different model than the main line, which "
-                "reads none of the cache the main line wrote"
-            )
-        if not fork_prefix:
-            return (
-                "no request has been recorded yet, so there is no prefix to "
-                "append to"
-            )
-        if fork_prefix[-1].get("tool_calls"):
-            return (
-                "the prefix ends on an assistant turn with unanswered "
-                "tool_calls; appending a user message there would interleave "
-                "between tool_use and tool_result"
-            )
-        if not self._prefix_contains_span(fork_prefix, messages_to_summarize):
-            return (
-                "the span selected for absorption is not present in the "
-                "recorded prefix, so a forked call could not see the text it "
-                "was asked to summarize"
-            )
-        return None
-
-    def _note_fork_fallback(self, reason: str) -> None:
-        """Record and (once per distinct reason) announce a refused fork.
-
-        WARNING level and counted, never silent: a fork that quietly did not
-        happen is the exact failure mode that makes this treatment look like
-        it does not work. Once per reason, not once per call, so a session
-        that can never fork logs a handful of lines instead of hundreds.
-        """
-        self._summary_fork_fallbacks += 1
-        if reason in self._fork_warned:
-            logger.debug(f"context-simple: summarizer fork refused again ({reason})")
-            return
-        self._fork_warned.add(reason)
-        logger.warning(
-            f"context-simple: summary_call_mode='fork' requested but this "
-            f"summarization ran STANDALONE instead -- {reason}. The standalone "
-            "call is correct and costs what it always did; no cache reuse was "
-            "attempted. This is logged once per distinct reason."
-        )
-
-    def _span_boundary_excerpt(self, msg: dict[str, Any]) -> str:
-        """A short verbatim excerpt of the span's final message, used as the
-        'summarize up to HERE' marker in the fork instruction."""
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            parts: list[str] = []
-            for block in content:
-                if isinstance(block, dict):
-                    text = block.get("text", "")
-                    if text:
-                        parts.append(str(text))
-                elif hasattr(block, "text"):
-                    parts.append(str(block.text))
-            content = "\n".join(parts)
-        text = str(content).strip()
-        if not text:
-            # A tool_calls-only assistant turn has no text of its own; name
-            # the tools instead of emitting an empty, useless marker.
-            names = [
-                str(tc.get("name") or tc.get("tool") or "")
-                for tc in (msg.get("tool_calls") or [])
-                if isinstance(tc, dict)
-            ]
-            names = [n for n in names if n]
-            text = (
-                f"[{msg.get('role', 'unknown')} turn calling: {', '.join(names)}]"
-                if names
-                else f"[{msg.get('role', 'unknown')} turn with no text content]"
-            )
-        if len(text) > _FORK_BOUNDARY_EXCERPT_CHARS:
-            text = text[:_FORK_BOUNDARY_EXCERPT_CHARS] + "..."
-        return text
-
-    def _format_fork_instruction(
-        self, messages_to_summarize: list[dict[str, Any]], prompt: str
-    ) -> str:
-        """The single user message a forked call appends.
-
-        Carries the summarization prompt (which in standalone mode is a
-        `role: "system"` message -- see module docstring for why a fork must
-        NOT add one) plus explicit scoping, because a fork does not re-send
-        the span: the model reads it from the prefix it is already holding,
-        so the instruction has to say which part of that prefix to
-        summarize. This is a REAL difference from standalone, which scopes
-        by construction: standalone can only see the span, a fork can see
-        everything and is asked to attend to the span.
-        """
-        n = len(messages_to_summarize)
-        excerpt = self._span_boundary_excerpt(messages_to_summarize[-1])
-        return (
-            f"{prompt}\n\n"
-            "SCOPE OF THIS SUMMARY. Summarize ONLY the OLDEST part of the "
-            f"conversation above: the first {n} message(s) following the "
-            "system prompt -- the span about to be retired from context to "
-            "make room. That span ENDS with the message excerpted below. Do "
-            "not summarize anything after it, and do not describe this "
-            "instruction.\n\n"
-            "--- final message of the span (verbatim excerpt) ---\n"
-            f"{excerpt}\n"
-            "--- end excerpt ---"
-        )
-
-    def _build_summary_request(
-        self,
-        messages_to_summarize: list[dict[str, Any]],
-        fork_prefix: list[dict[str, Any]] | None,
-    ) -> tuple[Any, str, str | None]:
-        """Build the summarizer's ChatRequest.
-
-        Returns (request, mode_actually_used, fallback_reason_or_None). The
-        standalone branch below is verbatim the pre-existing call and is the
-        ONLY branch reachable unless fork mode is both configured and
-        satisfiable.
-        """
-        from amplifier_core import ChatRequest, Message
-
-        prompt = self._get_summarization_prompt()
-        reason: str | None = None
-
-        if self._fork_armed():
-            reason = self._fork_refusal_reason(messages_to_summarize, fork_prefix)
-            if reason is None:
-                try:
-                    assert fork_prefix is not None  # guaranteed by the check above
-                    return (
-                        self._build_fork_request(
-                            messages_to_summarize, fork_prefix, prompt
-                        ),
-                        SUMMARY_CALL_MODE_FORK,
-                        None,
-                    )
-                except Exception as e:
-                    # A prefix message this module never created (unexpected
-                    # content shape from a caller, say) can fail Message
-                    # validation. Falling back keeps the summary happening at
-                    # today's cost instead of turning a cache optimization
-                    # into a lost summary.
-                    reason = f"the forked request could not be built ({e!r})"
-            self._note_fork_fallback(reason)
-
-        formatted = self._format_messages_for_summarization(messages_to_summarize)
-        request = ChatRequest(
-            messages=[
-                Message(role="system", content=prompt),
-                Message(role="user", content=formatted),
-            ],
-            model=self.summarization_model,
-        )
-        return request, SUMMARY_CALL_MODE_STANDALONE, reason
-
-    def _build_fork_request(
-        self,
-        messages_to_summarize: list[dict[str, Any]],
-        fork_prefix: list[dict[str, Any]],
-        prompt: str,
-    ) -> Any:
-        """The forked request: the parent's prefix, then ONE appended user
-        message. Nothing else -- no extra system message, no re-sent span,
-        no reordering.
-
-        Deliberately calls `_strip_internal_metadata` and NOT
-        `_finalize_view`: the latter also rewrites `_last_sent_estimate`,
-        the hybrid meter's conservatism comparand, which describes the view
-        the MAIN line sent. A summarizer call must not move it.
-        """
-        from amplifier_core import ChatRequest, Message
-
-        prefix_view = self._strip_internal_metadata(fork_prefix)
-        messages = [Message(**msg) for msg in prefix_view]
-        messages.append(
-            Message(
-                role="user",
-                content=self._format_fork_instruction(messages_to_summarize, prompt),
-            )
-        )
-        return ChatRequest(
-            messages=messages,
-            tools=self._sent_tools,
-            model=self._sent_model,
-        )
-
-    async def _run_summary_compaction_task(
-        self, seqs: list[int], fork_prefix: list[dict[str, Any]] | None = None
-    ) -> None:
-        """Background task: call the summarizer over the message span
-        identified by `seqs` and stash the result in `_pending_summary` for
-        the next get_messages_for_request()/_compact_ephemeral() call to
-        swap in (_swap_in_pending_summary).
-
-        Never raises: any failure (bad/absent provider, timeout, malformed
-        response, empty summary) increments `_summarization_failures`,
-        logs a warning, and leaves `_pending_summary` unset -- the next
-        compaction pass that needs to shed tokens falls back to the
-        progressive ladder for that pass, exactly as if
-        compaction_strategy were "progressive". Always clears
-        `_is_summarizing`/`_summarization_task` in a finally block so a
-        failed round never permanently wedges future triggers.
-        """
-        try:
-            seq_set = set(seqs)
-            messages_to_summarize = [
-                m for m in self.messages if self._extract_seq(m) in seq_set
-            ]
-            if not messages_to_summarize:
-                return
-
-            provider = self._cached_provider
-            if provider is None:
-                raise RuntimeError("no cached provider available for summary compaction")
-
-            request, call_mode, fallback_reason = self._build_summary_request(
-                messages_to_summarize, fork_prefix
-            )
-            self._last_summary_call = {
-                "mode_requested": self.summary_call_mode,
-                "mode_used": call_mode,
-                "reason": fallback_reason,
-                "prefix_messages": (
-                    len(request.messages) - 1
-                    if call_mode == SUMMARY_CALL_MODE_FORK
-                    else 0
-                ),
-                # WHICH array the fork appended to, from the module's own
-                # report rather than reconstructed from the wire. Only one
-                # of the two sources is evidenced as having been sent (see
-                # FORK_PREFIX_SOURCE_*), so a measurement that cannot see
-                # this field cannot tell a byte-aligned fork from a fork
-                # onto a view the provider never received.
-                "prefix_source": (
-                    self._fork_prefix_source
-                    if call_mode == SUMMARY_CALL_MODE_FORK
-                    else None
-                ),
-                # How many views were served since the caller last confirmed
-                # a send. >0 is normal (an orchestrator may re-fetch the view
-                # within one request); it is reported, not acted on.
-                "prefix_views_since_send": (
-                    self._view_serial - self._sent_serial
-                    if self._sent_serial is not None
-                    else None
-                ),
-                "fork_fallbacks": self._summary_fork_fallbacks,
-            }
-
-            if self._hooks is not None:
-                try:
-                    await self._hooks.emit(
-                        "context:pre_summarize",
-                        {
-                            "message_count": len(messages_to_summarize),
-                            "call_mode": call_mode,
-                        },
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not emit context:pre_summarize: {e}")
-
-            response = await asyncio.wait_for(
-                provider.complete(request), timeout=self.summarization_timeout_s
-            )
-            summary_text = self._extract_text_from_response(response)
-            if not summary_text.strip():
-                raise ValueError("summarizer returned empty text")
-
-            self._pending_summary = {"seqs": frozenset(seqs), "text": summary_text}
-            self._summarization_failures = 0
-
-            if self._hooks is not None:
-                try:
-                    await self._hooks.emit(
-                        "context:post_summarize",
-                        {
-                            "summary_length": len(summary_text),
-                            "call_mode": call_mode,
-                        },
-                    )
-                except Exception as e:
-                    logger.warning(f"Could not emit context:post_summarize: {e}")
-        except Exception as e:
-            self._summarization_failures += 1
-            logger.warning(
-                f"context-simple: summary compaction failed ({e!r}); falling "
-                "back to progressive compaction for the next pass that needs "
-                "to shed tokens"
-            )
-        finally:
-            self._is_summarizing = False
-            self._summarization_task = None
-
-    def _make_summary_message(self, summary_text: str) -> dict[str, Any]:
-        """Build the persisted summary message: role="user" (never
-        "system" -- see module docstring), wrapped in a
-        <system-reminder source="context-summary"> envelope so
-        foundation's is_real_user_message() classifies it correctly, and
-        stamped with a fresh `_seq` exactly like add_message() would.
-
-        NOT marked metadata.ephemeral=True: unlike the tail compaction
-        notice, this message is meant to persist as stable history.
-        """
-        content = (
-            f'<system-reminder source="{_SUMMARY_ENVELOPE_SOURCE}">\n'
-            f"{summary_text}\n"
-            "</system-reminder>"
-        )
-        message: dict[str, Any] = {
-            "role": "user",
-            "content": content,
-            "metadata": {
-                "timestamp": datetime.now(UTC).isoformat(timespec="milliseconds"),
-                "type": _SUMMARY_METADATA_TYPE,
-                "_seq": self._next_seq,
-            },
-        }
-        self._next_seq += 1
-        return message
-
-    async def _swap_in_pending_summary(
-        self, non_system_messages: list[dict[str, Any]]
-    ) -> tuple[list[dict[str, Any]], bool]:
-        """Absorb a completed pending summary, if it is still valid.
-
-        Validity is checked purely by `_seq` membership -- every captured
-        seq must still be present in `non_system_messages` and not already
-        removed by an intervening escalation. There is no index/offset
-        arithmetic here, so there is no "stale boundary" bug to guard
-        against beyond this membership check; if the whole span was
-        already resolved (e.g. an emergency progressive escalation ran in
-        between), the summary is discarded gracefully -- NOT counted as a
-        failure -- and the caller falls back to progressive compaction for
-        this pass, same as if none had been pending.
-
-        Never hand-splices self.messages: absorbed messages are recorded
-        via _record_removed() (the existing sticky-decision path), and the
-        summary message is APPENDED to self.messages, never inserted at an
-        arbitrary position.
-
-        Returns (possibly-updated non_system_messages, did_swap).
-        """
-        pending = self._pending_summary
-        self._pending_summary = None
-
-        present_seqs = {self._extract_seq(m) for m in non_system_messages}
-        absorb_seqs = {
-            s
-            for s in pending["seqs"]
-            if s in present_seqs and s not in self._removed_seqs
-        }
-        if not absorb_seqs:
-            logger.info(
-                "context-simple: discarding stale pending summary -- its "
-                "absorbed span was already resolved by an earlier escalation"
-            )
-            return non_system_messages, False
-
-        absorbed_messages = [
-            msg for msg in non_system_messages if self._extract_seq(msg) in absorb_seqs
-        ]
-        summary_message = self._make_summary_message(pending["text"])
-
-        # === SHRINK GUARD (deepseek-harness compaction-basic, region.ts) ===
-        #
-        # Refuse a summary that is not SMALLER than the span it replaces. Such
-        # a swap is a pure loss twice over: it pays a full cold prompt-cache
-        # rebuild (any shrink or edit invalidates the cached prefix) AND ends
-        # up with a bigger request than it started with -- a silent cost
-        # regression with no upside whatsoever. Nothing in this module
-        # previously checked it; a terse span plus a verbose 5-section summary
-        # is entirely capable of growing.
-        #
-        # Both sides are measured as full message dicts through the same
-        # `_estimate_tokens` the rest of the ladder uses, so the comparison is
-        # apples-to-apples (metadata overhead counted on both sides).
-        #
-        # There is no config knob for this: there is no defensible reason to
-        # want a summary that makes the context bigger. On refusal the pending
-        # summary is DISCARDED and this pass falls back to progressive
-        # compaction -- exactly the graceful path a stale summary already
-        # takes, not a failure.
-        #
-        # `_make_summary_message` has already consumed a `_seq` for the message
-        # being discarded. That gap is deliberately left rather than rewound:
-        # sequence ids need only be unique and monotonic (see
-        # _apply_sticky_decisions / _hybrid_split), and rewinding a shared
-        # counter is a worse hazard than an unused number.
-        absorbed_tokens = self._estimate_tokens(absorbed_messages)
-        summary_tokens = self._estimate_tokens([summary_message])
-        if summary_tokens >= absorbed_tokens:
-            logger.warning(
-                f"context-simple: REFUSING summary swap -- the summary is "
-                f"{summary_tokens:,} tokens against the {absorbed_tokens:,} tokens "
-                f"of the {len(absorbed_messages)} messages it would replace, so it "
-                f"would GROW the context while still paying a full prompt-cache "
-                f"rebuild. Discarding it; falling back to progressive compaction "
-                f"for this pass."
-            )
-            return non_system_messages, False
-
-        for msg in absorbed_messages:
-            self._record_removed(msg)
-
-        self.messages.append(summary_message)
-        self._summary_absorbed_count += len(absorb_seqs)
-
-        logger.info(
-            f"context-simple: summary compaction absorbed {len(absorb_seqs)} "
-            "messages into 1 stable summary message"
-        )
-        return non_system_messages + [summary_message], True
 
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
         """Calculate effective token budget from provider or fallback to config.
