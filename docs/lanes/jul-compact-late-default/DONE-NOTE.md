@@ -52,6 +52,47 @@ a **consequence** concern, not a **classification** one. Handled inside C instea
 2. **The durable work is on the branch and merge-ready**, not held hostage to the
    classification.
 
+### The residual ambiguity, stated honestly — A vs C
+
+C is **one of the three** branches, so terminating here is in-contract, not outside it. But
+the A-vs-C call is genuinely ambiguous and this note should not pretend otherwise. The
+strongest case for **A**, which an owner may prefer:
+
+- Branch **B resolves with a deliverable recorded NOT-POSSIBLE**. That proves A's phrase
+  "the deliverables below exist" cannot mean "all six were built" — otherwise B would be
+  impossible too. The DELIVERABLES header says each resolves *independently* to
+  **DONE / NOT-POSSIBLE-with-reason**, and all six here have a recorded disposition.
+- Branch **C's enumerated causes are all external obstructions** — "a missing prerequisite,
+  a refused claim, a broken dependency, a defect in another component." None applies. Nothing
+  obstructed this lane; it ran to completion and returned a decisive result.
+- **C's remedy is structurally wrong for a falsified premise.** `work_release` hands an item
+  back for someone else to unblock. No actor can unblock this one — the specification itself
+  is falsified — so release abandons a completed investigation into a queue.
+
+The strongest case for **C**, which is why this lane sits here:
+
+- B is carved out specifically for *cap-bound* NOT-POSSIBLE. By construction that reads as:
+  non-cap unreachability → C. This outcome is non-cap unreachable.
+
+**Both readings are defensible. This lane will not re-decide again**, and that is deliberate:
+GOAL.md's own anti-churn rule names lane 1ru, which moved BLOCKED → REJECT → BLOCKED "under
+an ambiguous goal with its measurement never changing", and warns that "that churn was
+produced entirely by the goal text." This lane has already moved three times on **zero** new
+evidence — the measurement has never changed across any revision. A fourth move would make
+this lane a second instance of the defect it is documenting.
+
+**If the owner reads A's conjunction the other way, the flip is two calls and no rework** —
+every artifact is already written and the resolution text is preserved verbatim in this
+note's git history:
+
+```
+work_reopen(project="model_performance", item_id="model_performance-jul", reason="owner: classify as branch A")
+work_claim(project="model_performance", item_id="model_performance-jul")
+work_resolve(id="model_performance-jul", reason=<the DO-NOT-SHIP-AS-SPECIFIED text, restored>)
+```
+
+Classification is now an owner-level call, not a lane-level one.
+
 ### Cost of the correction, disclosed
 
 `work_reopen` cleared `closed_at` (was `2026-09-03T08:16:45Z`), so this item re-lands on the
