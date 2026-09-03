@@ -364,7 +364,6 @@ for the full write-up. Neither defect is inherited here:
 module = "context-simple"
 config = {
     compaction_strategy = "summary",   # default: "progressive"
-    summary_call_mode = "standalone",  # default; "fork" appends onto the live prefix
     summary_trigger = 0.60,            # usage fraction that starts the async summarizer
     summarization_model = "...",       # optional; None uses the provider default
     summarization_prompt_path = "...", # optional file override for the 5-section prompt
@@ -439,127 +438,6 @@ absorptions cannot cycle; **hysteresis** on `summary_trigger` (arm at
 `summary_trigger` upward is the cheapest first experiment. Any of these
 should be validated against the same cost metrics before this flag is
 enabled anywhere by default.
-
-## Cache-safe fork of the summarization call (`summary_call_mode`)
-
-**Default is `"standalone"` — byte-identical to the summarizer call this
-module has always made.** `"inline"` is accepted as an alias for it. Only
-consulted when `compaction_strategy == "summary"`.
-
-### The defect
-
-The summarizer's request is, today, a **standalone** two-message call: its
-own ~955-char `role: "system"` prompt, plus a freshly formatted plain-text
-rendering of the span being absorbed. It shares **not one byte of prefix**
-with the main conversation. So every token of that span is billed as
-*fresh input* — while the provider is already holding that exact span warm
-in the main line's cache.
-
-This resolves the internal conflict recorded in `00-what-we-know.md` §2d
-(prose said the summarizer was "8.3–10.9% of run cost", the same source's
-own table said 2.4%): whatever the share, the call is genuinely standalone,
-so the cost is genuinely avoidable. It does **not** touch the boundary
-rebuild, which §2d shows is the dominant cost — see "honest ceiling" below.
-
-### The shape
-
-`summary_call_mode: "fork"` re-issues the same ask as a **pure append**:
-
-```
-[ ...the exact messages of the last request... ] + [ one user message: prompt + scope ]
-```
-
-Pure append is the *one* mutation measured as a cache HIT under the
-grow-only rule (probe P4: identical-repeat 9,789 HIT, **pure-append 9,789
-HIT**, strict truncation 0 MISS, middle-drop 0 MISS).
-
-Three things follow, and each is load-bearing:
-
-1. **The span is not re-sent.** It is already inside the prefix. Re-sending
-   it would cost exactly what standalone costs today *plus* the prefix — a
-   regression wearing an optimization's clothes.
-2. **The prompt moves into the appended `role: "user"` message.** A
-   per-summarization `role: "system"` message is hoisted into the
-   provider's single top-level system block and rewrites the cached system
-   prefix — the same failure already measured for the summary tier and the
-   compaction notice.
-3. **Scope has to be stated.** Standalone scopes by construction (it can
-   only see the span). A fork can see everything, so the appended message
-   names the span explicitly: message count, plus a bounded verbatim
-   excerpt of the span's final message as the "summarize up to here"
-   marker. This is a real behavioral difference between the two modes, not
-   a formatting detail.
-
-### The precondition you must wire: `note_request_sent()`
-
-Tool specs are serialized **ahead of** the system block, and this module is
-handed messages, never tools. It also never sees a tail an orchestrator
-injects *after* `get_messages_for_request()` returns. A fork missing either
-is not an append onto the cached prefix at all.
-
-So fork mode requires the caller to say what it actually sent:
-
-```python
-messages = await context.get_messages_for_request(provider=provider)
-request = ChatRequest(messages=messages, tools=tools, model=model)
-context.note_request_sent(messages, tools=tools, model=model)   # <- every request
-response = await provider.complete(request)
-```
-
-- Passing `tools` **at all** — even `None`/`[]` for a genuinely tool-free
-  session — is what arms the fork. "Not supplied" and "supplied as empty"
-  are deliberately distinguishable; guessing between them is how a fork
-  silently misaligns.
-- Passing `messages` gives byte-parity with the wire, which an **implicit,
-  match-forward-only cache (OpenAI)** requires — its measured behavior
-  misses on anything that is not a strict superset of a cached request
-  (that is the same finding as "strict truncation → 0"). Omit it and the
-  fork appends to this module's own last returned view, which is what an
-  **explicit-breakpoint cache (Anthropic)** needs, since the breakpoint is
-  placed on the last *stable* message — exactly where this module's view
-  ends, before any ephemeral injection.
-- Call it **every request**. A record that no longer describes the latest
-  request is ignored, not trusted: a one-time wiring would otherwise have
-  turn 40's fork append to turn 1's request.
-
-### A silently unforked fork is the failure mode that matters
-
-A fork that does not reproduce the parent's prefix wins nothing **and pays
-for the whole conversation** — strictly worse than the standalone call it
-replaces. Every misalignment therefore refuses, falls back to standalone,
-and says so: a `WARNING` naming the precondition (once per distinct
-reason), a session counter, and the mode actually used reported on
-`context:pre_summarize` / `context:post_summarize` and via
-`last_summary_call_stats`.
-
-The refusals: `note_request_sent()` never called · `summarization_model`
-set (a summarizer routed elsewhere reads none of the main line's cache) ·
-no request recorded yet (first request of a session) · the prefix ends on
-an assistant turn with unanswered `tool_calls` (appending there would
-interleave between `tool_use` and `tool_result`) · the span is absent from
-the recorded prefix · the forked request fails to build.
-
-### What is proven here, and what is not
-
-**Proven, structurally, by `tests/test_summary_call_mode_fork.py`:** the
-default request is byte-identical and the fork bookkeeping is never even
-written unless armed; the forked request is the parent prefix plus exactly
-one `role: "user"` message (`sha256(fork[:-1]) == sha256(parent)`); no
-`_seq` is consumed, history is untouched, `_last_sent_estimate` (the hybrid
-meter's comparand) does not move, and a forked session serves views
-bit-for-bit identical to an unforked control; tool-pair snapping is
-unchanged; every refusal falls back loudly.
-
-**Not proven — no cache or cost win is claimed.** G-FORK-PREFIX /
-G-FORK-CACHED / G-FORK-COST / G-FORK-NOBOUNDARY are a separately funded
-evaluation; none of it was run here.
-
-**Honest ceiling, stated in advance:** this reduces the separate summarizer
-charge only. It does **not** reduce the boundary rebuild, which §2d
-measured as the dominant cost (+84% boundaries drives the +83% run cost).
-If the summarizer really is 2.4% of run cost rather than 8.3–10.9%, then
-even a perfect fork is worth ~2% — the arm design must therefore report the
-summarizer's cost share from the run's own per-call table, not from prose.
 
 ## Tool-result budget, shape, and spill
 
