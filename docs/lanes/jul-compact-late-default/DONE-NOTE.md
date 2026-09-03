@@ -288,6 +288,55 @@ must run then, at an authority of at least $15.89.
    template needs a stated rule for which branch owns a *provably mis-specified* deliverable:
    this lane produced five terminal-state revisions on zero new evidence because A-vs-C is
    under-determined by the text as written.
+### The lever nobody has priced: `target_usage`, not `compact_threshold`
+
+*(knob: `target_usage` · family: n/a, arithmetic · confidence: **INFERRED** from measured
+constants — this lane ran nothing · evidence: the formula at `__init__.py:863` and `[P4]`'s
+arm table.)*
+
+Boundary count is governed by how much each compaction **frees**, which is
+`(compact_threshold − target_usage) × budget` — currently `(0.92 − 0.50) = 0.42` of budget.
+Both terms move it, and they are **not** the same size:
+
+| change | freed/boundary | boundaries vs today |
+|---|---:|---:|
+| shipped (`0.92` / `0.50`) | 0.42 | — |
+| `compact_threshold` → 0.95 | 0.45 | **−6.7%** |
+| `compact_threshold` → 1.00 *(zero response headroom — not viable)* | 0.50 | −16.0% |
+| **`target_usage` → 0.35** | 0.57 | **−26.3%** |
+| **`target_usage` → 0.25** | 0.67 | **−37.3%** |
+
+**`target_usage` is the bigger lever by 4×, and §7's earlier framing — "the only shipped lever
+is `compact_threshold`" — understated the option space.** Correcting that here.
+
+**Why it is still not shippable today, and why the existing negative may not transfer.**
+`[P4]`'s policy rec #3 says flatly *"Do not lower `target_usage`"*: `cad-deep` (0.15) cost
+**more** ($3.16 vs $2.58) with more requests and no quality upside. But its own disclosure
+explains that as a **floor** failure — `0.15 × 45,000 = 6,750` sits *below* the ~32k
+system-prompt floor, so compaction escalated to max level on every request. **That
+degeneracy is an artifact of the harness forcing knob, not of the dial.** Against a real
+production budget the floor is nowhere near binding:
+
+| target | tokens (200k window, budget 163,904) | vs ~32k floor |
+|---|---:|---:|
+| 0.50 (shipped) | 81,952 | 2.56× clear |
+| 0.35 | 57,366 | 1.79× clear |
+| 0.25 | 40,976 | 1.28× clear — marginal |
+
+So `target_usage` 0.35 is a **candidate the existing negative does not actually falsify** —
+`cad-deep` never tested the dial at a budget where it could work. It remains **unmeasured**,
+and lane rule 6 keeps it off a default until someone runs it. But it is a materially better
+thing to re-spec around than `compact_threshold`, and no lane has priced it.
+
+**Caveats, stated rather than buried:** this model assumes total growth is constant across
+arms, which it is not — `cad-fewer` measured −56% boundaries where the same arithmetic
+predicts −36%, because fewer boundaries also means fewer requests and less growth. So these
+figures are a **ranking of levers, not a forecast**. And deeper targets discard more history
+per boundary; `[P4]`'s retention was 20/20 everywhere, but on a scenario its own source calls
+a possible ceiling effect.
+
+---
+
 1. **Is "compact late" still wanted as a default?** If yes, the only shipped lever is
    `compact_threshold` (0.92 → higher), it is unmeasured, and its ceiling is ~19% fewer
    boundaries. That is a *new measurement*, not this item — and it needs a real guardrail at
