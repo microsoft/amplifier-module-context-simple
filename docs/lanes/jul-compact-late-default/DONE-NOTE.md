@@ -3,6 +3,26 @@
 Lane: `jul-compact-late-default` · repo: `microsoft/amplifier-module-context-simple` ·
 branch: `lane/jul-compact-late-default` · date: 2026-09-03
 
+> ## THE FEATURE DID NOT SHIP. NOTHING IN THIS NOTE SHOULD BE READ AS SAYING IT DID.
+>
+> This item's title is *"ship compact-late as the context-simple DEFAULT"* and its terminal
+> word is **RESOLVED**. Those two facts sit next to each other and a skimming reader will
+> join them wrongly. So, explicitly:
+>
+> **No compaction default was changed. No wire behavior changed. `compact_threshold` is
+> still 0.92, exactly as it was before this lane started.**
+>
+> The goal's *checkable end state* — one of branches A/B/C — is met at **B**.
+> The goal's *aspiration* — a shipped compact-late default — is **not** met, and **cannot be
+> met by anyone**, because the specified change is harmful: adopting `cad-fewer`'s 70,000
+> moves the compaction trigger **2.34x–13.3x EARLIER**, producing MORE boundaries and
+> inverting the −29% requests / −14% wall result it cites.
+>
+> Those two statements are both true and are not in tension. GOAL.md built branch B for
+> precisely this: *"A cap that binds is a RESULT, not a blocker."* The same holds for a
+> falsified premise. **The finding is the deliverable here — not a consolation for missing
+> one.**
+
 **Terminal outcome: GOAL.md OUTCOME branch B — RESOLVED AT THE CAP.** Deliverable 2 (the DTU
 guardrail) resolves NOT-POSSIBLE **because of the cap**: priced before any spend at
 **4 arms x $2.65/run / 0.667 validity = $15.89 against a $12 authority**. B is "satisfied BY
