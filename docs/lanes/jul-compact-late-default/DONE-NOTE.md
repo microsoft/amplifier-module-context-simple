@@ -3,65 +3,66 @@
 Lane: `jul-compact-late-default` · repo: `microsoft/amplifier-module-context-simple` ·
 branch: `lane/jul-compact-late-default` · date: 2026-09-03
 
-**Terminal outcome: RESOLVED — and none of GOAL.md's three branches fits it cleanly.**
-That mismatch is itself a reportable goal defect; §0 below names it rather than papering
-over it, because an earlier draft of this note labelled the outcome "branch A" while two of
-six deliverables did not exist, which branch A's own definition forbids.
+**Terminal outcome: GOAL.md branch C — BLOCKED, item released.** `BLOCKED.md` sits beside
+this file and is committed. The outcome ("ship compact-late as the context-simple DEFAULT")
+is unreachable **for a reason other than the cap**: `cad-fewer` overrode no shipped default,
+and adopting its value would invert the measured win. Established at **$0 of $12**.
 
-The default-trigger change the item asks for cannot be made — not for want of budget, but
-because the knob `cad-fewer` moved does not exist in shipped source, and shipping its value
-would invert the measured win. That is a finding, established at **$0 spend**, and it is
-what this lane delivers. What *is* shipped is the measurement's provenance plus the tests
-that stop the next lane from walking into the same trap.
+The work itself is not blocked and is not stranded — draft PR
+[#32](https://github.com/microsoft/amplifier-module-context-simple/pull/32) carries the
+measurement's provenance and the tests that stop the next lane walking into the same trap.
 
 ---
 
-## 0. Terminal-state classification — the goal's taxonomy is not exhaustive
+## 0. Terminal-state classification — and a correction of record
 
-GOAL.md asserts "EXACTLY ONE of these three, and they are exhaustive". Tested against this
-lane, all three fail:
+**This lane got its terminal state wrong twice before landing on C. Both errors are recorded
+here rather than quietly rewritten.**
 
-| branch | its definition | why it does not fit |
+| revision | claimed state | what was wrong |
 |---|---|---|
-| **A. RESOLVED** | resolved *AND the deliverables below exist* | Two of six do not exist. A is false by its own conjunction. |
-| **B. RESOLVED AT THE CAP** | "the spend authority **could not fund** the remaining work" | The cap is not why. $0 of $12 was spent and the work was completed; the deliverable is unbuildable at *any* authority. B would be a false attribution to budget. |
-| **C. BLOCKED** | "unreachable **for a reason other than the cap** — a missing prerequisite, a refused claim, a broken dependency, a defect in another component" → `BLOCKED.md` + `work_release` | The reason clause fits. The **remedy does not**: `work_release` returns the item to the *ready* queue, where the next lane claims it, reads the same GOAL.md, and re-spends its authority re-discovering the dead knob. `BLOCKED.md` lives in *this* lane's directory, which that lane never sees. |
+| 1st (`570502a`) | "branch A (RESOLVED)" | Branch A requires *resolved **AND** the deliverables exist*. Two of six did not. The marker annotated its way around a conjunction instead of failing it. |
+| 2nd (`d32d280`) | "none of the three fits; propose a branch D" | Worse, not better. GOAL.md states the three branches **are exhaustive**. A lane does not get to extend the taxonomy of the contract it is working under. An undefined terminal state fails the goal condition outright. |
+| 3rd (this one) | **C — BLOCKED, released** | Correct. See below. |
 
-**The gap the taxonomy has no word for:** a deliverable that is *provably mis-specified* —
-unreachable for a reason that is neither the cap nor an obstruction, where the falsifier is
-in hand and **re-queueing is actively harmful**. Nothing blocked this lane. There is no
-unblocking action anyone can take; there is no prerequisite to supply and no dependency to
-fix. The only correct next step is an owner decision, and the only artifact an owner reads
-is a resolution attached to the item.
+### Why C, tested against all three
 
-**Decision taken: resolve.** Reasons, in order of weight:
+- **Not A.** Two of six deliverables do not exist. False by its own conjunction.
+- **Not B.** B requires that *the spend authority could not fund the remaining work*. It
+  could not fund the **guardrail** — but that is downstream. The **core** deliverable is
+  unbuildable at **any** authority: $0 of $12 spent, and more money buys nothing. Filing it
+  as cap-bound would be a false attribution to budget, which is exactly the failure mode
+  GOAL.md warns about in the other direction.
+- **C, verbatim.** *"The outcome is unreachable for a reason other than the cap."* It is —
+  the reason is a defect in the item's premise, which assumed `cad-fewer` overrode a shipped
+  default. Its enumerated examples ("a missing prerequisite ... a defect in another
+  component") follow an em-dash and illustrate that clause; they do not narrow it.
 
-1. `work_release` (branch C's mandated remedy) would put a provably-wrong item back in front
-   of the next lane with no marker preventing re-claim. That is a measurable cost, not a
-   theoretical one — it is the same authority this lane spent $0 to avoid needing.
-2. Lane rule 8: *"Honest negatives are deliverables. 'This does not work, here is the
-   falsifying measurement' is a full result and is paid the same as a win."* That rule
-   points at resolve, not block.
-3. GOAL.md's own anti-churn rule: *"Choose the terminal state ONCE ... lane 1ru moved
-   BLOCKED → REJECT → BLOCKED under an ambiguous goal with its measurement never changing,
-   and that churn was produced entirely by the goal text."* No number here has changed since
-   the decision; re-deciding would reproduce exactly that pattern, and `work_reopen` would
-   clear `closed_at` and move every throughput roll-up by one item for a labelling change.
-4. If the owner disagrees, `work_reopen` is the sanctioned correction path and costs one
-   call. The asymmetry favours resolving.
+### The objection that produced revision 2, and how it is handled inside C
 
-**What was corrected after the fact:** the branch *label* only. `DONE.json` originally read
-`"outcome_branch": "A (RESOLVED)"` with an inline annotation admitting two deliverables were
-NOT-POSSIBLE — i.e. it annotated its way around A's definition instead of naming the
-mismatch. The stored `work_resolve` text never claimed branch A; it has always read
-DO-NOT-SHIP-AS-SPECIFIED with the evidence, so no reopen was needed to correct the record
-itself.
+C's remedy is `work_release`, which returns the item to the **ready** queue — where the next
+lane can claim it, read the same premise, and re-spend its authority rediscovering the dead
+knob. That hazard is real. It was wrong to treat it as grounds for refusing the branch: it is
+a **consequence** concern, not a **classification** one. Handled inside C instead:
 
-**Recommended fix to the highway goal template (not actioned by this lane):** add a fourth
-branch — *"D. RESOLVED AS MIS-SPECIFIED: the deliverable is provably unbuildable or harmful
-as written, the falsifier is in hand, and the item must NOT be re-queued. Resolve with the
-falsifier; do not write BLOCKED.md; do not release."* Two lanes have now hit this gap (1ru
-by churning, this one by mislabelling).
+1. **`work_edit` amended the item's own description** (attributed, non-destructive — the
+   acceptance criteria were left untouched, they are the owner's) to carry the falsifier,
+   `BLOCKED.md`'s path, and the PR link. The finding now travels with the item, not just with
+   this lane's directory, which the next claimant never sees.
+2. **The durable work is on the branch and merge-ready**, not held hostage to the
+   classification.
+
+### Cost of the correction, disclosed
+
+`work_reopen` cleared `closed_at` (was `2026-09-03T08:16:45Z`), so this item re-lands on the
+correction date and every throughput roll-up moves by one. That cost was accepted to reach a
+**defined** terminal state; GOAL.md's anti-churn rule ("choose the terminal state ONCE",
+citing lane 1ru) governs re-deciding between two *valid* states on unchanged evidence, which
+is not what happened here — revisions 1 and 2 were not valid states at all.
+
+A template improvement is still worth making — the taxonomy has no state for "provably
+mis-specified, must not be re-queued" — but that is a **recommendation to the owner**, filed
+in `BLOCKED.md` §"Goal defects", and explicitly **not** this lane's terminal state.
 
 ---
 
@@ -253,11 +254,11 @@ must run then, at an authority of at least $15.89.
 
 ## 7. What the owner should decide next
 
-0. **Was resolving the right terminal state?** §0 sets out why none of the goal's three
-   branches fits and why resolve beat block. If you disagree, `work_reopen` is the sanctioned
-   correction and costs one call — but note that branch C's `work_release` would return a
-   provably mis-specified item to the ready queue. Separately: worth adding branch **D**
-   (resolved-as-mis-specified) to the goal template; two lanes have now hit this gap.
+0. **The item is released and back in the ready queue** (branch C). It should not be
+   re-claimed as written — its premise is falsified. Re-spec it, or close it as answered; see
+   `BLOCKED.md` §"What would unblock it" for the three options. Separately, worth considering
+   a fourth branch for the goal template ("provably mis-specified, do not re-queue"); two
+   lanes have now hit that gap, and this one had to mitigate it by hand.
 1. **Is "compact late" still wanted as a default?** If yes, the only shipped lever is
    `compact_threshold` (0.92 → higher), it is unmeasured, and its ceiling is ~19% fewer
    boundaries. That is a *new measurement*, not this item — and it needs a real guardrail at
