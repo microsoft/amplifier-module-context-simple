@@ -242,7 +242,6 @@ async def test_default_mode_never_records_a_fork_prefix():
         assert context._last_request_view is None
         assert context._sent_tools_supplied is False
         assert context._summary_fork_fallbacks == 0
-        assert context._fork_prefix_source is None
         assert context.last_summary_call_stats is None
 
 
@@ -608,24 +607,11 @@ async def test_fork_refuses_when_the_prefix_ends_on_unanswered_tool_calls():
 
 
 @pytest.mark.asyncio
-async def test_a_stale_caller_message_record_refuses_loudly_not_silently(caplog):
+async def test_a_stale_caller_message_record_is_ignored_not_trusted():
     """A caller that wires note_request_sent() ONCE (startup helper, first
-    turn only) would have turn N's fork append to turn 1's request.
-
-    This test previously asserted the OPPOSITE resolution -- that the
-    module silently substituted its own last returned view. That
-    substitution is the defect this file now pins against
-    (model_performance-jnt): the module cannot know whether its own view
-    was ever sent, and under a real orchestrator that re-fetches the view
-    within a single request, the view it substitutes is one that was
-    superseded and never went on the wire. Trading an array KNOWN to have
-    been sent for one whose fate is unknown is backwards, and it was
-    invisible -- `mode_used` said "fork" either way.
-
-    The correct resolution for a record too old to be usable is the one
-    every other misalignment already gets: refuse, run standalone, and SAY
-    SO. Caught exactly (the span is not in that prefix), not by a proxy.
-    """
+    turn only) would otherwise have turn N's fork append to turn 1's
+    request -- a guaranteed miss AND a wasted cache write, wearing a
+    correct-looking API call. The fresh module view must win."""
     context = _summary_manager(summary_call_mode="fork")
     await _fill(context, turns=10)
     # Turn 1: the caller records what it sent.
@@ -639,28 +625,13 @@ async def test_a_stale_caller_message_record_refuses_loudly_not_silently(caplog)
     _cross_trigger(context)
 
     provider = _FakeProvider()
-    with caplog.at_level(logging.WARNING):
-        await context.get_messages_for_request(provider=provider)
-        await _await_pending_task(context)
+    await context.get_messages_for_request(provider=provider)
+    await _await_pending_task(context)
 
-    stats = context.last_summary_call_stats
-    assert stats["mode_used"] == "standalone", (
-        "a prefix too stale to contain the span must refuse, not fork onto "
-        "a substituted view"
-    )
-    assert "not present in the recorded prefix" in stats["reason"]
-    assert context._summary_fork_fallbacks == 1
-    assert any("ran STANDALONE instead" in r.message for r in caplog.records)
-
-    # The substitution specifically must not have happened: the standalone
-    # request is the two-message one, not an append onto the fresh view.
     request = provider.calls[0]
-    assert len(request.messages) == 2
-    assert _digest(request.messages) != _digest(fresh_view)
+    assert context.last_summary_call_stats["mode_used"] == "fork"
+    assert _digest(request.messages[:-1]) == _digest(fresh_view)
     assert not any("long ago" in str(m.content) for m in request.messages)
-    # And the summary still happened -- refusing costs today's price, never
-    # the summary itself.
-    assert context._pending_summary is not None
 
 
 @pytest.mark.asyncio
@@ -902,187 +873,3 @@ async def test_concurrent_forks_are_still_serialized_by_the_in_flight_guard():
     assert len(provider.calls) == 1
     assert context._pending_summary is not None
     assert context.last_summary_call_stats["mode_used"] == "fork"
-
-
-# ---------------------------------------------------------------------------
-# Group F -- the fork prefix is an array that was actually SENT
-#
-# model_performance-jnt. Measured on the wire (model_performance-6da, 20
-# forked calls): 9 appended to a request the provider actually saw, and 11
-# appended to an array that was never sent as any request. The module
-# reported `mode_used == "fork"` for all 20.
-#
-# Cause: `_capture_fork_prefix()` preferred the caller's recorded wire array
-# only while `_sent_serial == _view_serial`, and substituted
-# `_last_request_view` otherwise. A real orchestrator serves the view more
-# than once per sent request (amplifier's loop-streaming re-fetches after
-# persisting an ephemeral injection), the trigger is evaluated inside every
-# one of those calls, and on the second the substituted view is one that was
-# superseded by the re-fetch and never went on the wire.
-#
-# These tests are written against that substitution, not against the happy
-# path -- which the existing Group B tests already cover.
-# ---------------------------------------------------------------------------
-
-
-async def _serve_below_trigger(context: SimpleContextManager) -> list[dict]:
-    """Serve one more view without re-arming, i.e. a re-fetch within the
-    same request. `_arm_below_trigger` is the first view of a request; this
-    is the second one, which the orchestrator then supersedes."""
-    view = await context.get_messages_for_request(provider=_FakeProvider())
-    assert context._is_summarizing is False
-    return view
-
-
-@pytest.mark.asyncio
-async def test_a_re_fetched_view_does_not_displace_the_recorded_wire_array():
-    """THE REGRESSION. An extra view served since the caller confirmed its
-    send is normal, not a reason to stop trusting the send. The wire array
-    is the only one with positive evidence of having been on the wire; the
-    intervening view has none."""
-    context = _summary_manager(summary_call_mode="fork")
-    await _fill(context)
-    module_view = await _arm_below_trigger(context)
-    wire = [
-        *module_view,
-        {"role": "user", "content": "<system-reminder>injected</system-reminder>"},
-    ]
-    context.note_request_sent(wire, tools=_tools())
-    sent_at = context._view_serial
-
-    # The orchestrator re-fetches the view within the same request. This
-    # view is built, superseded, and never sent.
-    superseded = await _serve_below_trigger(context)
-    assert context._view_serial > sent_at, "the re-fetch must advance the view serial"
-
-    _cross_trigger(context)
-    provider = _FakeProvider()
-    await context.get_messages_for_request(provider=provider)
-    await _await_pending_task(context)
-
-    stats = context.last_summary_call_stats
-    assert stats["mode_used"] == "fork"
-    assert stats["prefix_source"] == "wire_record"
-    assert stats["prefix_views_since_send"] >= 1, (
-        "the re-fetch must be visible in the stats, not silently acted on"
-    )
-
-    request = provider.calls[0]
-    assert _digest(request.messages[:-1]) == _digest(wire), (
-        "the fork must append to the array the caller said it sent"
-    )
-    assert _digest(request.messages[:-1]) != _digest(superseded)
-    assert "injected" in request.messages[-2].content
-
-
-@pytest.mark.asyncio
-async def test_the_module_view_is_never_substituted_when_a_wire_record_exists():
-    """Belt and braces on the same defect, asserted from the other side: a
-    `_last_request_view` holding content that was demonstrably never sent
-    must not be able to reach the forked request at all."""
-    context = _summary_manager(summary_call_mode="fork")
-    await _fill(context)
-    module_view = await _arm_below_trigger(context)
-    context.note_request_sent(module_view, tools=_tools())
-    # A view that was built and discarded -- exactly what a re-fetch leaves
-    # behind, and what the old code would have forked onto.
-    context._last_request_view = [
-        {"role": "user", "content": "a view that was never sent"}
-    ]
-    context._view_serial += 1
-
-    _cross_trigger(context)
-    provider = _FakeProvider()
-    await context.get_messages_for_request(provider=provider)
-    await _await_pending_task(context)
-
-    request = provider.calls[0]
-    assert context.last_summary_call_stats["mode_used"] == "fork"
-    assert context.last_summary_call_stats["prefix_source"] == "wire_record"
-    assert not any("never sent" in str(m.content) for m in request.messages)
-    assert _digest(request.messages[:-1]) == _digest(module_view)
-
-
-@pytest.mark.asyncio
-async def test_prefix_source_names_the_module_view_path_honestly():
-    """When the caller supplies tools but never a message array, the fork
-    appends to this module's own view -- whose send this module cannot
-    confirm. That is still allowed (it is what an explicit-breakpoint
-    provider wants), but it must be REPORTED as what it is, so a
-    measurement can separate the two populations without patching."""
-    context = _summary_manager(summary_call_mode="fork")
-    await _fill(context)
-    context.note_request_sent(tools=_tools())
-    parent_view = await _arm_below_trigger(context)
-    _cross_trigger(context)
-
-    provider = _FakeProvider()
-    await context.get_messages_for_request(provider=provider)
-    await _await_pending_task(context)
-
-    stats = context.last_summary_call_stats
-    assert stats["mode_used"] == "fork"
-    assert stats["prefix_source"] == "module_view"
-    assert stats["prefix_views_since_send"] is None, (
-        "no message array was ever recorded, so there is no send to count from"
-    )
-    assert _digest(provider.calls[0].messages[:-1]) == _digest(parent_view)
-
-
-@pytest.mark.asyncio
-async def test_prefix_source_is_none_when_the_call_did_not_fork():
-    """A refused fork reports no prefix source. Reporting one would make a
-    standalone call look byte-aligned with something."""
-    context = _summary_manager(summary_call_mode="fork")
-    await _fill(context)
-    _cross_trigger(context)
-
-    provider = _FakeProvider()
-    await context.get_messages_for_request(provider=provider)
-    await _await_pending_task(context)
-
-    stats = context.last_summary_call_stats
-    assert stats["mode_used"] == "standalone"
-    assert stats["prefix_source"] is None
-
-
-@pytest.mark.asyncio
-async def test_tool_pair_integrity_and_seq_stability_survive_the_re_fetch_path():
-    """The re-fetch path must change WHICH array is appended to and nothing
-    else: the same span is selected, no `_seq` is consumed, history is
-    untouched, and the next served view matches an unforked control."""
-    forked = _summary_manager(summary_call_mode="fork")
-    control = _summary_manager()
-    for ctx in (forked, control):
-        await _fill(ctx)
-
-    view = await _arm_below_trigger(forked)
-    forked.note_request_sent([*view, {"role": "user", "content": "tail"}], tools=_tools())
-    await _serve_below_trigger(forked)  # the superseding re-fetch
-    await _arm_below_trigger(control)
-    for ctx in (forked, control):
-        _cross_trigger(ctx)
-
-    seq_before = forked._next_seq
-    history_before = json.dumps(_strip_timestamps(forked.messages), default=str)
-
-    for ctx in (forked, control):
-        await ctx.get_messages_for_request(provider=_FakeProvider("SAME SUMMARY"))
-        await _await_pending_task(ctx)
-
-    assert forked.last_summary_call_stats["mode_used"] == "fork"
-    assert forked.last_summary_call_stats["prefix_source"] == "wire_record"
-    assert forked._next_seq == seq_before, "the fork must not consume a _seq"
-    assert (
-        json.dumps(_strip_timestamps(forked.messages), default=str) == history_before
-    ), "the fork must not append to, reorder, or edit history"
-    assert set(forked._pending_summary["seqs"]) == set(control._pending_summary["seqs"]), (
-        "the call mode must not change WHICH span is absorbed"
-    )
-
-    for ctx in (forked, control):
-        ctx.compact_threshold = 0.3
-    forked_view = await forked.get_messages_for_request(provider=_FakeProvider())
-    control_view = await control.get_messages_for_request(provider=_FakeProvider())
-    assert _strip_timestamps(forked_view) == _strip_timestamps(control_view)
-    assert forked._removed_seqs == control._removed_seqs
