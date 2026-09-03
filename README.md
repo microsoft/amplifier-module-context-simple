@@ -166,6 +166,9 @@ Two limits on that result, both from its own source:
   window exceeds it -- more boundaries, inverting the measured win. The
   parametrized test at the bottom of
   `tests/test_compaction_trigger_provenance.py` asserts exactly this.
+  (Those trigger figures are `compact_threshold * budget`;
+  `get_messages_for_request` also subtracts the 800-token compaction-notice
+  reserve first, moving each down by 736 tokens. No ratio changes.)
 
 The general finding still holds and is the one to carry forward: **fewer
 compaction boundaries buys latency and request count, not money, and costs no
