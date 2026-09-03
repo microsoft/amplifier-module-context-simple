@@ -364,7 +364,9 @@ for the full write-up. Neither defect is inherited here:
 module = "context-simple"
 config = {
     compaction_strategy = "summary",   # default: "progressive"
-    summary_call_mode = "standalone",  # default; "fork" appends onto the live prefix
+    summary_call_mode = "standalone",  # default; "fork" appends onto the live prefix,
+                                       # "auto" = fork gated by the span-size predicate
+    summary_fork_min_span_ratio = 0.22,# optional; None (default) = predicate off
     summary_trigger = 0.60,            # usage fraction that starts the async summarizer
     summarization_model = "...",       # optional; None uses the provider default
     summarization_prompt_path = "...", # optional file override for the 5-section prompt
@@ -550,16 +552,122 @@ meter's comparand) does not move, and a forked session serves views
 bit-for-bit identical to an unforked control; tool-pair snapping is
 unchanged; every refusal falls back loudly.
 
-**Not proven — no cache or cost win is claimed.** G-FORK-PREFIX /
-G-FORK-CACHED / G-FORK-COST / G-FORK-NOBOUNDARY are a separately funded
-evaluation; none of it was run here.
+**And by `tests/test_summary_fork_span_predicate.py`** for the span-size
+predicate below: the default is off in *both* fork modes; the threshold is
+pinned from both sides against the fixture's own realized ratio (not a
+guessed constant); a decline sends the standalone request byte-for-byte and
+never moves the fallback counter; a misalignment is still a fallback even
+with the predicate armed at a ratio nothing could fail.
 
-**Honest ceiling, stated in advance:** this reduces the separate summarizer
-charge only. It does **not** reduce the boundary rebuild, which §2d
-measured as the dominant cost (+84% boundaries drives the +83% run cost).
-If the summarizer really is 2.4% of run cost rather than 8.3–10.9%, then
-even a perfect fork is worth ~2% — the arm design must therefore report the
-summarizer's cost share from the run's own per-call table, not from prose.
+**Now measured — and cost-neutral as shipped.** Lane `model_performance-6da`
+ran all four gates end-to-end (S5-CRAC, n=3/arm balanced across two
+containers, `gpt-5.6-terra@medium`); three of four FAILED. The cache
+mechanism is real — a forked call reads a **median 85.7%** of its own prompt
+from cache against **0.0%** for a standalone one — but total run cost moved
+**−0.8%**, i.e. noise. Unconditional forking is not worth shipping. Why, and
+the fix, is the next section.
+
+**One correction that outlived the treatment:** the summarizer is **~30% of
+run cost** on this workload, not the 2.4%/8.3–10.9% previously recorded.
+Both older figures were the same artefact — pairing each `llm:response` with
+the most recent `llm:request` misfiles a summarizer call that ran
+concurrently as a background task. Attribution must come from the module's
+own `ChatResponse.usage`, never from positional pairing.
+
+**Honest ceiling, unchanged:** this reduces the separate summarizer charge
+only. It does **not** reduce the boundary rebuild, which §2d measured as the
+dominant cost (+84% boundaries drives the +83% run cost).
+
+## Span-size predicate in front of the fork (`summary_fork_min_span_ratio`)
+
+**Default off. `None` (or `0`) means the predicate is not evaluated, no
+counter moves, and `summary_call_mode: "fork"` behaves exactly as it did
+before this feature existed.**
+
+### Why unconditional forking nets to zero
+
+6da measured both halves of the trade:
+
+| measure | forked call | standalone call |
+|---|---|---|
+| $ per 1,000 own-prompt tokens (median) | **0.00077** | **0.00350** — fork is 4.5× cheaper per token |
+| own prompt size (median tokens) | **26,620** | **5,129** — fork's prompt is 5.2× bigger |
+
+4.5× cheaper per token × 5.2× more tokens ≈ 1.0. The fork trades "a small,
+wholly-uncached prompt" for "a large, mostly-cached prompt", and at these
+sizes those cost the same.
+
+### But the trade is span-size dependent
+
+| population | n | mean cost |
+|---|---|---|
+| standalone, own prompt **> 30,000** tok | 17 | **$0.1410** |
+| standalone, own prompt **≤ 15,000** tok | 40 | **$0.0151** |
+| forked, any span | 20 | **$0.0265** — roughly flat |
+
+A forked call costs ~$0.027 no matter what it summarizes, because it always
+pays for the conversation prefix. A standalone call costs almost nothing on
+a small span and **5× a fork's price on a large one**. Fork wins on the tail
+and loses on the median.
+
+### The threshold is derived, not chosen
+
+A standalone call pays for the **span** at the uncached rate; a fork pays for
+the whole **prefix** at the cached rate. With `S` = span tokens and `P` =
+prefix tokens, the fork is cheaper exactly when
+
+```
+P × 0.00077 < S × 0.00350   ⟺   S / P > 0.22
+```
+
+`0.22` is that ratio and nothing else — it is `DEFAULT_FORK_MIN_SPAN_RATIO`,
+and `summary_call_mode: "auto"` is the one-word way to say "fork, predicate
+on, at that default". Two independent cross-checks against the same measured
+table, both of which it passes:
+
+- 6da's median span (5,129 tok) over its median fork prompt (26,620 tok) is
+  **0.193** — just *below* break-even, which is precisely why 6da measured
+  the two arms cancelling "exactly" at the median.
+- The bucket table: spans ≤15k imply a mean span ~4.3k → ratio ~0.16 →
+  **declines**, and standalone at $0.0151 does beat a fork at $0.0265. Spans
+  >30k imply a mean span ~40k → ratio ≥0.67 → **forks**, at a flat ~$0.027
+  against $0.1410. Both verdicts match the money.
+
+**Why a ratio and not a token count.** Fork cost scales with the *prefix*,
+which grows all session; standalone cost scales with the *span*. The
+break-even is therefore a ratio of two rates, and a fixed token threshold is
+only correct at one prefix size. (At 6da's median prefix the equivalent
+absolute threshold is ~5,900 span tokens; late in a session the same ratio
+is a much larger number.)
+
+### A decline is not a fallback
+
+The predicate is evaluated **strictly after** every alignment precondition,
+so it only ever sees forks that would have worked, and declines them on cost
+alone. That ordering is load-bearing in both directions: no span size can
+buy a misaligned fork, and a misalignment is never misreported as an
+economic decision. Declines move `fork_declines`; genuine refusals move
+`fork_fallbacks`; `last_summary_call_stats` reports both separately, plus a
+`span_measure` (`span_tokens`, `prefix_tokens`, `span_ratio`,
+`min_span_ratio`) so an eval arm can plot the realized distribution and
+re-derive its own threshold. One combined counter would make a healthy
+predicate and a broken fork look identical.
+
+Declines log at `INFO`, once per kind — not `WARNING`, which in this module
+means something is wrong.
+
+### The cap this does **not** lift
+
+6da also found the fork rate structurally capped at **45.5%** (20/44) on a
+CLI workload: every turn is a fresh `amplifier run --resume` process, so
+`note_request_sent()` has not been called when the first summary trigger of
+the turn fires. **The predicate runs after that refusal and therefore cannot
+raise the fork rate — only lower it.** Worse, the capped calls skew *large*
+(mean $0.0872 against $0.0265 forked), i.e. exactly the population the
+predicate wants to route to a fork. On a long-lived in-process session the
+cap does not apply and the predicate captures the full tail; on a CLI
+workload its realized win is bounded by the ≤45.5% forkable subset. Lifting
+that cap is a separate change to the seam, not to this predicate.
 
 ## Tool-result budget, shape, and spill
 
