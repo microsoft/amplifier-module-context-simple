@@ -360,6 +360,24 @@ _VALID_COMPACTION_STRATEGIES = (
 # "inline" is accepted as an alias for "standalone": the lane brief that
 # commissioned this work named the default mode "inline" while the work
 # item named it "standalone". Both mean "today's behavior, unchanged".
+# Where a forked summarizer call's prefix came from, reported verbatim on
+# `last_summary_call_stats["prefix_source"]`. This distinction is not
+# cosmetic: only ONE of these two sources carries positive evidence that
+# the array was ever on the wire.
+#
+#   "wire_record"  -- the caller's own note_request_sent(messages=...)
+#                     record. The caller told us it sent exactly this.
+#   "module_view"  -- this module's last RETURNED view. Whether it was
+#                     actually sent is unknown to this module: an
+#                     orchestrator may append a tail to it, or discard it
+#                     entirely and re-fetch a fresh view before sending
+#                     (amplifier's loop-streaming does exactly that, 1-3
+#                     times per sent request). A superseded view was never
+#                     on the wire, so forking onto one is a guaranteed
+#                     cache miss wearing a correct-looking API call.
+FORK_PREFIX_SOURCE_WIRE = "wire_record"
+FORK_PREFIX_SOURCE_VIEW = "module_view"
+
 SUMMARY_CALL_MODE_STANDALONE = "standalone"
 SUMMARY_CALL_MODE_FORK = "fork"
 _VALID_SUMMARY_CALL_MODES = (SUMMARY_CALL_MODE_STANDALONE, SUMMARY_CALL_MODE_FORK)
@@ -1019,6 +1037,11 @@ class SimpleContextManager:
         self._sent_tools: Any = None
         self._sent_tools_supplied: bool = False
         self._sent_model: str | None = None
+        # Which of the two sources the last captured fork prefix came from
+        # (FORK_PREFIX_SOURCE_*). Reported on `last_summary_call_stats` so a
+        # measurement can tell a wire-parity fork from a module-view fork
+        # WITHOUT reconstructing it from the provider's request log.
+        self._fork_prefix_source: str | None = None
         # Observability: what the LAST summarizer call actually did, and how
         # many times a requested fork had to fall back. An eval arm reads
         # these to tell a real fork from a silently unforked one.
@@ -1180,12 +1203,19 @@ class SimpleContextManager:
         enters `self.messages`, consumes a `_seq`, or moves any compaction
         state. Callers that do not know about it lose nothing.
 
-        Call it EVERY request, not once. A `messages` record is only used
-        while it still describes the most recent request this module served
-        -- a one-time wiring would otherwise have turn 40's fork append to
-        turn 1's request, which is a guaranteed cache miss dressed up as a
-        correct API call. A stale record is ignored (this module's own last
-        view is used instead), never trusted.
+        Call it EVERY request, not once. The most recent `messages` record
+        is the only array this module has positive evidence was ever on the
+        wire, so it is what a fork appends to -- a one-time wiring would
+        have turn 40's fork append to turn 1's request. That case is not
+        silently rerouted (rerouting is what produced the never-sent-array
+        bug); it is caught exactly, by the span-presence check, and refused
+        LOUDLY as a standalone call with a named reason.
+
+        Calling it more than once per request is harmless, and so is
+        serving the view more than once per request: extra views do not
+        invalidate the record. `last_summary_call_stats` reports
+        `prefix_views_since_send` so that re-fetching is observable rather
+        than inferred.
 
         Args:
             messages: The exact message array sent, if known. Gives the fork
@@ -1220,9 +1250,11 @@ class SimpleContextManager:
 
         None before the first one. Otherwise a dict with `mode_requested`,
         `mode_used`, `reason` (None when the requested mode was honored),
-        `prefix_messages`, and `fork_fallbacks` (session-cumulative). This
-        is how an eval arm distinguishes a real fork from a silently
-        unforked one WITHOUT patching the module.
+        `prefix_messages`, `prefix_source` (FORK_PREFIX_SOURCE_*, None when
+        not forked), `prefix_views_since_send`, and `fork_fallbacks`
+        (session-cumulative). This is how an eval arm distinguishes a real
+        fork from a silently unforked one -- and a wire-parity fork from a
+        module-view one -- WITHOUT patching the module.
         """
         return dict(self._last_summary_call) if self._last_summary_call else None
 
@@ -1630,6 +1662,7 @@ class SimpleContextManager:
         self._sent_tools = None
         self._sent_tools_supplied = False
         self._sent_model = None
+        self._fork_prefix_source = None
 
     async def should_compact(self) -> bool:
         """Check if context should be compacted.
@@ -4176,26 +4209,68 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
     def _capture_fork_prefix(self) -> list[dict[str, Any]] | None:
         """Snapshot the message array a forked call would append to.
 
-        Prefers the caller's own `note_request_sent(messages=...)` record
-        (byte-parity with the wire, including any tail the orchestrator
-        injected after this module returned). Falls back to this module's
-        last returned view, which still ends exactly where an
+        Uses the caller's own `note_request_sent(messages=...)` record when
+        there is one -- byte-parity with the wire, including any tail the
+        orchestrator injected after this module returned. Only when the
+        caller has never supplied a message array does this fall back to
+        the module's own last returned view, which is where an
         explicit-breakpoint provider places its cache breakpoint.
+
+        WHY THERE IS NO SILENT DOWNGRADE BETWEEN THE TWO (the bug this
+        replaced): the previous implementation preferred the wire record
+        only while `_sent_serial == _view_serial`, and substituted
+        `_last_request_view` whenever that equality failed. That equality
+        asks "have any views been served since the caller last confirmed a
+        send?" -- which conflates two situations a view counter cannot tell
+        apart, and gets the important one backwards.
+
+        A real orchestrator serves the view MORE THAN ONCE per sent request
+        (amplifier's loop-streaming re-fetches after persisting an ephemeral
+        injection -- `get_messages_for_request()` at three separate call
+        sites in one iteration). The summary trigger is evaluated inside
+        EVERY one of those calls. On the second and third, the serials no
+        longer match, and the old code swapped the caller's genuine wire
+        array for `_last_request_view` -- which at that instant holds a view
+        that was built, superseded by the re-fetch, and NEVER SENT.
+
+        Measured on the wire (model_performance-6da, 20 forked calls):
+        9 appended to a request the provider actually saw; the other 11
+        appended to an array that was never sent as any request. The
+        substitution was invisible from outside -- `mode_used` reported
+        "fork" either way.
+
+        The asymmetry that settles it: the wire record is the only source
+        carrying positive evidence that it was ever on the wire, so it is
+        never traded for one that carries none. Staleness in the wire record
+        is still caught, but by an EXACT check rather than a proxy: a record
+        too old to contain the span being absorbed fails
+        `_prefix_contains_span` and refuses LOUDLY (standalone + warning +
+        counter), which is the outcome a fork that cannot be byte-aligned is
+        supposed to have.
         """
         if not self._fork_armed():
             return None
-        source = self._last_request_view
         if self._sent_messages is not None:
-            if self._sent_serial == self._view_serial:
-                source = self._sent_messages
-            else:
+            self._fork_prefix_source = FORK_PREFIX_SOURCE_WIRE
+            if self._sent_serial != self._view_serial:
+                # Not an error, and deliberately not a substitution: the
+                # caller has served extra views since confirming this send
+                # (a re-fetch, or a view that was never sent at all). The
+                # last CONFIRMED array is still the best-evidenced prefix.
                 logger.debug(
-                    "context-simple: ignoring a stale note_request_sent() "
-                    f"message record (recorded at view {self._sent_serial}, "
-                    f"now at view {self._view_serial}); appending to this "
-                    "module's own last returned view instead"
+                    "context-simple: fork prefix is the caller's recorded "
+                    f"wire array from view {self._sent_serial} (now at view "
+                    f"{self._view_serial}); {self._view_serial - (self._sent_serial or 0)} "
+                    "view(s) have been served since it was confirmed sent, "
+                    "which is normal for an orchestrator that re-fetches the "
+                    "view within a single request"
                 )
-        return list(source) if source is not None else None
+            return list(self._sent_messages)
+        if self._last_request_view is not None:
+            self._fork_prefix_source = FORK_PREFIX_SOURCE_VIEW
+            return list(self._last_request_view)
+        self._fork_prefix_source = None
+        return None
 
     @staticmethod
     def _message_identity(msg: dict[str, Any]) -> tuple[str, str, str]:
@@ -4473,6 +4548,25 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                     len(request.messages) - 1
                     if call_mode == SUMMARY_CALL_MODE_FORK
                     else 0
+                ),
+                # WHICH array the fork appended to, from the module's own
+                # report rather than reconstructed from the wire. Only one
+                # of the two sources is evidenced as having been sent (see
+                # FORK_PREFIX_SOURCE_*), so a measurement that cannot see
+                # this field cannot tell a byte-aligned fork from a fork
+                # onto a view the provider never received.
+                "prefix_source": (
+                    self._fork_prefix_source
+                    if call_mode == SUMMARY_CALL_MODE_FORK
+                    else None
+                ),
+                # How many views were served since the caller last confirmed
+                # a send. >0 is normal (an orchestrator may re-fetch the view
+                # within one request); it is reported, not acted on.
+                "prefix_views_since_send": (
+                    self._view_serial - self._sent_serial
+                    if self._sent_serial is not None
+                    else None
                 ),
                 "fork_fallbacks": self._summary_fork_fallbacks,
             }
