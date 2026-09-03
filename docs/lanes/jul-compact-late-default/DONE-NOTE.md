@@ -288,6 +288,38 @@ must run then, at an authority of at least $15.89.
    template needs a stated rule for which branch owns a *provably mis-specified* deliverable:
    this lane produced five terminal-state revisions on zero new evidence because A-vs-C is
    under-determined by the text as written.
+### Why no budget increase ships this: the blocker is a missing INSTRUMENT, not money
+
+The recurring reading of this lane is "the feature wasn't shipped because the cap bound."
+That is wrong in a way worth correcting, because it implies a bigger authority would fix it.
+**It would not.**
+
+Every candidate default here — `cad-fewer`'s 70,000, a raised `compact_threshold`, a lowered
+`target_usage` — carries the same risk: compacting later or deeper discards more history, so
+the thing that must be shown is that **retention does not degrade**. On the only scenario
+that exists, that cannot be shown at any price:
+
+> *"S5-CRAC cannot discriminate: 40/40 constraints and 20/20 post-compaction in **every run
+> of every arm across probes 1–6**. Until a scenario exists where truncation *measurably
+> loses* something, **no compaction-strategy comparison can pay for itself**."*
+> — `00-what-we-know.md` §4, open question 1
+
+An S5 A/B of `target_usage 0.35` is affordable in isolation — 2 arms x 2 runs x $2.65 =
+**$10.60**, inside the $12 — and it would still not license the flip. It would return
+cost/requests/wall (real numbers) against a quality instrument pinned at its ceiling, so the
+one question that gates the default — *did we lose anything?* — would come back 20/20 exactly
+as it has in every arm of six prior probes, carrying no information. Buying that is buying a
+number that cannot fail.
+
+**So the prerequisite is not $15.89. It is open question 1: a retention scenario with
+headroom** — already named in the program notes, already unfunded, and explicitly the thing
+"gating T2 and any summary-vs-truncation claim." A compaction-cadence default flip is in the
+same class and is gated by the same missing instrument.
+
+That is the honest terminal answer to *"why wasn't the feature shipped?"* — not the cap, not
+effort, and not this lane's authority. **The measurement that would license it cannot be
+purchased on the instruments that currently exist.**
+
 ### The lever nobody has priced: `target_usage`, not `compact_threshold`
 
 *(knob: `target_usage` · family: n/a, arithmetic · confidence: **INFERRED** from measured
