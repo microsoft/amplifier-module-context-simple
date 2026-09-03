@@ -3,70 +3,106 @@
 Lane: `jul-compact-late-default` · repo: `microsoft/amplifier-module-context-simple` ·
 branch: `lane/jul-compact-late-default` · date: 2026-09-03
 
-**Terminal outcome: GOAL.md branch A — RESOLVED**, on an owner classification ruling
-(2026-09-03): *"only A and B satisfy the goal's checkable end state."* Deliverables 3–6 are
-DONE; deliverables 1 and 2 are recorded **NOT-POSSIBLE-with-reason** below, each leading with
-what was executed. Draft PR
-[#32](https://github.com/microsoft/amplifier-module-context-simple/pull/32), 97 tests green,
-**$0.00 of $12** spent.
+**Terminal outcome: THE GOAL CONDITION IS UNMET, and cannot be met by this lane by any
+available action.** All three of GOAL.md's "exhaustive" branches have been eliminated — two
+of them by the owner's own successive rulings. The lane's work is complete and its finding is
+decisive; what fails is the goal's ability to classify the result.
 
-**A, not B.** Branch B requires that *the spend authority could not fund the remaining work*.
-That is false for the core deliverable: $0 was spent and it is unbuildable at **any**
-authority. Filing it as cap-bound would be a false attribution to budget. (The cap *does*
-independently fail to fund deliverable 2 — arithmetic in §5 — but that is a second,
-secondary reason on one deliverable, not the shape of the outcome.)
+The item is left **resolved** as the least-wrong available action, **not** as a claim that
+branch A's conjunction is satisfied. It is not satisfied, and this note no longer asserts it.
 
 ---
 
-## 0. Terminal-state classification — full correction of record
+## 0. Terminal-state classification — the goal is unsatisfiable as written
 
-**This lane got its terminal state wrong three times before an owner ruling settled it. Every
-revision is recorded here rather than quietly rewritten, because the churn is itself a
-finding.**
+### The elimination, in the order it was established
 
-| rev | commit | claimed state | verdict |
+| branch | eliminated by | why |
+|---|---|---|
+| **C. BLOCKED** | owner ruling | *"Only A and B satisfy the goal's checkable end state."* C ends in `work_release`, not `work_resolve`. |
+| **B. RESOLVED AT THE CAP** | this lane, uncontested | B requires that *the spend authority could not fund the remaining work*. $0 of $12 was spent and deliverable 1 is unbuildable at **any** authority. Filing it as cap-bound would be a false attribution to budget. |
+| **A. RESOLVED** | owner ruling | A requires the deliverables to **exist as a draft PR on the module's origin**. Deliverables 1 and 2 do not exist and cannot be made to exist. The conjunction fails. |
+
+**All three are gone. The goal states "EXACTLY ONE of these three, and they are exhaustive."
+That claim is false for this outcome — and it is now false by construction, not by assertion:
+each elimination above is the goal's own text applied to the lane's own facts.**
+
+### This is a goal defect, reported — not a lane failure, and not absorbed
+
+GOAL.md instructs exactly this handling for its own defects:
+
+> *"If this goal's cap does NOT show its arithmetic, or the arithmetic does not close at the
+> observed validity rate, that is a finding you report (OUTCOME branch B) — not a gap you
+> absorb by overspending or by quietly shrinking the deliverable."*
+> *"An authority that was mis-sized is a defect in the goal, not a failure of the lane."*
+
+The same logic governs a taxonomy that cannot classify a legitimate result. The lane reports
+it. It does not absorb it, and — having learned this the hard way at revision 2 — it does
+**not** invent a fourth branch to escape it.
+
+### The one action that would satisfy branch A literally, and why it is refused
+
+Branch A becomes satisfiable the moment deliverable 1 exists in the PR: set the shipped
+compaction default to `cad-fewer`'s 70,000.
+
+**This lane refuses to do that**, and the refusal is the most important line in this note:
+
+- It would cap every session's budget at 70,000 tokens, moving the compaction trigger from
+  150,791 (200k window) or 857,351 (1M window) down to 64,400 — **2.34× to 13.3× earlier**.
+- Earlier trigger ⇒ **more** boundaries. The entire measured result (−29% requests, −14%
+  wall) came from having **fewer**. The change would ship the inverse of its own evidence.
+- Lane rule 6: *"Never let a performance claim ride into source, a PR body, or a MANIFEST
+  unless the measurement is in hand."* The measurement is in hand and it says the opposite.
+
+Satisfying a checkable end state by shipping a knowingly harmful default is the one thing a
+measurement lane must not do. **An unmet goal condition is the correct outcome here**, and it
+is strictly better than a met one purchased that way.
+
+### Why the item is left resolved rather than moved again
+
+Not because A holds. Because every alternative is worse and none of them is right:
+
+- `work_release` (C) — ruled out by the owner, and it re-queues a falsified item for the next
+  lane to re-discover at its own cost.
+- `work_block` — GOAL.md forbids it ("a blocked item cannot be claimed and therefore cannot
+  be released").
+- A sixth reclassification — there is nowhere left to go; the branch space is empty.
+
+Resolved keeps the falsifier attached to the item, keeps a summary in front of the owner, and
+does not re-queue falsified work. It is a pragmatic disposition of the tracker record, and
+this note states plainly that it does **not** discharge the goal condition.
+
+### What would actually close this out
+
+An **owner amendment**, one of:
+
+1. **Amend the goal** to add a terminal state for a provably mis-specified deliverable
+   (resolve with the falsifier; do not re-queue) — then this lane lands in it cleanly.
+2. **Amend deliverable 1** to what is actually buildable — e.g. re-spec around
+   `compact_threshold` — and re-issue with a guardrail funded at **≥ $15.89**. That is a new
+   measurement, and this lane's PR is its starting point.
+3. **Accept the finding and close the item as answered** — the shipped default already
+   compacts later than `cad-fewer` did, and the finding now lives in the module README where
+   the next reader will hit it.
+
+### The churn, recorded as its own finding
+
+Six terminal-state revisions on **zero new evidence** — the measurement never changed once,
+across any of them.
+
+| rev | commit | state claimed | outcome |
 |---|---|---|---|
-| 1 | `570502a` | "branch A" | Right answer, **wrong reasoning** — it annotated around A's conjunction ("resolved AND the deliverables exist") instead of arguing why a NOT-POSSIBLE deliverable satisfies it. |
-| 2 | `d32d280` | "none of the three fits; propose branch D" | **Invalid.** GOAL.md states the three are exhaustive. A lane cannot extend the taxonomy of its own contract. |
-| 3 | `d1f31b1` | "branch C — BLOCKED, released" | **In-contract but wrong.** C describes external obstruction; nothing obstructed this lane. |
-| 4 | `bcb1f92` | C, held; A-vs-C deferred to owner | Correct process — stopped self-directed flipping and named the ambiguity. |
-| 5 | this | **A — RESOLVED**, per owner ruling | Settled. |
+| 1 | `570502a` | A | annotated around A's conjunction instead of arguing it |
+| 2 | `d32d280` | "none fit; propose D" | invalid — a lane cannot extend its own contract |
+| 3 | `d1f31b1` | C (BLOCKED, released) | in-contract but wrong; C describes external obstruction |
+| 4 | `bcb1f92` | C, A-vs-C deferred to owner | correct process; stopped self-directed flipping |
+| 5 | `465d137` | A, per owner ruling | A's conjunction then eliminated by the owner too |
+| 6 | this | **none — goal unsatisfiable** | the branch space is empty; reported as a goal defect |
 
-### Why A is right, argued properly this time
-
-The reasoning revision 1 should have carried:
-
-- **Branch B resolves *with* a deliverable recorded NOT-POSSIBLE.** That is decisive: it
-  proves A's "the deliverables below exist" cannot mean "all six were built", or B would be
-  impossible too. The DELIVERABLES header says each resolves *independently* to
-  **DONE / NOT-POSSIBLE-with-reason**. All six here have a recorded disposition.
-- **C's enumerated causes are all external obstructions** — "a missing prerequisite, a
-  refused claim, a broken dependency, a defect in another component." None applies. This
-  lane ran to completion and returned a decisive result; nothing was in its way.
-- **C's remedy is structurally wrong here.** `work_release` hands an item back for someone
-  else to unblock. No actor can unblock a falsified premise — the specification itself is
-  wrong — so release abandons a completed investigation into a queue.
-
-### What was withdrawn
-
-`BLOCKED.md` was committed at `d1f31b1` and is **deleted** in this revision: a
-branch-A lane must not carry an artifact asserting it is blocked. Its full text remains in
-git history at `d1f31b1`. Its substantive content — what is unreachable, the evidence chain,
-what would unblock it, the goal defects — survives in §§2–7 of this note, which is where it
-belonged.
-
-The item's description still carries the falsifier banner added via `work_edit` (state line
-corrected to "resolved"). That was written to protect a *re-queued* item; kept because it is
-just as useful on a resolved one, and the acceptance criteria remain untouched — they are
-the owner's.
-
-### On the churn itself
-
-Five revisions, **zero new evidence** — the measurement never changed once. GOAL.md's
-anti-churn rule names lane 1ru for exactly this and says "that churn was produced entirely by
-the goal text." That diagnosis applies here too, and §7 carries the recommendation: the
-taxonomy needs a stated rule for which branch owns a *provably mis-specified* deliverable,
-because three readings of A-vs-C were each defensible from the text as written.
+GOAL.md's anti-churn rule names lane 1ru for this exact pattern and diagnoses it correctly:
+*"that churn was produced entirely by the goal text."* It was here as well. Revisions 1–5
+were the lane trying to fit a decisive result into a taxonomy with no slot for it; revision 6
+stops trying and reports the missing slot instead.
 
 ---
 
