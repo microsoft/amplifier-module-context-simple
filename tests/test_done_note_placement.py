@@ -42,9 +42,22 @@ def _scratch_repo(tmp_path: Path) -> Path:
     return repo
 
 
-def test_checker_exists_and_has_no_env_bypass():
-    src = CHECKER.read_text()
-    assert "environ" not in src, "the guard must not have an environment-variable bypass"
+def test_checker_has_no_env_bypass():
+    """No environment variable may switch this guard off.
+
+    Checked against the parsed AST, not a substring of the source -- the module
+    *docstring* legitimately contains the words "environment-variable bypass".
+    """
+    import ast
+
+    tree = ast.parse(CHECKER.read_text())
+    offenders = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Attribute) and node.attr in {"environ", "getenv"}:
+            offenders.append(node.attr)
+        if isinstance(node, ast.Name) and node.id in {"environ", "getenv"}:
+            offenders.append(node.id)
+    assert not offenders, f"guard reads the environment: {offenders}"
 
 
 def test_this_repo_is_clean():
