@@ -69,7 +69,7 @@ Not suitable for:
 
 The SimpleContextManager uses **ephemeral compaction** - `get_messages_for_request()` returns a compacted VIEW without modifying the internal message history. The full history is always preserved in memory.
 
-Compaction triggers when token usage reaches the configured threshold (default: 92% of max_tokens):
+Compaction triggers when token usage reaches the configured threshold (default: 92% of the **effective budget** -- which is derived from the provider, *not* from `max_tokens`; see [Where the compaction trigger comes from](#where-the-compaction-trigger-comes-from)):
 
 ### Protected Messages (Never Removed)
 
@@ -89,6 +89,89 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 Anthropic API requires that every tool_use in message N has a matching tool_result in message N+1. The context manager preserves these pairs as atomic units during compaction to maintain conversation state integrity and prevent API errors.
 
 **Critical implementation detail**: When an assistant message has multiple tool_calls, there are multiple consecutive tool_result messages after it. The compaction logic walks backwards through these tool results to find the originating assistant message, ensuring the entire tool group is preserved as an atomic unit. This prevents orphaned tool results that would cause API validation errors.
+
+## Where the compaction trigger comes from
+
+The trigger is one multiplication:
+
+```
+trigger = compact_threshold * effective_budget
+```
+
+`effective_budget` comes from `_calculate_budget()`, in this priority order:
+
+1. an explicit `token_budget=` argument (deprecated, rarely used);
+2. `provider.get_model_info()` -> `context_window - 0.5 * max_output_tokens - 4096`;
+3. `provider.get_info().defaults` -> the same formula;
+4. **only if none of the above yields a window**: the configured `max_tokens`.
+
+### `max_tokens` is a fallback, not a cap
+
+Orchestrators call `get_messages_for_request(provider=provider)`, so in
+practice branch 2 or 3 always answers and **branch 4 is never reached**.
+The `max_tokens` value in your bundle config (the shipped foundation bundle
+sets `max_tokens: 300000`) therefore has **no effect on when compaction
+fires**. Lowering it to compact sooner, or raising it to compact later, is a
+no-op on the wire.
+
+This is a real trap, not a theoretical one. The cadence probe that produced
+the numbers below could not move the trigger with config at all: its harness
+had to patch this module's source in-container to add
+`budget = min(budget, self.max_tokens)` before either of its arms would
+compact in a bounded run.
+
+`tests/test_compaction_trigger_provenance.py` pins this behavior in both
+directions -- same history and same config compacts with no provider and does
+*not* compact with one -- so the trap fails a test rather than a measurement
+run.
+
+**To move the trigger, move `compact_threshold`.** It is the only shipped knob
+that expresses "compact later" independently of the provider, and the old
+value stays reachable:
+
+```yaml
+context:
+  module: context-simple
+  config:
+    compact_threshold: 0.80   # compact earlier than the 0.92 default
+```
+
+### What the cadence measurement does and does not say
+
+Measured on the S5-CRAC scenario (`gpt-5.6-terra`, n=2 vs n=5 reused
+baselines; capture root
+`.amplifier/evaluation/treatment-validation/20260901-cadence/`,
+`PROBE4-VERDICT.md`), raising the compaction trigger budget from 45,000 to
+70,000 tokens produced:
+
+| arm | boundaries | requests | wall (s) | cost ($) | S5 score |
+|---|---:|---:|---:|---:|---:|
+| `cad-today` (trigger 45k, n=5) | 21.6 | 104 | 562 | 2.58 | 94.4 |
+| `cad-fewer` (trigger 70k, n=2) | 9.5 | **74** | **485** | 2.65 | 95.0 |
+
+**-29% requests, -14% wall, at equal cost and equal quality** -- and the only
+arm in that matrix where input-item caching measurably occurred (20/72 and
+11/77 requests). Buy the latency and request-count win; **do not promise a
+cost win** ($2.65 vs $2.58 is nil, in the wrong direction).
+
+Two limits on that result, both from its own source:
+
+- Both values are **scenario forcing knobs**. 45,000 exists to make a bounded
+  10-turn run compact at all. Neither is a production default, and neither is
+  a value this module has ever shipped.
+- **Production already compacts later than `cad-fewer` did.** With a
+  200,000-token window the shipped trigger is `0.92 * 163,904 = 150,791`
+  tokens; `cad-fewer`'s was `0.92 * 70,000 = 64,400`. Adopting 70,000 as a
+  budget cap would move the trigger **earlier** for every provider whose
+  window exceeds it -- more boundaries, inverting the measured win. The
+  parametrized test at the bottom of
+  `tests/test_compaction_trigger_provenance.py` asserts exactly this.
+
+The general finding still holds and is the one to carry forward: **fewer
+compaction boundaries buys latency and request count, not money, and costs no
+measurable quality** (post-compaction retention was 20/20 in every run of
+every arm, `b_constraints` 40/40 throughout -- on a scenario whose 5 crisp
+constraints may be a ceiling effect).
 
 ## Real-usage token meter (`token_meter`)
 
