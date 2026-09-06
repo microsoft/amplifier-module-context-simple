@@ -244,6 +244,21 @@ class SimpleContextManager:
         self.token_meter = token_meter
         self._hooks = hooks
         self._last_compaction_stats: dict[str, Any] | None = None
+        # Which compaction-stats object the model has already been TOLD about.
+        # Compared by identity against `_last_compaction_stats`, which is
+        # replaced wholesale (never mutated) on each real escalation --
+        # see _finalize_compaction_with_stats. This is what lets
+        # get_messages_for_request() distinguish "a compaction just happened"
+        # from "the same compaction I already announced, N turns ago", so the
+        # tail notice can degrade to a short standing form instead of
+        # replaying a stale full report on every request forever (#513).
+        #
+        # NOT keyed on stats["strategy_level"]: that is the sticky monotonic
+        # high-water mark (see _sticky_level below), which pins at its ceiling
+        # early in a long session -- every later escalation reports the SAME
+        # level while still dropping real messages. Keying on level would
+        # silently suppress the notice for genuinely new compaction work.
+        self._notice_shown_for_stats: dict[str, Any] | None = None
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
         # most recent real usage observed via `llm:response`
@@ -465,11 +480,14 @@ class SimpleContextManager:
             #    the cached prefix. Tail + ephemeral=True + role != "system" is
             #    the only combination the existing provider fix recognizes.
             #
-            # The notice content itself only changes when a NEW compaction
-            # escalation actually occurs (see _compact_ephemeral's sticky decision
-            # state) -- so on calls between escalations, this tail addition is
-            # byte-identical, and everything before it (the real prefix) is
-            # completely undisturbed either way.
+            # The notice's TEXT varies (full report on a new escalation, short
+            # standing reminder on repeats -- see _format_standing_compaction_notice),
+            # and that is cache-irrelevant by construction: the notice is never
+            # persisted into self.messages and is always the LAST element, so the
+            # prefix shared between consecutive requests never contains a notice at
+            # all. Cache safety comes from role != "system" + metadata.ephemeral=True
+            # + tail position (points 1 and 2 above), not from the notice's bytes.
+            # Everything before it (the real prefix) is undisturbed either way.
             if self.compaction_notice_enabled and self._last_compaction_stats:
                 level = self._last_compaction_stats.get("strategy_level", 0)
                 # GUARD: never append into an unanswered tool_calls turn.
@@ -498,7 +516,20 @@ class SimpleContextManager:
                         "It will be appended on the next request instead."
                     )
                 elif level >= self.compaction_notice_min_level:
-                    notice = self._format_compaction_notice()
+                    # Fresh vs. standing (#513). Identity, not equality: the
+                    # stats dict is replaced wholesale on each real escalation
+                    # (_finalize_compaction_with_stats) and never mutated, so
+                    # `is` is an exact "something actually changed" signal --
+                    # unlike strategy_level, which is a monotonic high-water
+                    # mark that stops changing long before compaction does.
+                    is_new_escalation = (
+                        self._last_compaction_stats is not self._notice_shown_for_stats
+                    )
+                    notice = (
+                        self._format_compaction_notice()
+                        if is_new_escalation
+                        else self._format_standing_compaction_notice()
+                    )
                     if notice:
                         compacted.append(
                             {
@@ -506,12 +537,17 @@ class SimpleContextManager:
                                 "content": notice,
                                 "metadata": {
                                     "source": "context-compaction",
+                                    "notice_kind": "full"
+                                    if is_new_escalation
+                                    else "standing",
                                     "ephemeral": True,
                                 },
                             }
                         )
+                        self._notice_shown_for_stats = self._last_compaction_stats
                         logger.debug(
-                            f"Appended compaction notice at tail (level {level}, "
+                            f"Appended {'full' if is_new_escalation else 'standing'} "
+                            f"compaction notice at tail (level {level}, "
                             f"verbosity: {self.compaction_notice_verbosity})"
                         )
 
@@ -599,6 +635,7 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._notice_shown_for_stats = None
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:
@@ -610,6 +647,7 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._notice_shown_for_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
         logger.info("Context cleared")
@@ -1860,6 +1898,39 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
 </system-reminder>"""
 
         return notice
+
+    def _format_standing_compaction_notice(self) -> str:
+        """Format the SHORT 'nothing new happened' compaction notice.
+
+        Emitted in place of the full report on every request between real
+        escalations (#513). Deliberately SELF-CONTAINED: it must not refer
+        back to the earlier full notice, because that notice is not in this
+        request -- notices are appended to the ephemeral view only and are
+        never written to self.messages.
+
+        Byte-stable across consecutive repeats at the same level. Can be
+        overridden by subclasses alongside _format_compaction_notice.
+
+        Returns:
+            Formatted notice string, or empty string if no stats available.
+        """
+        if not self._last_compaction_stats:
+            return ""
+
+        level = self._last_compaction_stats.get("strategy_level", 0)
+
+        return (
+            '<system-reminder source="context-compaction-standing">\n'
+            f"Context compaction is still in effect (level {level}/8), and NOTHING NEW "
+            "was compacted for this request. This is a standing reminder of an "
+            "existing condition, not a new event: no messages or tool results were "
+            "dropped since your previous turn.\n"
+            "No action is needed. Continue the current task -- do not re-read files, "
+            "re-run tools, or re-verify state on account of this reminder. Truncated "
+            "tool results carry their own inline truncation markers; re-run a tool "
+            "only if you actually need content you can see is missing.\n"
+            "</system-reminder>"
+        )
 
     def _format_affected_items(self, level: int, stats: dict[str, Any]) -> str:
         """
