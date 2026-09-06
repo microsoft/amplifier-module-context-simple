@@ -1,0 +1,75 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  lint:
+    name: ruff check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      # `ruff check` only -- deliberately NOT `ruff format --check`.
+      #
+      # Measured on clean main (ruff 0.14.10): `ruff check .` -> "All checks
+      # passed!"; `ruff format --check .` -> "5 files would be reformatted"
+      # (amplifier_module_context_simple/__init__.py, three test modules, one
+      # docs/lanes evidence script). No repo in this module family carries a
+      # [tool.ruff] section or a ruff.toml, so `format --check` would be
+      # enforcing ruff's default line-length-88 -- a convention this repo was
+      # never written to and its siblings do not use. Wiring it would make CI
+      # red on clean main on day one, which is the one thing this workflow was
+      # explicitly not allowed to do. Reported rather than papered over.
+      #
+      # Version-pinned so a local run reproduces CI byte for byte:
+      #   uvx ruff@0.14.10 check .
+      # (ruff is not in this repo's dev group; provider-openai pins
+      # ruff>=0.14.10 in its own dev group but never invokes it in CI.)
+      - name: ruff check
+        run: uvx ruff@0.14.10 check .
+
+  test:
+    name: pytest (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    # A hang must fail LOUDLY and fast, not sit burning runner time until the
+    # 6h default -- a job stuck at "in_progress" reads as "not done yet"
+    # rather than "broken", which is how a false green gets merged.
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # requires-python = ">=3.11" -- cover the floor and a current minor.
+        # ubuntu-latest only: the template this is modelled on
+        # (provider-openai) is single-OS. provider-anthropic runs a 3-OS
+        # matrix, but it has to -- it ships OS-sensitive provider I/O.
+        # context-simple is pure in-memory message-list manipulation with
+        # zero runtime dependencies; a broader matrix here would be cost
+        # without signal.
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install dependencies
+        run: uv sync --all-extras --dev
+
+      # No API key placeholder here, unlike provider-openai's CI. Measured:
+      # with ANTHROPIC_API_KEY/OPENAI_API_KEY unset, the suite is
+      # "102 passed, 1 xfailed" -- context-simple's structural and behavioral
+      # tests inherit from amplifier-core and mount no live provider.
+      #
+      # No `-m "not live"` deselection either: this repo registers no `live`
+      # marker and has no network-dependent tests.
+      - name: Run test suite
+        run: uv run pytest -q
