@@ -1,0 +1,48 @@
+pytest (py3.12)	Run test suite	﻿2026-09-06T21:41:20.7752486Z ##[group]Run uv run pytest -q
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7752823Z [36;1muv run pytest -q[0m
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7791675Z shell: /usr/bin/bash -e {0}
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7791943Z env:
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7792138Z   UV_PYTHON: 3.12
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7792595Z   VIRTUAL_ENV: /home/runner/work/amplifier-module-context-simple/amplifier-module-context-simple/.venv
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7793167Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+pytest (py3.12)	Run test suite	2026-09-06T21:41:20.7793481Z ##[endgroup]
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.6643853Z .............F......x................................................... [ 69%]
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7458369Z ................................                                         [100%]
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7459125Z =================================== FAILURES ===================================
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7459756Z _______________________ test_ci_workflow_can_report_red ________________________
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7460183Z 
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7460351Z     def test_ci_workflow_can_report_red():
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7461061Z >       assert 1 == 2, "deliberate failure -- proving CI reports RED, not a false green"
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7462253Z E       AssertionError: deliberate failure -- proving CI reports RED, not a false green
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7463150Z E       assert 1 == 2
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7463472Z 
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7463812Z tests/test_ci_red_proof.py:11: AssertionError
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7464693Z =========================== short test summary info ============================
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7467181Z FAILED tests/test_ci_red_proof.py::test_ci_workflow_can_report_red - AssertionError: deliberate failure -- proving CI reports RED, not a false green
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7469034Z assert 1 == 2
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7469490Z 1 failed, 102 passed, 1 xfailed in 9.08s
+pytest (py3.12)	Run test suite	2026-09-06T21:41:30.7900636Z ##[error]Process completed with exit code 1.
+pytest (py3.11)	Run test suite	﻿2026-09-06T21:41:21.8916700Z ##[group]Run uv run pytest -q
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8917037Z [36;1muv run pytest -q[0m
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8959713Z shell: /usr/bin/bash -e {0}
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8959988Z env:
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8960207Z   UV_PYTHON: 3.11
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8960676Z   VIRTUAL_ENV: /home/runner/work/amplifier-module-context-simple/amplifier-module-context-simple/.venv
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8961240Z   UV_CACHE_DIR: /home/runner/work/_temp/setup-uv-cache
+pytest (py3.11)	Run test suite	2026-09-06T21:41:21.8961551Z ##[endgroup]
+pytest (py3.11)	Run test suite	2026-09-06T21:41:31.9934701Z .............F......x................................................... [ 69%]
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0701035Z ................................                                         [100%]
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0702150Z =================================== FAILURES ===================================
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0703107Z _______________________ test_ci_workflow_can_report_red ________________________
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0703609Z 
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0703832Z     def test_ci_workflow_can_report_red():
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0704580Z >       assert 1 == 2, "deliberate failure -- proving CI reports RED, not a false green"
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0705624Z E       AssertionError: deliberate failure -- proving CI reports RED, not a false green
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0706241Z E       assert 1 == 2
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0706441Z 
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0706619Z tests/test_ci_red_proof.py:11: AssertionError
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0707144Z =========================== short test summary info ============================
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0708698Z FAILED tests/test_ci_red_proof.py::test_ci_workflow_can_report_red - AssertionError: deliberate failure -- proving CI reports RED, not a false green
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0709677Z assert 1 == 2
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.0710062Z 1 failed, 102 passed, 1 xfailed in 9.38s
+pytest (py3.11)	Run test suite	2026-09-06T21:41:32.1131064Z ##[error]Process completed with exit code 1.
