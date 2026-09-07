@@ -90,6 +90,26 @@ Anthropic API requires that every tool_use in message N has a matching tool_resu
 
 **Critical implementation detail**: When an assistant message has multiple tool_calls, there are multiple consecutive tool_result messages after it. The compaction logic walks backwards through these tool results to find the originating assistant message, ensuring the entire tool group is preserved as an atomic unit. This prevents orphaned tool results that would cause API validation errors.
 
+### Compaction Notice
+
+When `compaction_notice_enabled` is true and the sticky compaction level meets
+`compaction_notice_min_level`, a tail-position notice is appended to the returned view (never
+persisted to history) so the model knows compaction happened. It comes in two forms:
+
+- **Full** (`source="context-compaction"`): the complete incident report -- level, message/token
+  counts, what was preserved, what may be affected. Emitted the first time the model is told about
+  a given compaction.
+- **Standing** (`source="context-compaction-standing"`): a short, self-contained "nothing new
+  happened since last time" reminder, with an explicit "don't re-verify" instruction. Emitted on
+  every subsequent request until the *next* real compaction occurs, instead of repeating the full
+  report byte-for-byte forever.
+
+Both forms are gated by the same `compaction_notice_enabled` / `compaction_notice_min_level`
+settings and both carry `metadata["source"] = "context-compaction"` (so existing consumers that
+filter on that value see both); a `metadata["notice_kind"]` of `"full"` or `"standing"` is added
+for telemetry. `compaction_notice_verbosity` applies to the full notice only. No new configuration
+option is introduced by this distinction.
+
 ## Where the compaction trigger comes from
 
 The trigger is one multiplication:

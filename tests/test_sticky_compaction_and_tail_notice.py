@@ -828,6 +828,143 @@ async def test_notice_returns_once_tool_results_arrive():
 
 
 # ---------------------------------------------------------------------------
+# (d.1) #513 -- fresh vs. standing compaction notice
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_first_notice_after_new_escalation_is_full():
+    """#513: the notice for a compaction the model has not been told about yet
+    must be the FULL report -- the standing/short form must never pre-empt the
+    first delivery of real compaction news."""
+    context = _make_context()
+    await _fill_until_compacted(context)
+
+    view = await context.get_messages_for_request()
+
+    assert context._last_compaction_stats is not None, "compaction should have fired"
+    notices = _notices(view)
+    assert len(notices) == 1
+    notice = notices[0]
+    assert view[-1] is notice, "notice must still be at the tail"
+    assert notice["metadata"]["notice_kind"] == "full"
+    assert notice["metadata"]["source"] == "context-compaction"
+    assert notice["metadata"]["ephemeral"] is True
+    assert notice["role"] == "user"
+    content = notice["content"]
+    assert 'source="context-compaction"' in content
+    assert "context-compaction-standing" not in content
+    assert "Compaction summary:" in content
+
+
+@pytest.mark.asyncio
+async def test_repeat_notice_with_no_new_escalation_is_standing():
+    """#513 core regression: with nothing new compacted, the tail notice must
+    degrade to the short standing form instead of replaying the full incident
+    report -- which previously repeated verbatim for the rest of the session."""
+    context = _make_context(compact_threshold=0.92, target_usage=0.5)
+    await _fill_until_compacted(context)
+
+    first = await context.get_messages_for_request()
+    stats_after_first = context._last_compaction_stats
+    assert stats_after_first is not None
+    first_notices = _notices(first)
+    assert len(first_notices) == 1
+    assert first_notices[0]["metadata"]["notice_kind"] == "full"
+    full_text = first_notices[0]["content"]
+
+    await context.add_message(_padded(900, "user"))
+    await context.add_message(_padded(900, "assistant"))
+    second = await context.get_messages_for_request()
+
+    assert context._last_compaction_stats is stats_after_first, (
+        "test precondition: the second call must NOT be a new escalation"
+    )
+
+    second_notices = _notices(second)
+    assert len(second_notices) == 1, (
+        "the standing notice must still be discoverable via metadata.source == "
+        "'context-compaction' -- downstream consumers filter on that value"
+    )
+    notice = second_notices[0]
+    assert second[-1] is notice
+    assert notice["role"] == "user"
+    assert notice["metadata"]["ephemeral"] is True
+    assert notice["metadata"]["notice_kind"] == "standing"
+
+    standing_text = notice["content"]
+    assert standing_text != full_text, "this is the bug: stale full notice replayed"
+    assert 'source="context-compaction-standing"' in standing_text
+    assert "Compaction summary:" not in standing_text
+    assert len(standing_text) < len(full_text)
+    assert "system-reminder" in standing_text
+    assert "compact" in standing_text.lower()
+
+
+@pytest.mark.asyncio
+async def test_new_escalation_emits_full_notice_again():
+    """#513: the standing form must never latch. Every genuinely new
+    escalation -- including one at the SAME strategy_level, which is the
+    steady state of any long session -- gets a fresh full report."""
+    context = _make_context()
+    await _fill_until_compacted(context)
+
+    observations: list[tuple[int, bool, str]] = []
+    full_texts: list[str] = []
+    last_stats = None
+
+    for i in range(12):
+        view = await context.get_messages_for_request()
+        stats = context._last_compaction_stats
+        is_new = stats is not last_stats
+        last_stats = stats
+
+        notices = _notices(view)
+        assert len(notices) == 1, f"call {i}: expected exactly one tail notice"
+        kind = notices[0]["metadata"]["notice_kind"]
+        observations.append((i, is_new, kind))
+        if kind == "full":
+            full_texts.append(notices[0]["content"])
+
+        await context.add_message(_padded(4000 + i, "user"))
+        await context.add_message(_padded(4000 + i, "assistant"))
+
+    escalations = [i for i, is_new, _ in observations if is_new]
+    assert len(escalations) >= 2, (
+        f"test precondition: needed >=2 escalations across 12 calls, got {escalations}"
+    )
+
+    for i, is_new, kind in observations:
+        assert kind == ("full" if is_new else "standing"), (
+            f"call {i}: new_escalation={is_new} but notice_kind={kind!r}"
+        )
+
+    assert len(full_texts) >= 2
+    assert full_texts[0] != full_texts[-1], (
+        "a later escalation must report its own numbers, not replay the first"
+    )
+    assert sum(1 for _, _, k in observations if k == "full") < len(observations)
+
+
+@pytest.mark.asyncio
+async def test_standing_notice_respects_notice_config_gates():
+    """Both notice variants sit inside the same enabled/min_level gates."""
+    disabled = _make_context(compaction_notice_enabled=False)
+    await _fill_until_compacted(disabled)
+    for _ in range(3):
+        assert _notices(await disabled.get_messages_for_request()) == []
+
+    gated = _make_context(compaction_notice_min_level=9)  # sticky level tops out at 8
+    await _fill_until_compacted(gated)
+    for _ in range(3):
+        assert _notices(await gated.get_messages_for_request()) == []
+    assert gated._last_compaction_stats is not None, "compaction still ran"
+    assert gated._notice_shown_for_stats is None, (
+        "a suppressed notice must not be recorded as delivered"
+    )
+
+
+# ---------------------------------------------------------------------------
 # (e) `_seq` is internal bookkeeping and must not cross the module boundary
 # ---------------------------------------------------------------------------
 
