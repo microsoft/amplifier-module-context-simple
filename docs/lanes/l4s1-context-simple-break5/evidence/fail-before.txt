@@ -1,0 +1,24 @@
+HEAD=dd9b9c3f042fc70588f0afbd6a81f4ac20337ee7
+F..                                                                      [100%]
+=================================== FAILURES ===================================
+__________________ test_loaded_tool_state_survives_compaction __________________
+
+    def test_loaded_tool_state_survives_compaction():
+        mgr = _manager()
+        out = _build(mgr)
+        carriers = _carriers(out)
+>       assert len(carriers) == 1, (
+            "the message recording which tools were dynamically loaded was dropped "
+            "by compaction -- per TS:854 those tools now cease to exist for the "
+            "model AND the prompt cache breaks forward, silently (break 5)."
+        )
+E       AssertionError: the message recording which tools were dynamically loaded was dropped by compaction -- per TS:854 those tools now cease to exist for the model AND the prompt cache breaks forward, silently (break 5).
+E       assert 0 == 1
+E        +  where 0 = len([])
+
+tests/test_loaded_tool_state_protection.py:90: AssertionError
+=========================== short test summary info ============================
+FAILED tests/test_loaded_tool_state_protection.py::test_loaded_tool_state_survives_compaction
+1 failed, 2 passed in 0.03s
+...............................                                          [100%]
+102 passed, 1 xfailed in 4.93s
