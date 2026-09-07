@@ -49,6 +49,15 @@ from 58 to 102 tests between the two heads; the delta is the same **+3**.
 
 Raw logs: `evidence/fail-before.txt`, `evidence/pass-after.txt`.
 
+**CI is green, and this is the first of the break-5 attempts where that means
+something.** `context-simple` got its first workflow in this program (PR #36, `dd9b9c3`),
+proven red-then-green before merging. Run
+[`34081821041`](https://github.com/microsoft/amplifier-module-context-simple/actions/runs/34081821041)
+on commit `1a83f17`: **`ruff check` success · `pytest (py3.11)` success ·
+`pytest (py3.12)` success**. Captured at `evidence/ci-green-run.json`. (That run predates
+this paragraph by one commit; the run for the final head is recorded in the lane's
+`DONE.json`, so neither citation chases its own tail.)
+
 **Byte-identity of default mode.** The protection fires only when a message's
 `metadata` carries a key in `LOADED_TOOL_STATE_METADATA_KEYS`. With no such key
 present, `loaded_tool_state_indices` is empty, `protected_indices` is untouched and no
