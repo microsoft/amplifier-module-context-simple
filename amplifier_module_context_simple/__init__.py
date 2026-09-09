@@ -7,7 +7,8 @@ Implements an in-memory context manager with EPHEMERAL compaction:
   • get_messages_for_request() returns compacted VIEW (new list)
   • get_messages() returns FULL history (for transcripts/session persistence)
 
-This design ensures conversation history is never lost, even during compaction.
+Compaction never loses admitted history. Oversized direct tool-result text is
+irreversibly clipped before admission and is not retained in the transcript.
 For persistent storage across sessions, use context-persistent instead.
 
 Dynamic System Prompt Support:
@@ -41,11 +42,24 @@ __amplifier_module_type__ = "context"
 import logging
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
+from sys import maxsize
 from typing import Any
 
-from amplifier_core import ModuleCoordinator
+from amplifier_core import ModuleCoordinator, TextBlock
 
 logger = logging.getLogger(__name__)
+
+DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024
+_TOOL_RESULT_INGRESS_MARKER = (
+    "[tool-result truncated at ingress: original_text_utf8_bytes={original_text_utf8_bytes}; "
+    "retrieve missing content using narrower read/query parameters; do not repeat "
+    "state-changing actions just to recover output.]"
+)
+_MIN_MAX_TOOL_RESULT_BYTES = len(
+    _TOOL_RESULT_INGRESS_MARKER.format(original_text_utf8_bytes=maxsize).encode(
+        "utf-8", errors="replace"
+    )
+)
 
 # token_meter config values. "estimate" (default) preserves pre-existing
 # behavior exactly; "actual" lets a real llm:response measurement drive the
@@ -120,6 +134,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               falling back to the estimator before then. An unrecognized
               value falls back to "estimate" with a logged warning rather
               than crashing mount(). See module docstring.
+            - max_tool_result_bytes: Maximum UTF-8 bytes admitted for direct
+              text in one tool result (default: 131,072). Oversized text is
+              irreversibly clipped at ingress with a retrieval marker.
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -152,6 +169,9 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         output_reserve_fraction=config.get("output_reserve_fraction", 0.5),
         token_meter=token_meter,
         hooks=getattr(coordinator, "hooks", None),
+        max_tool_result_bytes=config.get(
+            "max_tool_result_bytes", DEFAULT_MAX_TOOL_RESULT_BYTES
+        ),
     )
 
     # Always register the meter listener when hooks are available, regardless
@@ -189,7 +209,8 @@ class SimpleContextManager:
 
     Owns memory policy: orchestrators ask for messages via get_messages_for_request(),
     and this context manager decides how to fit them within limits. Compaction is
-    handled internally and ephemerally - the original history is always preserved.
+    handled internally and ephemerally - admitted history is always preserved.
+    Oversized direct tool-result text is clipped before it enters that history.
 
     Compaction Strategy (Progressive Interleaved):
     Triggered when usage >= compact_threshold (default 92%), target is target_usage (default 50%).
@@ -228,6 +249,7 @@ class SimpleContextManager:
         output_reserve_fraction: float = 0.5,
         token_meter: str = TOKEN_METER_ESTIMATE,
         hooks: Any = None,
+        max_tool_result_bytes: int = DEFAULT_MAX_TOOL_RESULT_BYTES,
     ):
         """
         Initialize the context manager.
@@ -257,7 +279,20 @@ class SimpleContextManager:
             hooks: Optional hooks instance for emitting observability events
                 and (always, when present) recording real usage for the
                 token meter via `llm:response` -- see `_on_llm_response`.
+            max_tool_result_bytes: Maximum UTF-8 bytes admitted for direct
+                text in one tool result. The minimum allows the truncation
+                marker itself; default is 128 KiB.
         """
+        if (
+            isinstance(max_tool_result_bytes, bool)
+            or not isinstance(max_tool_result_bytes, int)
+            or max_tool_result_bytes < _MIN_MAX_TOOL_RESULT_BYTES
+        ):
+            raise ValueError(
+                "max_tool_result_bytes must be an integer at least "
+                f"{_MIN_MAX_TOOL_RESULT_BYTES} so the ingress truncation marker fits"
+            )
+
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
         self.compact_threshold = compact_threshold
@@ -279,6 +314,7 @@ class SimpleContextManager:
             token_meter = TOKEN_METER_ESTIMATE
         self.token_meter = token_meter
         self._hooks = hooks
+        self.max_tool_result_bytes = max_tool_result_bytes
         self._last_compaction_stats: dict[str, Any] | None = None
         # Real-usage token meter state (see _on_llm_response /
         # _measure_working_tokens). `_last_measured_prompt_tokens` holds the
@@ -313,6 +349,143 @@ class SimpleContextManager:
         # accumulated effect, not just the most recent escalation step.
         self._sticky_level: int = 0
 
+    @staticmethod
+    def _encode_tool_result_text(text: str) -> bytes:
+        """Encode direct text, replacing lone surrogates for ingress accounting."""
+        return text.encode("utf-8", errors="replace")
+
+    @classmethod
+    def _utf8_safe_prefix(cls, text: str, max_bytes: int) -> str:
+        """Return a valid UTF-8 prefix, replacing lone surrogates when clipped."""
+        return cls._encode_tool_result_text(text)[:max_bytes].decode(
+            "utf-8", errors="ignore"
+        )
+
+    @staticmethod
+    def _direct_text_block_text(block: Any) -> str | None:
+        """Return text only from the two supported direct text block shapes."""
+        if isinstance(block, TextBlock):
+            return block.text
+        if (
+            isinstance(block, dict)
+            and block.get("type") == "text"
+            and isinstance(block.get("text"), str)
+        ):
+            return block["text"]
+        return None
+
+    @staticmethod
+    def _copy_text_block_with_text(block: Any, text: str) -> Any:
+        """Copy a recognized text block while preserving its other fields."""
+        if isinstance(block, TextBlock):
+            return block.model_copy(update={"text": text})
+        return {**block, "text": text}
+
+    def _limit_tool_result_text_at_ingress(
+        self, message: dict[str, Any]
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Bound direct tool-result text without mutating the caller's message.
+
+        This intentionally handles only a string content value and direct
+        ``TextBlock``/``{"type": "text"}`` entries in a top-level content list.
+        Other blocks, nested structures, and unknown shapes remain untouched.
+        """
+        if message.get("role") != "tool":
+            return message, None
+
+        content = message.get("content")
+        content_kind: str | None = None
+        if isinstance(content, str):
+            original_text_utf8_bytes = len(self._encode_tool_result_text(content))
+            content_kind = "string"
+        elif isinstance(content, list):
+            original_text_utf8_bytes = sum(
+                len(self._encode_tool_result_text(text))
+                for block in content
+                if (text := self._direct_text_block_text(block)) is not None
+            )
+            content_kind = "text_blocks"
+        else:
+            return message, None
+
+        if original_text_utf8_bytes <= self.max_tool_result_bytes:
+            return message, None
+
+        marker = _TOOL_RESULT_INGRESS_MARKER.format(
+            original_text_utf8_bytes=original_text_utf8_bytes
+        )
+        marker_bytes = len(self._encode_tool_result_text(marker))
+        remaining_text_bytes = self.max_tool_result_bytes - marker_bytes
+
+        if isinstance(content, str):
+            limited_content = self._utf8_safe_prefix(content, remaining_text_bytes) + marker
+        else:
+            limited_content: list[Any] = []
+            marker_added = False
+            for block in content:
+                text = self._direct_text_block_text(block)
+                if text is None:
+                    limited_content.append(block)
+                    continue
+                if marker_added:
+                    continue
+
+                prefix = self._utf8_safe_prefix(text, remaining_text_bytes)
+                prefix_bytes = len(self._encode_tool_result_text(prefix))
+                if prefix_bytes == len(self._encode_tool_result_text(text)):
+                    limited_content.append(self._copy_text_block_with_text(block, prefix))
+                    remaining_text_bytes -= prefix_bytes
+                    continue
+
+                limited_content.append(
+                    self._copy_text_block_with_text(block, prefix + marker)
+                )
+                marker_added = True
+
+        stored_text_utf8_bytes = (
+            len(self._encode_tool_result_text(limited_content))
+            if isinstance(limited_content, str)
+            else sum(
+                len(self._encode_tool_result_text(text))
+                for block in limited_content
+                if (text := self._direct_text_block_text(block)) is not None
+            )
+        )
+        event_data = {
+            "tool_name": message.get("name"),
+            "tool_call_id": message.get("tool_call_id"),
+            "original_text_utf8_bytes": original_text_utf8_bytes,
+            "stored_text_utf8_bytes": stored_text_utf8_bytes,
+            "max_tool_result_bytes": self.max_tool_result_bytes,
+            "content_kind": content_kind,
+        }
+        return {**message, "content": limited_content}, event_data
+
+    async def _emit_tool_result_ingress_truncation(self, event_data: dict[str, Any]) -> None:
+        """Emit ingress observability without ever blocking tool-result admission."""
+        if self._hooks is not None:
+            try:
+                await self._hooks.emit("context:tool_result_ingress_truncated", event_data)
+                return
+            except Exception:
+                emission_status = "event emission failed"
+        else:
+            emission_status = "no hooks are registered"
+
+        logger.warning(
+            "context-simple: tool result truncated at ingress (%s; tool_name=%r, "
+            "tool_call_id=%r, original_text_utf8_bytes=%d, stored_text_utf8_bytes=%d, "
+            "max_tool_result_bytes=%d); retrieve missing content using narrower "
+            "read/query parameters; do not repeat state-changing actions just to "
+            "recover output.",
+            emission_status,
+            event_data["tool_name"],
+            event_data["tool_call_id"],
+            event_data["original_text_utf8_bytes"],
+            event_data["stored_text_utf8_bytes"],
+            event_data["max_tool_result_bytes"],
+        )
+
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
@@ -325,6 +498,8 @@ class SimpleContextManager:
         Timestamps are automatically added to message metadata for replay timing.
         Existing timestamps and metadata are preserved.
         """
+        message, truncation_event = self._limit_tool_result_text_at_ingress(message)
+
         # Add timestamp in metadata if not already present (for replay timing)
         existing_meta = message.get("metadata") or {}
         if "timestamp" not in existing_meta:
@@ -347,6 +522,8 @@ class SimpleContextManager:
 
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
+        if truncation_event is not None:
+            await self._emit_tool_result_ingress_truncation(truncation_event)
 
         token_count = self._estimate_tokens(self.messages)
         usage = token_count / self.max_tokens
@@ -624,7 +801,11 @@ class SimpleContextManager:
         produced the transcript.
         """
         restamped: list[dict[str, Any]] = []
+        truncation_events: list[dict[str, Any]] = []
         for i, msg in enumerate(messages):
+            msg, truncation_event = self._limit_tool_result_text_at_ingress(msg)
+            if truncation_event is not None:
+                truncation_events.append(truncation_event)
             meta = dict(msg.get("metadata") or {})
             meta["_seq"] = i
             restamped.append({**msg, "metadata": meta})
@@ -635,6 +816,8 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        for truncation_event in truncation_events:
+            await self._emit_tool_result_ingress_truncation(truncation_event)
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:

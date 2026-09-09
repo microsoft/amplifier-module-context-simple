@@ -43,8 +43,31 @@ module = "context-simple"
 name = "simple"
 config = {
     max_messages = 100  # Optional limit
+    max_tool_result_bytes = 131072 # Optional 128 KiB ingress text cap
 }
 ```
+
+### Tool-result text ingress cap
+
+Before admission, a tool message's string content (including JSON serialized
+`ToolResult` dict/list output) is limited to `max_tool_result_bytes`, which
+defaults to 131,072 UTF-8 bytes. Oversized content keeps a UTF-8-safe prefix
+and one explicit retrieval marker. Raise this one explicit setting only for a
+legitimate larger text result; there is no off switch in this version.
+
+For block content, the cap covers only direct text blocks. Image, audio,
+unknown, and nested block data are not read or sliced. The original oversized
+text is not retained in metadata, a side file, or the admitted transcript:
+retrieve missing content using narrower read/query parameters; do not repeat
+state-changing actions just to recover output. For ill-formed Python text
+containing lone surrogates, byte accounting uses UTF-8 replacement; under-cap
+content remains unchanged, while an oversized clipped prefix is valid UTF-8.
+
+The default is a finite observed baseline, not a universal tail guarantee:
+509 outputs from 16 stock-main S1 captures had a 40,139-byte p99 and
+87,301-byte maximum, with none above 128 KiB. 128 KiB is 3.27x that p99 and
+1.5x that maximum, while still fitting the local 64k-window regression where
+a 256 KiB cap would not.
 
 ## Usage
 
@@ -67,7 +90,10 @@ Not suitable for:
 
 ## Compaction Strategy
 
-The SimpleContextManager uses **ephemeral compaction** - `get_messages_for_request()` returns a compacted VIEW without modifying the internal message history. The full history is always preserved in memory.
+The SimpleContextManager uses **ephemeral compaction** -
+`get_messages_for_request()` returns a compacted VIEW without modifying the
+admitted internal message history. Ingress-clipped tool text is irreversible
+and is not retained in the canonical transcript; compaction remains view-only.
 
 Compaction triggers when token usage reaches the configured threshold (default: 92% of the **effective budget** -- which is derived from the provider, *not* from `max_tokens`; see [Where the compaction trigger comes from](#where-the-compaction-trigger-comes-from)):
 
