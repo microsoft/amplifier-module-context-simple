@@ -41,10 +41,9 @@ Provides straightforward in-memory conversation context management. This is the 
 [[contexts]]
 module = "context-simple"
 name = "simple"
-config = {
-    max_messages = 100  # Optional limit
-    max_tool_result_bytes = 131072 # Optional 128 KiB ingress text cap
-}
+
+[contexts.config]
+max_tool_result_bytes = 131072  # Optional override; default is 128 KiB
 ```
 
 ### Tool-result text ingress cap
