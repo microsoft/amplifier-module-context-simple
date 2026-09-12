@@ -302,3 +302,4 @@ Nothing blocking. Two observations handed on rather than acted on:
    is now well-defined at 0 and negative, but e.g. `target_usage=5.0` or
    `truncate_chars=-1` remain undefined. Worth one item if anyone wants the
    constructor to fail loud; not filed, because it is a design call, not a defect.
+
