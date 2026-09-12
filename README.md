@@ -104,6 +104,26 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 - **Recent messages**: Last N% of messages (configurable via `protected_recent`)
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
 
+Persisted ephemeral reminders are recognized only from their structured metadata
+(`ephemeral`, `persisted`, and `reminder_placement`), never from their text.
+The first and last human user messages are used as compaction anchors; if a
+legacy transcript has no human user message, the first and last user messages
+remain the fallback. The first human anchor remains stubbable only at level 8.
+
+### Request overlays
+
+`get_messages_for_request_with_overlays(overlays, *, provider=None)` is an
+additive duck-typed convenience method for an orchestrator that must ensure a
+trusted persisted reminder appears in one request. Each overlay supplies the
+canonical reminder message and a `pre_user` or `tail` placement. An optional
+`overlay_content` string lets the orchestrator supply framing appropriate to
+that placement, without changing the canonical message. If every required
+reminder is visible, the normal request view is returned unchanged. Otherwise,
+all currently required reminders are assembled once at their requested
+placements, within the finite request budget. Recovery neither changes
+canonical history nor commits overlay-driven sticky decisions. An unsafe
+placement or required content that cannot fit raises `RequiredRequestOverlayError`.
+
 ### Compaction Phases
 
 1. **Phase 1 - Tool Result Truncation**: Older tool results are truncated to reduce token usage

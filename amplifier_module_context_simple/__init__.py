@@ -40,10 +40,10 @@ Real-Usage Token Meter (opt-in, default off -- see config `token_meter`):
 __amplifier_module_type__ = "context"
 
 import logging
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Sequence
 from datetime import UTC, datetime
 from sys import maxsize
-from typing import Any
+from typing import Any, Literal, NotRequired, TypedDict
 
 from amplifier_core import ModuleCoordinator, TextBlock
 
@@ -97,6 +97,37 @@ LOADED_TOOL_STATE_METADATA_KEYS: frozenset[str] = frozenset(
         "openai:tool_search_items",
     }
 )
+
+
+class RequestOverlay(TypedDict):
+    message: dict[str, Any]
+    placement: Literal["pre_user", "tail"]
+    overlay_content: NotRequired[str]
+
+
+class RequiredRequestOverlayError(RuntimeError):
+    """A required request-only overlay cannot safely fit in this request."""
+
+
+def _is_persisted_ephemeral_reminder(msg: dict[str, Any]) -> bool:
+    """Return whether *msg* is the trusted persisted reminder envelope."""
+    metadata = msg.get("metadata")
+    return (
+        msg.get("role") == "user"
+        and isinstance(metadata, dict)
+        and metadata.get("ephemeral") is True
+        and metadata.get("persisted") is True
+        and metadata.get("reminder_placement") in ("pre_user", "tail")
+    )
+
+
+def _is_human_user_message(msg: dict[str, Any]) -> bool:
+    """A user message that is neither a tool result nor a trusted reminder."""
+    return (
+        msg.get("role") == "user"
+        and not msg.get("tool_call_id")
+        and not _is_persisted_ephemeral_reminder(msg)
+    )
 
 
 def _carries_loaded_tool_state(msg: dict[str, Any]) -> bool:
@@ -348,6 +379,7 @@ class SimpleContextManager:
         # Reported in compaction stats / notice so the LLM sees the total
         # accumulated effect, not just the most recent escalation step.
         self._sticky_level: int = 0
+        self._transient_compaction = False
 
     @staticmethod
     def _encode_tool_result_text(text: str) -> bytes:
@@ -418,7 +450,9 @@ class SimpleContextManager:
         remaining_text_bytes = self.max_tool_result_bytes - marker_bytes
 
         if isinstance(content, str):
-            limited_content = self._utf8_safe_prefix(content, remaining_text_bytes) + marker
+            limited_content = (
+                self._utf8_safe_prefix(content, remaining_text_bytes) + marker
+            )
         else:
             limited_content: list[Any] = []
             marker_added = False
@@ -433,7 +467,9 @@ class SimpleContextManager:
                 prefix = self._utf8_safe_prefix(text, remaining_text_bytes)
                 prefix_bytes = len(self._encode_tool_result_text(prefix))
                 if prefix_bytes == len(self._encode_tool_result_text(text)):
-                    limited_content.append(self._copy_text_block_with_text(block, prefix))
+                    limited_content.append(
+                        self._copy_text_block_with_text(block, prefix)
+                    )
                     remaining_text_bytes -= prefix_bytes
                     continue
 
@@ -461,11 +497,15 @@ class SimpleContextManager:
         }
         return {**message, "content": limited_content}, event_data
 
-    async def _emit_tool_result_ingress_truncation(self, event_data: dict[str, Any]) -> None:
+    async def _emit_tool_result_ingress_truncation(
+        self, event_data: dict[str, Any]
+    ) -> None:
         """Emit ingress observability without ever blocking tool-result admission."""
         if self._hooks is not None:
             try:
-                await self._hooks.emit("context:tool_result_ingress_truncated", event_data)
+                await self._hooks.emit(
+                    "context:tool_result_ingress_truncated", event_data
+                )
                 return
             except Exception:
                 emission_status = "event emission failed"
@@ -580,32 +620,283 @@ class SimpleContextManager:
         Returns:
             Messages ready for LLM request, compacted if necessary.
         """
-        budget = self._calculate_budget(token_budget, provider)
+        effective_budget = self._effective_budget(token_budget, provider)
+        working_messages = await self._working_messages_for_request()
+        return await self._request_view(working_messages, effective_budget)
 
-        # Reserve token budget for potential compaction notice (if enabled)
-        effective_budget = budget
-        if self.compaction_notice_enabled:
-            effective_budget = budget - self.compaction_notice_token_reserve
-            if effective_budget <= 0:
-                # Misconfiguration guard: if the reserve consumes the entire budget
-                # (or more), _should_compact's `budget > 0` check would silently
-                # force usage to 0, disabling compaction entirely rather than
-                # loudly failing. Fall back to the full budget instead of a
-                # non-positive effective budget - a reserve that swallows the
-                # whole context is not a valid state to compact against.
-                logger.warning(
-                    f"compaction_notice_token_reserve ({self.compaction_notice_token_reserve:,}) "
-                    f">= budget ({budget:,}); ignoring reserve for this request to avoid "
-                    f"silently disabling compaction (effective budget would be {effective_budget:,})"
+    async def get_messages_for_request_with_overlays(
+        self,
+        overlays: Sequence[RequestOverlay],
+        *,
+        provider: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Build one request view with required, request-only reminder overlays.
+
+        An overlay refers to an exact trusted persisted reminder already in the
+        canonical history. If normal compaction omitted or stubbed it, the
+        reminder is reintroduced for this request only; canonical history and
+        sticky decisions remain unchanged.
+        """
+        required = self._validate_request_overlays(overlays)
+        request_budget = self._calculate_budget(None, provider)
+        effective_budget = self._effective_budget(request_budget, None)
+        working_messages = await self._working_messages_for_request()
+        normal_view = await self._request_view(working_messages, effective_budget)
+
+        if all(
+            self._reminder_content_is_visible(normal_view, content)
+            for _, _, content, _ in required
+        ):
+            return normal_view
+
+        # In recovery only, reserve the required messages once, outside the
+        # compactable source. Otherwise a visible required body is charged both
+        # as history and as an overlay, or lost in the transient pass.
+        normal_notice = self._trailing_compaction_notice(normal_view)
+        material_budget = request_budget - sum(
+            self._estimate_tokens(
+                [self._request_overlay_message(message, placement, overlay_content)]
+            )
+            for message, placement, _, overlay_content in required
+        )
+        if normal_notice is not None:
+            material_budget -= self._estimate_tokens([normal_notice])
+        if material_budget <= 0:
+            raise RequiredRequestOverlayError(
+                "required request overlays leave no material context budget"
+            )
+
+        material = [
+            message
+            for message in working_messages
+            if not any(
+                message == required_message for required_message, _, _, _ in required
+            )
+        ]
+        transient_view = await self._compact_ephemeral_transient(
+            material_budget, material
+        )
+        view = list(transient_view)
+        self._insert_request_overlays(view, required, normal_notice)
+
+        if not all(
+            self._reminder_content_is_visible(view, overlay_content)
+            for _, _, _, overlay_content in required
+        ):
+            raise RequiredRequestOverlayError(
+                "required request overlays could not be restored"
+            )
+        if self._estimate_tokens(view) > request_budget:
+            raise RequiredRequestOverlayError(
+                "required request overlays cannot fit within the request budget"
+            )
+        return self._strip_internal_metadata(view)
+
+    @staticmethod
+    def _reminder_literal_content(message: dict[str, Any]) -> str | None:
+        """Return a supported literal reminder body without decoding envelopes."""
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if isinstance(content, TextBlock):
+            return content.text
+        if isinstance(content, list) and len(content) == 1:
+            block = content[0]
+            if isinstance(block, TextBlock):
+                return block.text
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            ):
+                return block["text"]
+        return None
+
+    def _validate_request_overlays(
+        self, overlays: Sequence[RequestOverlay]
+    ) -> list[tuple[dict[str, Any], str, str, str]]:
+        """Validate and de-duplicate overlays before building a request view."""
+        if isinstance(overlays, str | bytes) or not isinstance(overlays, Sequence):
+            raise ValueError("overlays must be a sequence of overlay mappings")
+
+        required: list[tuple[dict[str, Any], str, str, str]] = []
+        seen_content: set[str] = set()
+        for overlay in overlays:
+            if not isinstance(overlay, dict):
+                raise ValueError("each request overlay must be a mapping")
+            message = overlay.get("message")
+            placement = overlay.get("placement")
+            if (
+                not isinstance(message, dict)
+                or not _is_persisted_ephemeral_reminder(message)
+                or placement not in ("pre_user", "tail")
+            ):
+                raise ValueError(
+                    "request overlay must contain a trusted reminder and placement"
                 )
-                effective_budget = budget
+            content = self._reminder_literal_content(message)
+            if content is None:
+                raise ValueError(
+                    "request overlay reminder content must be literal text"
+                )
+            overlay_content = overlay.get("overlay_content", content)
+            if not isinstance(overlay_content, str) or not overlay_content:
+                raise ValueError(
+                    "request overlay content must be non-empty literal text"
+                )
+            if not any(
+                candidate == message and _is_persisted_ephemeral_reminder(candidate)
+                for candidate in self.messages
+            ):
+                raise ValueError(
+                    "request overlay reminder must exactly match canonical history"
+                )
+            if content not in seen_content:
+                required.append((message, placement, content, overlay_content))
+                seen_content.add(content)
+        return required
+
+    def _reminder_content_is_visible(
+        self, messages: list[dict[str, Any]], content: str
+    ) -> bool:
+        """Whether a full trusted or fresh overlay body is present in a view."""
+        return any(
+            self._reminder_literal_content(message) == content
+            and (
+                _is_persisted_ephemeral_reminder(message)
+                or (
+                    message.get("role") == "user"
+                    and isinstance(message.get("metadata"), dict)
+                    and message["metadata"].get("ephemeral") is True
+                    and message["metadata"].get("persisted") is not True
+                )
+            )
+            for message in messages
+        )
+
+    @staticmethod
+    def _trailing_compaction_notice(
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return this request's normal compaction notice, if one was emitted."""
+        if not messages:
+            return None
+        metadata = messages[-1].get("metadata")
+        if (
+            isinstance(metadata, dict)
+            and metadata.get("source") == "context-compaction"
+            and metadata.get("ephemeral") is True
+        ):
+            return messages[-1]
+        return None
+
+    @staticmethod
+    def _request_overlay_message(
+        message: dict[str, Any], placement: str, overlay_content: str | None = None
+    ) -> dict[str, Any]:
+        """Copy a canonical reminder as a fresh request-only ephemeral message."""
+        metadata = dict(message["metadata"])
+        metadata.pop("persisted", None)
+        metadata.pop("_seq", None)
+        metadata["ephemeral"] = True
+        metadata["reminder_placement"] = placement
+        return {
+            **message,
+            "content": message["content"]
+            if overlay_content is None
+            else overlay_content,
+            "metadata": metadata,
+        }
+
+    @staticmethod
+    def _tail_request_placement_is_safe(messages: list[dict[str, Any]]) -> bool:
+        """A tail user message is safe only when all tool calls have results."""
+        pending: set[str] = set()
+        for message in messages:
+            if message.get("role") == "assistant" and message.get("tool_calls"):
+                for call in message["tool_calls"]:
+                    if not isinstance(call, dict):
+                        return False
+                    call_id = call.get("id") or call.get("tool_call_id")
+                    if not call_id:
+                        return False
+                    pending.add(call_id)
+            elif message.get("role") == "tool":
+                call_id = message.get("tool_call_id")
+                if call_id:
+                    pending.discard(call_id)
+        return not pending
+
+    def _insert_request_overlays(
+        self,
+        view: list[dict[str, Any]],
+        missing: list[tuple[dict[str, Any], str, str, str]],
+        normal_notice: dict[str, Any] | None,
+    ) -> None:
+        """Insert fresh overlays without splitting an assistant/tool-result group."""
+        pre_user = [
+            self._request_overlay_message(message, placement, overlay_content)
+            for message, placement, _, overlay_content in missing
+            if placement == "pre_user"
+        ]
+        tail = [
+            self._request_overlay_message(message, placement, overlay_content)
+            for message, placement, _, overlay_content in missing
+            if placement == "tail"
+        ]
+        anchor = next(
+            (
+                i
+                for i in range(len(view) - 1, -1, -1)
+                if _is_human_user_message(view[i])
+            ),
+            None,
+        )
+        needs_safe_end = (
+            tail or (pre_user and anchor is None) or normal_notice is not None
+        )
+        if needs_safe_end and not self._tail_request_placement_is_safe(view):
+            raise RequiredRequestOverlayError(
+                "required request overlay has no safe placement around pending tool calls"
+            )
+        if pre_user:
+            if anchor is None:
+                view.extend(pre_user)
             else:
-                logger.debug(
-                    f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
-                    f"(effective budget: {effective_budget:,})"
-                )
+                view[anchor:anchor] = pre_user
+        if normal_notice is not None:
+            view.append(normal_notice)
+        view.extend(tail)
 
-        # Determine working messages based on whether factory is set
+    def _effective_budget(self, token_budget: int | None, provider: Any | None) -> int:
+        """Calculate the normal request budget, including the notice reserve."""
+        budget = self._calculate_budget(token_budget, provider)
+        if not self.compaction_notice_enabled:
+            return budget
+
+        effective_budget = budget - self.compaction_notice_token_reserve
+        if effective_budget <= 0:
+            # Misconfiguration guard: if the reserve consumes the entire budget
+            # (or more), _should_compact's `budget > 0` check would silently
+            # force usage to 0, disabling compaction entirely rather than
+            # loudly failing. Fall back to the full budget instead of a
+            # non-positive effective budget - a reserve that swallows the
+            # whole context is not a valid state to compact against.
+            logger.warning(
+                f"compaction_notice_token_reserve ({self.compaction_notice_token_reserve:,}) "
+                f">= budget ({budget:,}); ignoring reserve for this request to avoid "
+                f"silently disabling compaction (effective budget would be {effective_budget:,})"
+            )
+            return budget
+
+        logger.debug(
+            f"Reserved {self.compaction_notice_token_reserve} tokens for potential notice "
+            f"(effective budget: {effective_budget:,})"
+        )
+        return effective_budget
+
+    async def _working_messages_for_request(self) -> list[dict[str, Any]]:
+        """Build the one fresh source view used for one request."""
         if self._system_prompt_factory:
             # Factory mode: get fresh system content, exclude stored system messages
             # BUT preserve hook-injected system messages (they have metadata.source = "hook")
@@ -620,15 +911,19 @@ class SimpleContextManager:
                 if msg.get("role") != "system"
                 or (msg.get("metadata") or {}).get("source") == "hook"
             ]
-            working_messages = [system_message] + conversation_messages
             logger.debug(
                 f"System prompt factory produced {len(system_content):,} chars, "
                 f"{len(conversation_messages)} conversation messages"
             )
-        else:
-            # Static mode: use messages as-is (may include stored system messages)
-            working_messages = list(self.messages)
+            return [system_message] + conversation_messages
 
+        # Static mode: use messages as-is (may include stored system messages).
+        return list(self.messages)
+
+    async def _request_view(
+        self, working_messages: list[dict[str, Any]], effective_budget: int
+    ) -> list[dict[str, Any]]:
+        """Apply the normal compaction policy to an already-built source view."""
         token_count, meter_source, estimated_tokens = self._measure_working_tokens(
             working_messages
         )
@@ -880,7 +1175,9 @@ class SimpleContextManager:
             self.token_meter == TOKEN_METER_ACTUAL
             and self._last_measured_prompt_tokens is not None
         ):
-            return (self._last_measured_prompt_tokens / budget) >= self.compact_threshold
+            return (
+                self._last_measured_prompt_tokens / budget
+            ) >= self.compact_threshold
         return (estimated_tokens / budget) >= self.compact_threshold
 
     def _measure_working_tokens(
@@ -979,6 +1276,44 @@ class SimpleContextManager:
     # turn or two, instead of re-deriving (and potentially shifting) the
     # entire compaction decision on every single get_messages_for_request()
     # call.
+
+    def _snapshot_compaction_state(
+        self,
+    ) -> tuple[set[int], set[int], set[int], int, dict[str, Any] | None]:
+        """Take the explicit mutable state a request-only pass must not retain."""
+        return (
+            set(self._removed_seqs),
+            set(self._truncated_seqs),
+            set(self._stubbed_seqs),
+            self._sticky_level,
+            self._last_compaction_stats,
+        )
+
+    def _restore_compaction_state(
+        self,
+        state: tuple[set[int], set[int], set[int], int, dict[str, Any] | None],
+    ) -> None:
+        """Restore state after transient overlay recovery."""
+        (
+            self._removed_seqs,
+            self._truncated_seqs,
+            self._stubbed_seqs,
+            self._sticky_level,
+            self._last_compaction_stats,
+        ) = state
+
+    async def _compact_ephemeral_transient(
+        self, budget: int, source_messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Compact a request-only view without sticky changes, stats, or events."""
+        state = self._snapshot_compaction_state()
+        previous_transient = self._transient_compaction
+        self._transient_compaction = True
+        try:
+            return await self._compact_ephemeral(budget, source_messages)
+        finally:
+            self._restore_compaction_state(state)
+            self._transient_compaction = previous_transient
 
     @staticmethod
     def _extract_seq(msg: dict[str, Any]) -> int | None:
@@ -1423,7 +1758,10 @@ class SimpleContextManager:
             # === LEVEL 8: Stub first user message + remove old stubs (extreme pressure) ===
             max_level_reached = 8
 
-            # Find first user message and stub it if not already stubbed
+            # Find human anchors; persisted reminders must not become the
+            # "original task" merely because they were admitted first.
+            first_human_idx = None
+            last_human_idx = None
             first_user_idx = None
             last_user_idx = None
             for i, msg in enumerate(working_messages):
@@ -1431,15 +1769,25 @@ class SimpleContextManager:
                     if first_user_idx is None:
                         first_user_idx = i
                     last_user_idx = i
+                    if _is_human_user_message(msg):
+                        if first_human_idx is None:
+                            first_human_idx = i
+                        last_human_idx = i
+            first_anchor_idx = (
+                first_human_idx if first_human_idx is not None else first_user_idx
+            )
+            last_anchor_idx = (
+                last_human_idx if last_human_idx is not None else last_user_idx
+            )
 
             # Stub first user message (previously protected) - but NEVER if it's also the last
             # The last user message is the current intent and must always be preserved
-            if first_user_idx is not None and first_user_idx != last_user_idx:
-                first_msg = working_messages[first_user_idx]
+            if first_anchor_idx is not None and first_anchor_idx != last_anchor_idx:
+                first_msg = working_messages[first_anchor_idx]
                 if not first_msg.get("_stubbed"):
                     content = first_msg.get("content", "")
                     if isinstance(content, str) and len(content) > 80:
-                        working_messages[first_user_idx] = self._stub_user_message(
+                        working_messages[first_anchor_idx] = self._stub_user_message(
                             first_msg
                         )
                         # Sticky: record before `first_msg` var is superseded.
@@ -1461,7 +1809,7 @@ class SimpleContextManager:
                     for i, msg in enumerate(working_messages)
                     if msg.get("_stubbed")
                     and i < protected_boundary  # Outside protected recent zone
-                    and i != last_user_idx  # Never remove last user message
+                    and i != last_anchor_idx  # Never remove the current anchor
                 ]
 
                 stubs_removed = 0
@@ -1625,7 +1973,10 @@ class SimpleContextManager:
             i for i, msg in enumerate(messages) if msg.get("role") == "user"
         }
 
-        # Find first and last user message indices (always fully protected from stubbing too)
+        # Find human anchors. If history contains only persisted reminders,
+        # retain the original role-user behavior as a safe fallback.
+        first_human_idx = None
+        last_human_idx = None
         first_user_idx = None
         last_user_idx = None
         for i, msg in enumerate(messages):
@@ -1633,6 +1984,16 @@ class SimpleContextManager:
                 if first_user_idx is None:
                     first_user_idx = i
                 last_user_idx = i
+                if _is_human_user_message(msg):
+                    if first_human_idx is None:
+                        first_human_idx = i
+                    last_human_idx = i
+        first_anchor_idx = (
+            first_human_idx if first_human_idx is not None else first_user_idx
+        )
+        last_anchor_idx = (
+            last_human_idx if last_human_idx is not None else last_user_idx
+        )
 
         # Always protect system messages
         for i, msg in enumerate(messages):
@@ -1659,8 +2020,8 @@ class SimpleContextManager:
         # We don't add it to protected_indices so it can be stubbed at Level 8
 
         # Always protect the LAST user message (current context)
-        if last_user_idx is not None:
-            protected_indices.add(last_user_idx)
+        if last_anchor_idx is not None:
+            protected_indices.add(last_anchor_idx)
 
         # Protect last N% of messages (using the passed protection level)
         protected_boundary = int(len(messages) * (1 - protected_recent))
@@ -1752,8 +2113,8 @@ class SimpleContextManager:
                 i
                 for i in user_message_indices
                 if i not in protected_indices
-                and i != first_user_idx  # Protected from stubbing at levels 1-7
-                and i != last_user_idx  # Always protected (never stubbed)
+                and i != first_anchor_idx  # Protected from stubbing at levels 1-7
+                and i != last_anchor_idx  # Always protected (never stubbed)
                 and not messages[i].get("_stubbed")  # Don't re-stub
             ]
         )
@@ -1952,6 +2313,9 @@ class SimpleContextManager:
                 f"({final_tokens / budget:.0%} of budget, target {target_tokens:,}) -- "
                 f"{cause}."
             )
+
+        if self._transient_compaction:
+            return final_messages
 
         # Cumulative high-water mark across ALL escalations ever, not just
         # this one -- monotonic, never goes backward. This is what feeds the
