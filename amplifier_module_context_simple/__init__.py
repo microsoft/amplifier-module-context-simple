@@ -1980,6 +1980,11 @@ class SimpleContextManager:
             "target_tokens": target_tokens,
             "protected_recent": self.protected_recent,
             "protected_tool_results": self.protected_tool_results,
+            "metadata": {
+                "reason": "token_threshold_exceeded",
+                "threshold": self.compact_threshold,
+                "usage_ratio": old_tokens / budget if budget > 0 else 0,
+            },
         }
         self._last_compaction_stats = stats
 
