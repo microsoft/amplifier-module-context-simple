@@ -311,6 +311,13 @@ a corresponding quality regression.
 
 - `amplifier-core>=1.0.0`
 
+## Request-retention verification
+
+The full module suite passes locally and in an isolated CLI test environment
+using unchanged core 1.6.1 (132 passed, one existing expected failure). Retention tests
+check the assembled outgoing view, including compaction, inactive requirements,
+and compatibility paths; checking canonical storage alone cannot prove delivery.
+
 ## Contributing
 
 > [!NOTE]
