@@ -96,13 +96,43 @@ and is not retained in the canonical transcript; compaction remains view-only.
 
 Compaction triggers when token usage reaches the configured threshold (default: 92% of the **effective budget** -- which is derived from the provider, *not* from `max_tokens`; see [Where the compaction trigger comes from](#where-the-compaction-trigger-comes-from)):
 
-### Protected Messages (Never Removed)
+### Protection boundaries
 
-- **System messages**: All system messages are always preserved
-- **First user message**: The original task/request is always protected (prevents losing context about what was originally asked)
-- **Last user message**: The most recent user input is always preserved
+- **System messages**: System messages in the assembled working set are preserved. With a system-prompt factory, stored system messages are replaced except those marked `metadata.source = "hook"`.
+- **First and last human prompts**: Preserved through all reduction levels. User-role messages marked ephemeral or sourced from a hook/compaction notice do not take these positions.
 - **Recent messages**: Last N% of messages (configurable via `protected_recent`)
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
+
+Intermediate user-role messages longer than 80 characters can become a
+50-character preview, including persisted machine reminders. This preview is
+not a semantic summary. Persistence alone does not guarantee delivery.
+
+### Optional request retention
+
+Mounting registers `context.request_retention` when the coordinator supports
+capabilities. Its async callable accepts `retain_contents=[...]`, plus optional
+`provider` and `token_budget` arguments. Each string must exactly match an
+already admitted user message marked `metadata.ephemeral = true` and
+`metadata.persisted = true`. Only the newest matching copy is protected.
+
+The retained view counts that content before compaction and restores it from
+canonical history even if an earlier request stubbed it. Requirements last for
+one call; callers must repeat current requirements. Missing content raises
+`ValueError`; content that cannot fit the estimated input budget raises
+`ContextLengthError` without committing new sticky reductions. This is not an
+exact tokenizer or a guarantee that the complete provider payload fits.
+
+The existing `get_messages_for_request()` signature is unchanged. Hosts without
+a capability registry and callers using the existing method still work, but
+do not receive active-injection retention. Canonical history and persisted
+message metadata remain unchanged. Request assembly for one context instance
+must be serialized, as with its existing sticky compaction state.
+
+When verifying retention, inspect the assembled request across multiple
+compaction boundaries. A fact still in the transcript may be absent from the
+request. Middle human corrections and inactive, one-shot injections remain
+subject to compaction; this mechanism does not infer their lifetime or summarize
+them.
 
 ### Compaction Phases
 

@@ -46,6 +46,7 @@ from sys import maxsize
 from typing import Any
 
 from amplifier_core import ModuleCoordinator, TextBlock
+from amplifier_core.llm_errors import ContextLengthError
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +106,16 @@ def _carries_loaded_tool_state(msg: dict[str, Any]) -> bool:
     if not isinstance(meta, dict):
         return False
     return any(meta.get(key) for key in LOADED_TOOL_STATE_METADATA_KEYS)
+
+
+def _is_human_message(msg: dict[str, Any]) -> bool:
+    """Wire role alone does not distinguish a prompt from an injection."""
+    meta = msg.get("metadata") or {}
+    return (
+        msg.get("role") == "user"
+        and not meta.get("ephemeral")
+        and meta.get("source") not in ("hook", "context-compaction")
+    )
 
 
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
@@ -190,6 +201,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
 
     await coordinator.mount("context", context)
+    # Optional module capability; the core Context protocol is unchanged.
+    register_capability = getattr(coordinator, "register_capability", None)
+    if callable(register_capability):
+        register_capability(
+            "context.request_retention", context.get_messages_for_request_retaining
+        )
     logger.info(f"Mounted SimpleContextManager (token_meter={token_meter!r})")
 
     async def cleanup() -> None:
@@ -224,14 +241,14 @@ class SimpleContextManager:
     Level 5: Remove more messages (60% of configured protection)
     Level 6: Truncate remaining tool results (except last N)
     Level 7: Remove more messages (30% of configured protection - last resort)
-    Level 8: Stub first user message + remove old stubs (extreme pressure)
+    Level 8: Stub unprotected machine prefix + remove old stubs (extreme pressure)
 
     This interleaved approach ensures minimal data loss by:
     - Preferring truncation (preserves structure) over removal (loses context)
     - Progressively relaxing protection as pressure increases
     - Respecting configured protected_recent as baseline, only relaxing under pressure
-    - Always protecting: system messages, last user message, last N tool results, tool pairs
-    - First user message: stubbable at Level 8, but never fully removed
+    - Always protecting: system messages, first/last human prompts, last N tool results, tool pairs
+    - Requested active persisted injections remain complete through all levels
     """
 
     def __init__(
@@ -328,6 +345,8 @@ class SimpleContextManager:
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
+        self._request_retained_contents: frozenset[str] = frozenset()
+        self._request_protected_seqs: set[int] = set()
 
         # --- Sticky compaction decision state ---
         # Compaction decisions (remove / truncate / stub) are keyed by a
@@ -418,7 +437,9 @@ class SimpleContextManager:
         remaining_text_bytes = self.max_tool_result_bytes - marker_bytes
 
         if isinstance(content, str):
-            limited_content = self._utf8_safe_prefix(content, remaining_text_bytes) + marker
+            limited_content = (
+                self._utf8_safe_prefix(content, remaining_text_bytes) + marker
+            )
         else:
             limited_content: list[Any] = []
             marker_added = False
@@ -433,7 +454,9 @@ class SimpleContextManager:
                 prefix = self._utf8_safe_prefix(text, remaining_text_bytes)
                 prefix_bytes = len(self._encode_tool_result_text(prefix))
                 if prefix_bytes == len(self._encode_tool_result_text(text)):
-                    limited_content.append(self._copy_text_block_with_text(block, prefix))
+                    limited_content.append(
+                        self._copy_text_block_with_text(block, prefix)
+                    )
                     remaining_text_bytes -= prefix_bytes
                     continue
 
@@ -461,11 +484,15 @@ class SimpleContextManager:
         }
         return {**message, "content": limited_content}, event_data
 
-    async def _emit_tool_result_ingress_truncation(self, event_data: dict[str, Any]) -> None:
+    async def _emit_tool_result_ingress_truncation(
+        self, event_data: dict[str, Any]
+    ) -> None:
         """Emit ingress observability without ever blocking tool-result admission."""
         if self._hooks is not None:
             try:
-                await self._hooks.emit("context:tool_result_ingress_truncated", event_data)
+                await self._hooks.emit(
+                    "context:tool_result_ingress_truncated", event_data
+                )
                 return
             except Exception:
                 emission_status = "event emission failed"
@@ -553,6 +580,80 @@ class SimpleContextManager:
         self._system_prompt_factory = factory
         logger.info("System prompt factory registered - will refresh on each request")
 
+    async def get_messages_for_request_retaining(
+        self,
+        *,
+        retain_contents: list[str],
+        provider: Any | None = None,
+        token_budget: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Optional capability: retain current persisted injections for one view.
+
+        Contents must exactly match admitted user-role messages marked
+        ephemeral=True and persisted=True. Only the newest matching copy is
+        protected. This neither admits messages nor changes their lifetime;
+        the caller supplies the current delivery requirements on every call.
+        """
+        previous_contents = self._request_retained_contents
+        previous_seqs = self._request_protected_seqs
+        decisions = (
+            self._removed_seqs.copy(),
+            self._truncated_seqs.copy(),
+            self._stubbed_seqs.copy(),
+            self._sticky_level,
+            self._last_compaction_stats,
+        )
+        try:
+            self._request_retained_contents = frozenset(retain_contents)
+            return await self.get_messages_for_request(token_budget, provider)
+        except BaseException:
+            # A failed/cancelled assembly must not commit a reduction that was
+            # never delivered. Canonical history is unchanged throughout.
+            (
+                self._removed_seqs,
+                self._truncated_seqs,
+                self._stubbed_seqs,
+                self._sticky_level,
+                self._last_compaction_stats,
+            ) = decisions
+            raise
+        finally:
+            self._request_retained_contents = previous_contents
+            self._request_protected_seqs = previous_seqs
+
+    def _protected_sequences(self, messages: list[dict[str, Any]]) -> set[int]:
+        humans = [msg for msg in messages if _is_human_message(msg)]
+        protected = [humans[0], humans[-1]] if humans else []
+        remaining = set(self._request_retained_contents)
+        for msg in reversed(messages):
+            meta = msg.get("metadata") or {}
+            content = msg.get("content")
+            if (
+                msg.get("role") == "user"
+                and meta.get("ephemeral") is True
+                and meta.get("persisted") is True
+                and isinstance(content, str)
+                and content in remaining
+            ):
+                protected.append(msg)
+                remaining.remove(content)
+        if remaining:
+            raise ValueError("Requested retained injection is not in admitted history")
+        return {seq for msg in protected if (seq := self._extract_seq(msg)) is not None}
+
+    def _is_request_protected(self, msg: dict[str, Any]) -> bool:
+        return self._extract_seq(msg) in self._request_protected_seqs
+
+    def _check_retained_budget(
+        self, messages: list[dict[str, Any]], budget: int
+    ) -> None:
+        if self._request_retained_contents and self._estimate_tokens(messages) > budget:
+            raise ContextLengthError(
+                "Context cannot fit the current injections and protected conversation "
+                "within the estimated input budget; shorten the active instructions "
+                "or use a larger context window. Required content was not discarded."
+            )
+
     async def get_messages_for_request(
         self,
         token_budget: int | None = None,
@@ -628,6 +729,16 @@ class SimpleContextManager:
         else:
             # Static mode: use messages as-is (may include stored system messages)
             working_messages = list(self.messages)
+
+        self._request_protected_seqs = self._protected_sequences(working_messages)
+        self._check_retained_budget(
+            [
+                m
+                for m in working_messages
+                if m.get("role") == "system" or self._is_request_protected(m)
+            ],
+            effective_budget,
+        )
 
         token_count, meter_source, estimated_tokens = self._measure_working_tokens(
             working_messages
@@ -731,8 +842,10 @@ class SimpleContextManager:
             # Strip internal bookkeeping at the module boundary -- everything
             # above this point (sticky decisions, token accounting) still runs
             # on messages carrying `_seq`; only what leaves has it removed.
+            self._check_retained_budget(compacted, budget)
             return self._strip_internal_metadata(compacted)
 
+        self._check_retained_budget(working_messages, budget)
         return self._strip_internal_metadata(working_messages)
 
     # Metadata keys that are internal bookkeeping only and must never cross
@@ -1037,6 +1150,9 @@ class SimpleContextManager:
         result: list[dict[str, Any]] = []
         for msg in messages:
             seq = self._extract_seq(msg)
+            if self._is_request_protected(msg):
+                result.append(dict(msg))
+                continue
             if seq is not None and seq in self._removed_seqs:
                 continue
             if seq is not None and seq in self._truncated_seqs:
@@ -1079,6 +1195,7 @@ class SimpleContextManager:
         messages_to_compact = (
             source_messages if source_messages is not None else self.messages
         )
+        self._request_protected_seqs = self._protected_sequences(messages_to_compact)
         target_tokens = int(budget * self.target_usage)
         old_count = len(messages_to_compact)
         old_tokens = self._estimate_tokens(messages_to_compact)
@@ -1432,9 +1549,14 @@ class SimpleContextManager:
                         first_user_idx = i
                     last_user_idx = i
 
-            # Stub first user message (previously protected) - but NEVER if it's also the last
-            # The last user message is the current intent and must always be preserved
-            if first_user_idx is not None and first_user_idx != last_user_idx:
+            # An unprotected machine prefix can still be reduced at extreme pressure.
+            # Human boundary prompts and current retained injections stay complete.
+            if (
+                first_user_idx is not None
+                and first_user_idx != last_user_idx
+                and not self._is_request_protected(working_messages[first_user_idx])
+                and not _is_human_message(working_messages[first_user_idx])
+            ):
                 first_msg = working_messages[first_user_idx]
                 if not first_msg.get("_stubbed"):
                     content = first_msg.get("content", "")
@@ -1462,6 +1584,7 @@ class SimpleContextManager:
                     if msg.get("_stubbed")
                     and i < protected_boundary  # Outside protected recent zone
                     and i != last_user_idx  # Never remove last user message
+                    and not self._is_request_protected(msg)
                 ]
 
                 stubs_removed = 0
@@ -1625,11 +1748,11 @@ class SimpleContextManager:
             i for i, msg in enumerate(messages) if msg.get("role") == "user"
         }
 
-        # Find first and last user message indices (always fully protected from stubbing too)
+        # Human boundaries must not be displaced by machine user-role messages.
         first_user_idx = None
         last_user_idx = None
         for i, msg in enumerate(messages):
-            if msg.get("role") == "user":
+            if _is_human_message(msg):
                 if first_user_idx is None:
                     first_user_idx = i
                 last_user_idx = i
@@ -1654,11 +1777,11 @@ class SimpleContextManager:
                 len(loaded_tool_state_indices),
             )
 
-        # First user message is stubbable at extreme pressure (Level 8), but never fully removed
-        # (It's excluded from removal_candidates via user_message_indices, but can be stubbed)
-        # We don't add it to protected_indices so it can be stubbed at Level 8
-
-        # Always protect the LAST user message (current context)
+        protected_indices.update(
+            i for i, msg in enumerate(messages) if self._is_request_protected(msg)
+        )
+        if first_user_idx is not None:
+            protected_indices.add(first_user_idx)
         if last_user_idx is not None:
             protected_indices.add(last_user_idx)
 
