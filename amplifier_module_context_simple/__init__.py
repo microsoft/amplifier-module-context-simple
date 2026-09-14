@@ -993,6 +993,8 @@ class SimpleContextManager:
         """
         if budget <= 0:
             return False
+        if self._request_retained_contents and estimated_tokens > budget:
+            return True
         if (
             self.token_meter == TOKEN_METER_ACTUAL
             and self._last_measured_prompt_tokens is not None
