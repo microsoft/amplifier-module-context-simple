@@ -47,6 +47,14 @@ from typing import Any
 
 from amplifier_core import ModuleCoordinator, TextBlock
 
+from .instructions import (
+    CAPABILITY,
+    InstructionAssembly,
+    has_instruction_descriptor,
+    has_input_descriptor,
+    is_instruction_message,
+)
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024
@@ -137,6 +145,12 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             - max_tool_result_bytes: Maximum UTF-8 bytes admitted for direct
               text in one tool result (default: 131,072). Oversized text is
               irreversibly clipped at ingress with a retrieval marker.
+            - instruction_callback_timeout_s: Maximum seconds for a required
+              instruction snapshot or direct filter callback (default: 5.0).
+            - instruction_filters: Ordered mappings with ``capability`` and
+              ``policy_id``. Legacy string capability entries remain accepted
+              with their prior receipt behavior. If configured, redaction must
+              be last.
 
     Returns:
         Cleanup callable that unregisters the token-meter hook (if one was
@@ -173,6 +187,18 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             "max_tool_result_bytes", DEFAULT_MAX_TOOL_RESULT_BYTES
         ),
     )
+    # Older direct test/application coordinators predate capabilities.  They
+    # stay on the legacy context path rather than gaining a partial v1 route.
+    if hasattr(coordinator, "register_capability"):
+        instruction_assembly = InstructionAssembly(
+            context,
+            coordinator,
+            required_filters=tuple(config.get("instruction_filters", ())),
+            session_id=str(config.get("instruction_session_id", "context")),
+            callback_timeout_s=config.get("instruction_callback_timeout_s", 5.0),
+        )
+        context._instruction_assembly = instruction_assembly
+        coordinator.register_capability(CAPABILITY, instruction_assembly)
 
     # Always register the meter listener when hooks are available, regardless
     # of token_meter mode: recording is a no-op on trigger behavior unless
@@ -328,6 +354,11 @@ class SimpleContextManager:
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
+        # Assigned by mount().  A directly constructed manager remains fully
+        # legacy-compatible until a host explicitly opens a v1 request scope.
+        self._instruction_assembly: InstructionAssembly | None = None
+        self._instruction_mutation_version = 0
+        self._instruction_observations: list[dict[str, Any]] = []
 
         # --- Sticky compaction decision state ---
         # Compaction decisions (remove / truncate / stub) are keyed by a
@@ -498,6 +529,14 @@ class SimpleContextManager:
         Timestamps are automatically added to message metadata for replay timing.
         Existing timestamps and metadata are preserved.
         """
+        if has_instruction_descriptor(message) or has_input_descriptor(message):
+            raise ValueError(
+                "v1 instruction or input descriptors may be stored only by trusted restore or "
+                "instruction assembly; input provenance is attached only by input scope"
+            )
+        if self._instruction_assembly is not None:
+            self._instruction_assembly.assert_message_ingress_allowed(message)
+            message = self._instruction_assembly.bind_input_message(message)
         message, truncation_event = self._limit_tool_result_text_at_ingress(message)
 
         # Add timestamp in metadata if not already present (for replay timing)
@@ -522,6 +561,7 @@ class SimpleContextManager:
 
         # Add message (no rejection - compaction happens ephemerally)
         self.messages.append(message)
+        self._instruction_mutation_version += 1
         if truncation_event is not None:
             await self._emit_tool_result_ingress_truncation(truncation_event)
 
@@ -550,13 +590,67 @@ class SimpleContextManager:
                      The factory should handle @mention resolution, file
                      loading, and instruction assembly.
         """
+        if self._instruction_assembly is not None:
+            self._instruction_assembly.assert_context_mutation_allowed()
         self._system_prompt_factory = factory
+        self._instruction_mutation_version += 1
         logger.info("System prompt factory registered - will refresh on each request")
 
     async def get_messages_for_request(
         self,
         token_budget: int | None = None,
         provider: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return a legacy view, or an explicitly scoped v1 assembled view.
+
+        Merely mounting this context (or restoring a marked record) does not
+        activate v1.  A cooperating loop must open
+        ``context.instructions.v1.request(...)`` and select a provider with
+        ``instruction_layout_version == 1``.
+        """
+        assembly = self._instruction_assembly
+        if assembly is None or not assembly.active:
+            return await self._get_messages_for_request_legacy(token_budget, provider)
+
+        request = assembly.current_request
+        assert request is not None
+        budget = self._calculate_budget(token_budget, provider)
+        previous_stats = self._last_compaction_stats
+
+        async def base_view(reservation: int) -> tuple[list[dict[str, Any]], str | None]:
+            # Active instructions are protected prompt material, so compact
+            # ordinary history against the budget left after their frozen
+            # reservation.  The final assembly check remains authoritative.
+            base_budget = max(1, budget - reservation)
+            base = await self._get_messages_for_request_legacy(
+                base_budget,
+                provider,
+                include_compaction_notice=False,
+            )
+            notice: str | None = None
+            if (
+                self.compaction_notice_enabled
+                and self._last_compaction_stats is not previous_stats
+                and self._last_compaction_stats is not None
+                and self._last_compaction_stats.get("strategy_level", 0)
+                >= self.compaction_notice_min_level
+            ):
+                notice = self._format_compaction_notice()
+            return base, notice
+
+        return await assembly.prepare(
+            request_id=request["request_id"],
+            provider=provider,
+            base_view=base_view,
+            budget=budget,
+        )
+
+    async def _get_messages_for_request_legacy(
+        self,
+        token_budget: int | None = None,
+        provider: Any | None = None,
+        *,
+        include_compaction_notice: bool = True,
     ) -> list[dict[str, Any]]:
         """
         Get messages ready for an LLM request.
@@ -568,9 +662,9 @@ class SimpleContextManager:
         Applies EPHEMERAL compaction if needed - returns a NEW list without
         modifying self.messages. The original history is always preserved.
 
-        If compaction occurs and notice is enabled, a system-reminder is inserted
-        at position 1 (after main system message) to inform the LLM about what
-        was compacted.
+        V1 fixed records are never returned by this legacy path.  They require
+        explicit request scope and a compatible provider; this prevents a
+        restored descriptor from becoming accidental legacy prompt text.
 
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
@@ -584,7 +678,7 @@ class SimpleContextManager:
 
         # Reserve token budget for potential compaction notice (if enabled)
         effective_budget = budget
-        if self.compaction_notice_enabled:
+        if self.compaction_notice_enabled and include_compaction_notice:
             effective_budget = budget - self.compaction_notice_token_reserve
             if effective_budget <= 0:
                 # Misconfiguration guard: if the reserve consumes the entire budget
@@ -619,6 +713,7 @@ class SimpleContextManager:
                 for msg in self.messages
                 if msg.get("role") != "system"
                 or (msg.get("metadata") or {}).get("source") == "hook"
+                and not is_instruction_message(msg)
             ]
             working_messages = [system_message] + conversation_messages
             logger.debug(
@@ -627,7 +722,9 @@ class SimpleContextManager:
             )
         else:
             # Static mode: use messages as-is (may include stored system messages)
-            working_messages = list(self.messages)
+            working_messages = [
+                msg for msg in self.messages if not is_instruction_message(msg)
+            ]
 
         token_count, meter_source, estimated_tokens = self._measure_working_tokens(
             working_messages
@@ -683,7 +780,11 @@ class SimpleContextManager:
             # state) -- so on calls between escalations, this tail addition is
             # byte-identical, and everything before it (the real prefix) is
             # completely undisturbed either way.
-            if self.compaction_notice_enabled and self._last_compaction_stats:
+            if (
+                include_compaction_notice
+                and self.compaction_notice_enabled
+                and self._last_compaction_stats
+            ):
                 level = self._last_compaction_stats.get("strategy_level", 0)
                 # GUARD: never append into an unanswered tool_calls turn.
                 #
@@ -788,8 +889,68 @@ class SimpleContextManager:
         """
         return list(self.messages)
 
+    def _add_fixed_instruction_message(self, message: dict[str, Any]) -> None:
+        """Append a retained v1 system record without a lease-side store.
+
+        The caller is the local assembly capability.  The canonical record is
+        an ordinary message and is exposed by ``get_messages`` immediately for
+        the host's normal checkpoint path.
+        """
+        metadata = dict(message.get("metadata") or {})
+        metadata.setdefault("timestamp", datetime.now(UTC).isoformat(timespec="milliseconds"))
+        metadata["_seq"] = self._next_seq
+        self._next_seq += 1
+        self.messages.append({**message, "metadata": metadata})
+        self._instruction_mutation_version += 1
+
+    def _record_instruction_observation(self, observation: dict[str, Any]) -> None:
+        """Keep content-free v1 lifecycle observations local to this context."""
+        if "content" in observation:
+            raise ValueError("instruction observations must not carry instruction content")
+        self._instruction_observations.append(dict(observation))
+
     async def set_messages(self, messages: list[dict[str, Any]]) -> None:
-        """Set messages from a saved transcript (for session resume).
+        """Set generic history, rejecting all claimed v1 instruction records.
+
+        Remote/client histories and imported transcripts must use this method.
+        A host checkpoint that intentionally retains v1 records must instead
+        call :meth:`restore_host_checkpoint` after mounting the assembly.
+        """
+        assembly = self._instruction_assembly
+        if assembly is not None:
+            assembly.assert_context_mutation_allowed()
+        if any(
+            isinstance(message, dict)
+            and (has_instruction_descriptor(message) or has_input_descriptor(message))
+            for message in messages
+        ):
+            raise ValueError(
+                "generic history cannot restore v1 instruction or input descriptors; "
+                "use restore_host_checkpoint for a trusted host checkpoint"
+            )
+        if assembly is not None:
+            assembly.assert_generic_history_replacement_allowed()
+        await self._replace_messages(messages)
+
+    async def restore_host_checkpoint(self, messages: list[dict[str, Any]]) -> None:
+        """Restore a host-owned checkpoint after assembly mount and validation.
+
+        This separates checkpoint policy from remote/untrusted history. It does
+        not authenticate arbitrary in-process Python code, which shares the
+        host trust boundary.
+        """
+        assembly = self._instruction_assembly
+        if assembly is None:
+            raise ValueError(
+                "host checkpoint restore requires a mounted instruction assembly"
+            )
+        assembly.assert_context_mutation_allowed()
+        restored = assembly.validate_trusted_restore(messages)
+        await self._replace_messages(restored)
+        assembly.rebase_fixed_order()
+
+    async def _replace_messages(self, messages: list[dict[str, Any]]) -> None:
+        """Replace validated history and reset instance-local compaction state.
 
         Sticky compaction decisions live only in this instance's memory (they
         are never persisted alongside the transcript), so a resumed session
@@ -816,12 +977,16 @@ class SimpleContextManager:
         self._stubbed_seqs = set()
         self._sticky_level = 0
         self._last_compaction_stats = None
+        self._instruction_mutation_version += 1
         for truncation_event in truncation_events:
             await self._emit_tool_result_ingress_truncation(truncation_event)
         logger.info(f"Restored {len(messages)} messages to context")
 
     async def clear(self) -> None:
-        """Clear all messages."""
+        """Clear all messages and deliberately discard fixed v1 state."""
+        if self._instruction_assembly is not None:
+            self._instruction_assembly.assert_context_mutation_allowed()
+            self._instruction_assembly.reset_fixed_state()
         self.messages = []
         self._next_seq = 0
         self._removed_seqs = set()
@@ -831,6 +996,7 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
+        self._instruction_mutation_version += 1
         logger.info("Context cleared")
 
     async def should_compact(self) -> bool:
@@ -992,6 +1158,21 @@ class SimpleContextManager:
         """
         return (msg.get("metadata") or {}).get("_seq")
 
+    @staticmethod
+    def _stable_message_id(msg: dict[str, Any]) -> str | None:
+        """Return a host-owned v1 input identity, never internal ``_seq``."""
+        metadata = msg.get("metadata") or {}
+        input_metadata = metadata.get("amplifier:input")
+        if isinstance(input_metadata, dict) and isinstance(
+            input_metadata.get("message_id"), str
+        ):
+            return input_metadata["message_id"]
+        for key in ("message_id", "id"):
+            value = msg.get(key, metadata.get(key))
+            if isinstance(value, str):
+                return value
+        return None
+
     def _record_removed(self, msg: dict[str, Any]) -> None:
         """Permanently record that a message has been removed by compaction."""
         seq = self._extract_seq(msg)
@@ -1092,6 +1273,14 @@ class SimpleContextManager:
         non_system_messages = [
             msg for msg in messages_to_compact if msg.get("role") != "system"
         ]
+        # Pending fixed feedback has a causal anchor.  Protect only that
+        # named anchor while delivery is pending; delivered records remain
+        # ordinary historical evidence and may be compacted with their anchor.
+        protected_instruction_anchor_ids: set[str] = set()
+        if self._instruction_assembly is not None and self._instruction_assembly.active:
+            protected_instruction_anchor_ids = (
+                self._instruction_assembly.pending_anchor_message_ids()
+            )
 
         # UNITS CONVENTION (see the block comment below): every "are we under
         # target yet?" comparison in this method and its helpers is TOTAL vs
@@ -1278,6 +1467,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level3_protection,
                 system_tokens=system_tokens,
+                protected_message_ids=protected_instruction_anchor_ids,
             )
         )
         total_removed += removed
@@ -1344,6 +1534,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level5_protection,
                 system_tokens=system_tokens,
+                protected_message_ids=protected_instruction_anchor_ids,
             )
         )
         total_removed += removed
@@ -1407,6 +1598,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level7_protection,
                 system_tokens=system_tokens,
+                protected_message_ids=protected_instruction_anchor_ids,
             )
         )
         total_removed += removed
@@ -1434,7 +1626,12 @@ class SimpleContextManager:
 
             # Stub first user message (previously protected) - but NEVER if it's also the last
             # The last user message is the current intent and must always be preserved
-            if first_user_idx is not None and first_user_idx != last_user_idx:
+            if (
+                first_user_idx is not None
+                and first_user_idx != last_user_idx
+                and self._stable_message_id(working_messages[first_user_idx])
+                not in protected_instruction_anchor_ids
+            ):
                 first_msg = working_messages[first_user_idx]
                 if not first_msg.get("_stubbed"):
                     content = first_msg.get("content", "")
@@ -1600,6 +1797,7 @@ class SimpleContextManager:
         target_tokens: int,
         protected_recent: float,
         system_tokens: int,
+        protected_message_ids: set[str] | None = None,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -1637,6 +1835,13 @@ class SimpleContextManager:
         # Always protect system messages
         for i, msg in enumerate(messages):
             if msg.get("role") == "system":
+                protected_indices.add(i)
+
+        # Pending v1 fixed entries need their exact input/event anchor until
+        # delivery.  This is deliberately a narrow named protection, not a
+        # new general history-stubbing policy.
+        for i, msg in enumerate(messages):
+            if self._stable_message_id(msg) in (protected_message_ids or set()):
                 protected_indices.add(i)
 
         # BREAK 5 -- never remove a message carrying loaded-tool state.
