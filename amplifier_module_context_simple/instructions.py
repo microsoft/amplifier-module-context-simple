@@ -26,6 +26,9 @@ CAPABILITY = "context.instructions.v1"
 FILTER_CAPABILITY = "context.instructions.filter.v1/redaction"
 INSTRUCTION_METADATA = "amplifier:instruction"
 INPUT_METADATA = "amplifier:input"
+AUTHORITATIVE = "authoritative"
+ADVISORY = "advisory"
+_AUTHORITIES = frozenset({AUTHORITATIVE, ADVISORY})
 _ACTIVE_CALLBACK_REQUEST: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "active_instruction_callback_request", default=None
 )
@@ -36,6 +39,12 @@ _ACTIVE_RESPONSE_APPEND: contextvars.ContextVar["_ResponseAppendAllowance | None
 
 class InstructionAssemblyError(RuntimeError):
     """An active v1 request cannot safely be assembled."""
+
+
+def _validate_authority(authority: Any, label: str = "instruction authority") -> str:
+    if not isinstance(authority, str) or authority not in _AUTHORITIES:
+        raise InstructionAssemblyError(f"{label} must be 'authoritative' or 'advisory'")
+    return authority
 
 
 def is_instruction_message(message: dict[str, Any]) -> bool:
@@ -147,7 +156,7 @@ def _target_kind(target: Any) -> str:
 def _validate_snapshot_item(item: Any) -> dict[str, Any]:
     if not isinstance(item, dict):
         raise InstructionAssemblyError("instruction snapshot entries must be mappings")
-    allowed = {"key", "content", "placement", "after"}
+    allowed = {"key", "content", "placement", "after", "authority"}
     if set(item) - allowed or not {"key", "content", "placement"} <= set(item):
         raise InstructionAssemblyError("instruction snapshot entry has an invalid shape")
     if not isinstance(item["key"], str) or not item["key"]:
@@ -156,7 +165,11 @@ def _validate_snapshot_item(item: Any) -> dict[str, Any]:
         raise InstructionAssemblyError("instruction snapshot content must be text")
     if item["placement"] not in {"head", "before_human", "tail"}:
         raise InstructionAssemblyError("instruction snapshot placement is invalid")
-    return dict(item)
+    normalized = dict(item)
+    normalized["authority"] = _validate_authority(
+        normalized.get("authority", AUTHORITATIVE), "instruction snapshot authority"
+    )
+    return normalized
 
 
 @dataclass
@@ -215,9 +228,15 @@ class InstructionLease:
         *,
         target: dict[str, Any] | str,
         retain_history: bool = False,
+        authority: str = AUTHORITATIVE,
     ) -> str:
         return self._assembly._publish(
-            self._source, event_key, instruction, target=target, retain_history=retain_history
+            self._source,
+            event_key,
+            instruction,
+            target=target,
+            retain_history=retain_history,
+            authority=authority,
         )
 
     def retire(self, event_key: str, reason: str) -> None:
@@ -242,6 +261,10 @@ class InstructionLease:
 class InstructionAssembly:
     """Context-local registry, placement resolver, and request transaction."""
 
+    # Consumers require this explicit counterpart to the provider capability
+    # before sending descriptors that carry an authority field.
+    instruction_layout_authority_v1 = True
+
     def __init__(
         self,
         context: Any,
@@ -250,6 +273,7 @@ class InstructionAssembly:
         required_filters: list[dict[str, str] | str] | tuple[dict[str, str] | str, ...] = (),
         session_id: str = "context",
         callback_timeout_s: float = 5.0,
+        callback_max_workers: int = 4,
     ) -> None:
         if not isinstance(session_id, str) or not session_id:
             raise InstructionAssemblyError("instruction session_id must be a non-empty string")
@@ -260,10 +284,19 @@ class InstructionAssembly:
             or callback_timeout_s <= 0
         ):
             raise InstructionAssemblyError("instruction callback timeout must be finite and greater than zero")
+        if (
+            isinstance(callback_max_workers, bool)
+            or not isinstance(callback_max_workers, int)
+            or callback_max_workers <= 0
+        ):
+            raise InstructionAssemblyError(
+                "instruction callback max workers must be a positive integer"
+            )
         self._context = context
         self._coordinator = coordinator
         self._required_filters = self._normalize_required_filters(required_filters)
         self._callback_timeout_s = float(callback_timeout_s)
+        self._callback_workers = threading.BoundedSemaphore(callback_max_workers)
         self._session_id = session_id
         self._sources: dict[str, _RegisteredSource] = {}
         self._source_generation = 0
@@ -377,12 +410,17 @@ class InstructionAssembly:
         descriptor = (message.get("metadata") or {}).get(INSTRUCTION_METADATA)
         if not isinstance(descriptor, dict):
             raise InstructionAssemblyError("trusted restored instruction descriptor must be a mapping")
+        # Authority was added after v1 first shipped. Trusted historical
+        # records intentionally retain their original meaning rather than
+        # silently becoming advisory.
+        descriptor.setdefault("authority", AUTHORITATIVE)
         expected = {
             "version",
             "source",
             "key",
             "binding",
             "placement",
+            "authority",
             "entry_id",
             "event_key",
             "session_id",
@@ -407,6 +445,7 @@ class InstructionAssembly:
             or descriptor.get("disposition") not in {"pending", "delivered", "retired", "anchor_pruned"}
         ):
             raise InstructionAssemblyError("trusted restored instruction descriptor has invalid fixed fields")
+        _validate_authority(descriptor.get("authority"), "trusted restored instruction authority")
         if "deferred_origin" in descriptor and descriptor["deferred_origin"] is not True:
             raise InstructionAssemblyError("trusted restored instruction deferred origin is invalid")
         for key in ("source", "key", "event_key", "entry_id", "session_id"):
@@ -541,7 +580,7 @@ class InstructionAssembly:
             raise InstructionAssemblyError("instruction lease is closed or replaced")
 
     def _assert_not_preparing(self) -> None:
-        if self._preparing:
+        if _ACTIVE_CALLBACK_REQUEST.get() is not None or self._preparing:
             raise InstructionAssemblyError(
                 "instruction callbacks cannot publish, retire, or mutate context while preparing"
             )
@@ -558,13 +597,17 @@ class InstructionAssembly:
 
     def assert_generic_history_replacement_allowed(self) -> None:
         """Keep generic history imports from retargeting fixed v1 state."""
-        if self._pending or any(
-            _fixed_descriptor(message) is not None for message in self._context.messages
-        ):
+        if self.has_marked_fixed_state():
             raise InstructionAssemblyError(
                 "generic history cannot replace pending or retained v1 fixed state; "
                 "use restore_host_checkpoint or clear the context deliberately"
             )
+
+    def has_marked_fixed_state(self) -> bool:
+        """Whether fixed v1 state would be silently lost on the legacy route."""
+        return bool(self._pending) or any(
+            has_instruction_descriptor(message) for message in self._context.messages
+        )
 
     def reset_fixed_state(self) -> None:
         """Discard request-only fixed state as part of an explicit context clear."""
@@ -604,6 +647,7 @@ class InstructionAssembly:
         *,
         target: dict[str, Any] | str,
         retain_history: bool,
+        authority: str,
     ) -> str:
         self._assert_live_source(source)
         self._assert_not_preparing()
@@ -611,6 +655,7 @@ class InstructionAssembly:
             raise InstructionAssemblyError("event_key must be a non-empty string")
         if not isinstance(instruction, str):
             raise InstructionAssemblyError("fixed instruction content must be text")
+        authority = _validate_authority(authority, "fixed instruction authority")
         target_kind = _target_kind(target)
         if target_kind != "deferred":
             self._validate_fixed_target(target)
@@ -629,13 +674,15 @@ class InstructionAssembly:
             )
             if (
                 existing.get("content") != instruction
+                or descriptor.get("authority", AUTHORITATIVE) != authority
                 or (
                     descriptor.get("target") != target
                     and not same_deferred_request
                 )
             ):
                 raise InstructionAssemblyError(
-                    f"fixed instruction {entry_id!r} was republished with different content or target"
+                    f"fixed instruction {entry_id!r} was republished with different content or target "
+                    "(or authority)"
                 )
             return entry_id
 
@@ -647,6 +694,7 @@ class InstructionAssembly:
             "content": instruction,
             "target": copy.deepcopy(target),
             "placement": placement,
+            "authority": authority,
             "deferred_origin": target_kind == "deferred",
             "retain_history": retain_history,
             "order": self._fixed_order,
@@ -678,6 +726,7 @@ class InstructionAssembly:
             "key": entry["key"],
             "binding": "fixed",
             "placement": entry["placement"],
+            "authority": entry["authority"],
             "entry_id": entry["entry_id"],
             "event_key": entry["key"],
             "session_id": self._session_id,
@@ -755,9 +804,16 @@ class InstructionAssembly:
             raise InstructionAssemblyError("request scope requires a non-empty request_id")
         if self._current_turn and request_scope.get("turn_id") != self._current_turn["turn_id"]:
             raise InstructionAssemblyError("request scope does not belong to the active turn")
-        self._route = (
-            "v1" if getattr(selected_provider, "instruction_layout_version", None) == 1 else "legacy"
+        supports_v1 = (
+            getattr(selected_provider, "instruction_layout_version", None) == 1
+            and getattr(selected_provider, "instruction_layout_authority_v1", None) is True
         )
+        if not supports_v1 and self.has_marked_fixed_state():
+            raise InstructionAssemblyError(
+                "marked v1 instruction history requires a provider with "
+                "instruction_layout_version == 1 and instruction_layout_authority_v1 is True"
+            )
+        self._route = "v1" if supports_v1 else "legacy"
         self._current_request = dict(request_scope)
         try:
             yield
@@ -831,9 +887,10 @@ class InstructionAssembly:
             if notice:
                 notice_record = self._record(
                     source="context-compaction",
-                    key="compaction-notice",
+                    key="notice",
                     content=notice,
                     placement="before_human",
+                    authority=ADVISORY,
                     binding="live",
                     order=-1,
                 )
@@ -900,6 +957,7 @@ class InstructionAssembly:
                         key=item["key"],
                         content=item["content"],
                         placement=item["placement"],
+                        authority=item["authority"],
                         binding="live",
                         order=(source.order * 1_000_000) + index,
                         target=item.get("after"),
@@ -919,6 +977,7 @@ class InstructionAssembly:
                     key=entry["key"],
                     content=entry["content"],
                     placement=entry["placement"],
+                    authority=entry.get("authority", AUTHORITATIVE),
                     binding="fixed",
                     order=entry["order"],
                     target=entry["target"],
@@ -939,6 +998,7 @@ class InstructionAssembly:
             entries.append(
                 {
                     **copy.deepcopy(descriptor),
+                    "authority": descriptor.get("authority", AUTHORITATIVE),
                     "content": message.get("content"),
                     "retain_history": True,
                 }
@@ -999,6 +1059,7 @@ class InstructionAssembly:
         key: str,
         content: str,
         placement: str,
+        authority: str,
         binding: str,
         order: int,
         target: dict[str, Any] | None = None,
@@ -1011,6 +1072,7 @@ class InstructionAssembly:
             "key": key,
             "binding": binding,
             "placement": placement,
+            "authority": _validate_authority(authority),
         }
         if binding == "fixed":
             descriptor.update(
@@ -1054,18 +1116,29 @@ class InstructionAssembly:
 
         def invoke() -> Any:
             token = _ACTIVE_CALLBACK_REQUEST.set(request_id)
+            value: Any = None
+            error: BaseException | None = None
             try:
                 value = callback(*args)
                 if inspect.isawaitable(value):
                     value = asyncio.run(_await(value))
-                schedule(value)
-            except BaseException as error:
-                schedule(error=error)
+            except BaseException as caught:
+                error = caught
             finally:
                 _ACTIVE_CALLBACK_REQUEST.reset(token)
+                self._callback_workers.release()
+            schedule(value, error)
 
         try:
-            threading.Thread(target=invoke, daemon=True).start()
+            if not self._callback_workers.acquire(blocking=False):
+                raise InstructionAssemblyError(
+                    "instruction callback worker capacity is exhausted"
+                )
+            try:
+                threading.Thread(target=invoke, daemon=True).start()
+            except BaseException:
+                self._callback_workers.release()
+                raise
             return await asyncio.wait_for(result, timeout=self._callback_timeout_s)
         except TimeoutError as error:
             raise InstructionAssemblyError(

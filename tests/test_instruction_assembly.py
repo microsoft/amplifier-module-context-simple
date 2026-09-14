@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import threading
 import time
 
 import pytest
@@ -47,6 +48,16 @@ class _MountCoordinator(_Coordinator):
 
 class _Provider:
     instruction_layout_version = 1
+    instruction_layout_authority_v1 = True
+
+
+class _LayoutOnlyProvider:
+    instruction_layout_version = 1
+
+
+class _TruthyAuthorityProvider:
+    instruction_layout_version = 1
+    instruction_layout_authority_v1 = 1
 
 
 class _FailAfterResponseIngressContext(SimpleContextManager):
@@ -218,6 +229,7 @@ def _bound_context(
     filters=(),
     max_tokens=2_000,
     callback_timeout_s=5.0,
+    callback_max_workers=4,
     context_type=SimpleContextManager,
 ):
     context = context_type(
@@ -233,6 +245,7 @@ def _bound_context(
         required_filters=filters,
         session_id="logical-session",
         callback_timeout_s=callback_timeout_s,
+        callback_max_workers=callback_max_workers,
     )
     context._instruction_assembly = assembly
     coordinator.register_capability(CAPABILITY, assembly)
@@ -246,6 +259,7 @@ async def test_i1_mount_advertises_the_structural_capability():
 
     assembly = coordinator.capabilities[CAPABILITY]
     assert coordinator.mounted == ("context", assembly._context)
+    assert assembly.instruction_layout_authority_v1 is True
     lease = assembly.register("producer", stable_order=0)
     assert callable(lease.publish)
     assert callable(lease.retire)
@@ -1042,3 +1056,318 @@ async def test_system_prompt_factory_is_versioned_and_frozen_with_prepared_reque
             await context.get_messages_for_request()
             with pytest.raises(InstructionAssemblyError, match="immutable"):
                 await context.set_system_prompt_factory(first_factory)
+
+
+@pytest.mark.asyncio
+async def test_snapshot_authority_defaults_to_authoritative_and_preserves_explicit_advisory():
+    context, _, assembly = _bound_context()
+    assembly.register(
+        "source",
+        lambda _scope: [
+            {"key": "default", "content": "default authority", "placement": "before_human"},
+            {
+                "key": "advisory",
+                "content": "advisory authority",
+                "placement": "before_human",
+                "authority": "advisory",
+            },
+        ],
+        stable_order=0,
+    )
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+
+    view = await _request(context, assembly, "r1", anchor)
+    authorities = {
+        message["content"]: message["metadata"]["amplifier:instruction"]["authority"]
+        for message in view
+        if message["content"] in {"default authority", "advisory authority"}
+    }
+
+    assert authorities == {
+        "default authority": "authoritative",
+        "advisory authority": "advisory",
+    }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", [True, None, 1, "unsupported"])
+async def test_snapshot_rejects_invalid_authority(authority):
+    context, _, assembly = _bound_context()
+    assembly.register(
+        "source",
+        lambda _scope: [
+            {
+                "key": "invalid",
+                "content": "invalid authority",
+                "placement": "before_human",
+                "authority": authority,
+            }
+        ],
+    )
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+
+    with pytest.raises(InstructionAssemblyError, match="snapshot authority"):
+        await _request(context, assembly, "r1", anchor)
+
+
+@pytest.mark.asyncio
+async def test_fixed_authority_is_validated_persisted_and_part_of_republish_identity():
+    context, _, assembly = _bound_context()
+    lease = assembly.register("source", stable_order=0)
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+
+    entry_id = lease.publish(
+        "notice",
+        "advisory fixed",
+        target=anchor,
+        retain_history=True,
+        authority="advisory",
+    )
+    descriptor = next(
+        message["metadata"]["amplifier:instruction"]
+        for message in context.messages
+        if message["metadata"].get("amplifier:instruction", {}).get("entry_id") == entry_id
+    )
+    assert descriptor["authority"] == "advisory"
+
+    with pytest.raises(InstructionAssemblyError, match="different content or target"):
+        lease.publish(
+            "notice",
+            "advisory fixed",
+            target=anchor,
+            retain_history=True,
+            authority="authoritative",
+        )
+    for invalid in (None, True, 1, "unsupported"):
+        with pytest.raises(InstructionAssemblyError, match="authority"):
+            lease.publish(
+                f"invalid-{invalid!r}",
+                "invalid authority",
+                target=anchor,
+                authority=invalid,
+            )
+
+
+@pytest.mark.asyncio
+async def test_authority_gate_keeps_unmarked_history_legacy_and_rejects_marked_history():
+    context, _, assembly = _bound_context()
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+    assert not assembly.has_marked_fixed_state()
+    assembly.register(
+        "live",
+        lambda _scope: [{"key": "state", "content": "must not render", "placement": "before_human"}],
+    )
+    scope = {
+        "turn_id": "legacy-turn",
+        "request_id": "legacy-request",
+        "llm_step_id": "legacy-step",
+        "input_anchor": anchor,
+        "tail_anchor": None,
+        "completed_batches": [],
+    }
+    async with assembly.turn("legacy-turn", anchor):
+        async with assembly.request(scope, _LayoutOnlyProvider()):
+            assert assembly.route == "legacy"
+            assert "must not render" not in [
+                message["content"] for message in await context.get_messages_for_request()
+            ]
+
+    assembly.register("fixed").publish(
+        "head",
+        "retained authoritative record",
+        target={"session_id": "logical-session", "kind": "conversation_head"},
+        retain_history=True,
+    )
+    assert assembly.has_marked_fixed_state()
+    for provider in (_LayoutOnlyProvider(), _TruthyAuthorityProvider()):
+        with pytest.raises(InstructionAssemblyError, match="instruction_layout_authority_v1"):
+            async with assembly.request({**scope, "request_id": "rejected"}, provider):
+                pass
+
+
+@pytest.mark.asyncio
+async def test_authority_gate_rejects_incompatible_provider_for_pending_request_only_fixed_state():
+    context, _, assembly = _bound_context()
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+    entry_id = assembly.register("source").publish(
+        "one-shot",
+        "request-only authoritative record",
+        target=anchor,
+        retain_history=False,
+    )
+    assert entry_id in assembly._pending
+    assert assembly.has_marked_fixed_state()
+
+    with pytest.raises(InstructionAssemblyError, match="instruction_layout_authority_v1"):
+        async with assembly.request(
+            {
+                "turn_id": "turn-r1",
+                "request_id": "r1",
+                "llm_step_id": "step-r1",
+                "input_anchor": anchor,
+                "tail_anchor": None,
+                "completed_batches": [],
+            },
+            _LayoutOnlyProvider(),
+        ):
+            pass
+
+    assert entry_id in assembly._pending
+    assert [message["content"] for message in context.messages] == ["task"]
+
+
+@pytest.mark.asyncio
+async def test_v1_forced_compaction_notice_is_admitted_as_advisory_record():
+    context = SimpleContextManager(
+        max_tokens=2_000,
+        compact_threshold=0.5,
+        target_usage=0.3,
+        protected_recent=0.2,
+        protected_tool_results=1,
+        truncate_chars=40,
+        compaction_notice_enabled=True,
+        compaction_notice_min_level=1,
+    )
+    coordinator = _Coordinator()
+    assembly = InstructionAssembly(context, coordinator, session_id="logical-session")
+    context._instruction_assembly = assembly
+    coordinator.register_capability(CAPABILITY, assembly)
+    for index in range(40):
+        await context.add_message({"role": "user", "content": f"old user {index} " + ("x" * 80)})
+        await context.add_message(
+            {"role": "assistant", "content": f"old assistant {index} " + ("x" * 80)}
+        )
+    anchor = await _add_input(context, assembly, "h1", "human", "current task")
+
+    view = await _request(context, assembly, "r1", anchor)
+    notices = [
+        message
+        for message in view
+        if message.get("metadata", {}).get("amplifier:instruction", {}).get("source")
+        == "context-compaction"
+    ]
+
+    assert context._last_compaction_stats is not None
+    assert len(notices) == 1
+    descriptor = notices[0]["metadata"]["amplifier:instruction"]
+    assert descriptor["key"] == "notice"
+    assert descriptor["authority"] == "advisory"
+    assert descriptor["placement"] == "before_human"
+    contents = [message["content"] for message in view]
+    assert contents.index(notices[0]["content"]) + 1 == contents.index("current task")
+
+
+@pytest.mark.asyncio
+async def test_timed_out_callback_cannot_later_publish_close_or_mutate_context():
+    context, _, assembly = _bound_context(callback_timeout_s=0.01)
+    callback_started = threading.Event()
+    callback_release = threading.Event()
+    callback_finished = threading.Event()
+    callback_errors = []
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+    lease = None
+
+    async def delayed_snapshot(_scope):
+        callback_started.set()
+        await asyncio.to_thread(callback_release.wait)
+        for mutation in (
+            lambda: lease.publish("late", "must not publish", target=anchor),
+            lease.close,
+            lambda: context.clear(),
+        ):
+            try:
+                result = mutation()
+                if asyncio.iscoroutine(result):
+                    await result
+            except InstructionAssemblyError as error:
+                callback_errors.append(error)
+        callback_finished.set()
+        return []
+
+    lease = assembly.register("source", delayed_snapshot, stable_order=0)
+    with pytest.raises(InstructionAssemblyError, match="snapshot callback.*timed out"):
+        await _request(context, assembly, "r1", anchor)
+    assert await asyncio.to_thread(callback_started.wait, 1)
+
+    callback_release.set()
+    assert await asyncio.to_thread(callback_finished.wait, 1)
+    assert len(callback_errors) == 3
+    assert "source" in assembly._sources
+    assert "logical-session:source:late" not in assembly._pending
+    assert [message["content"] for message in context.messages] == ["task"]
+
+
+@pytest.mark.asyncio
+async def test_callback_worker_capacity_fails_without_starting_and_recovers_after_release():
+    _, _, assembly = _bound_context(callback_max_workers=1)
+    started = threading.Event()
+    release = threading.Event()
+
+    def blocking_callback():
+        started.set()
+        release.wait()
+        return "first"
+
+    first = asyncio.create_task(
+        assembly._call_required(blocking_callback, "first callback", "request-1")
+    )
+    assert await asyncio.to_thread(started.wait, 1)
+    second_started = threading.Event()
+
+    def rejected_callback():
+        second_started.set()
+        return "second"
+
+    with pytest.raises(InstructionAssemblyError, match="worker capacity is exhausted"):
+        await assembly._call_required(rejected_callback, "second callback", "request-2")
+    assert not second_started.is_set()
+
+    release.set()
+    assert await first == "first"
+    assert await assembly._call_required(lambda: "recovered", "recovered callback", "request-3") == "recovered"
+
+
+@pytest.mark.asyncio
+async def test_snapshot_callback_receives_a_detached_request_scope_copy():
+    context, _, assembly = _bound_context()
+    observed_scopes = []
+
+    def snapshot(scope):
+        observed_scopes.append(scope)
+        scope["input_anchor"]["message_id"] = "forged"
+        scope["completed_batches"].append({"mutated": True})
+        return [{"key": "state", "content": "safe", "placement": "before_human"}]
+
+    assembly.register("source", snapshot)
+    anchor = await _add_input(context, assembly, "h1", "human", "task")
+    request_scope = {
+        "turn_id": "turn-r1",
+        "request_id": "r1",
+        "llm_step_id": "step-r1",
+        "input_anchor": copy.deepcopy(anchor),
+        "tail_anchor": None,
+        "completed_batches": [],
+    }
+    async with assembly.turn("turn-r1", anchor):
+        async with assembly.request(request_scope, _Provider()):
+            view = await context.get_messages_for_request()
+
+    assert observed_scopes[0]["input_anchor"]["message_id"] == "forged"
+    assert request_scope["input_anchor"] == anchor
+    assert request_scope["completed_batches"] == []
+    contents = [message["content"] for message in view]
+    assert contents.index("safe") + 1 == contents.index("task")
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "4"])
+def test_callback_worker_limit_requires_a_positive_non_boolean_integer(value):
+    context = SimpleContextManager(compaction_notice_enabled=False)
+    with pytest.raises(InstructionAssemblyError, match="max workers"):
+        InstructionAssembly(context, _Coordinator(), callback_max_workers=value)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [0, True, "4"])
+async def test_mount_validates_instruction_callback_worker_limit(value):
+    with pytest.raises(InstructionAssemblyError, match="max workers"):
+        await mount(_MountCoordinator(), {"instruction_callback_max_workers": value})

@@ -147,6 +147,8 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
               irreversibly clipped at ingress with a retrieval marker.
             - instruction_callback_timeout_s: Maximum seconds for a required
               instruction snapshot or direct filter callback (default: 5.0).
+            - instruction_callback_max_workers: Maximum concurrent callback
+              workers (default: 4). Must be a positive integer.
             - instruction_filters: Ordered mappings with ``capability`` and
               ``policy_id``. Legacy string capability entries remain accepted
               with their prior receipt behavior. If configured, redaction must
@@ -196,6 +198,7 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
             required_filters=tuple(config.get("instruction_filters", ())),
             session_id=str(config.get("instruction_session_id", "context")),
             callback_timeout_s=config.get("instruction_callback_timeout_s", 5.0),
+            callback_max_workers=config.get("instruction_callback_max_workers", 4),
         )
         context._instruction_assembly = instruction_assembly
         coordinator.register_capability(CAPABILITY, instruction_assembly)

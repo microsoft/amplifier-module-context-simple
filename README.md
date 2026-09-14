@@ -44,7 +44,19 @@ name = "simple"
 
 [contexts.config]
 max_tool_result_bytes = 131072  # Optional override; default is 128 KiB
+instruction_callback_max_workers = 4  # Bound concurrent snapshot/filter callbacks
 ```
+
+Instruction descriptors have an explicit authority: `authoritative` (the
+default, including historical descriptors that omit it) or `advisory`.
+Providers must opt in to both layout and authority support before the
+assembly path activates. This prevents retained authoritative records from
+silently falling back to legacy prompt handling.
+
+**Coupled rollout:** a loop must require
+`context.instructions.v1.instruction_layout_authority_v1 is True` before it
+stages authority-bearing snapshots for execution. It may still discover the
+context capability to reject marked history rather than silently downgrade it.
 
 ### Tool-result text ingress cap
 

@@ -23,6 +23,7 @@ class _Coordinator:
 
 class _Provider:
     instruction_layout_version = 1
+    instruction_layout_authority_v1 = True
 
 
 def _assembly(context, session_id="logical"):
@@ -617,3 +618,94 @@ async def test_retained_deferred_republication_after_restore_reuses_its_bound_an
             target=symbolic_target,
             retain_history=True,
         )
+
+
+@pytest.mark.asyncio
+async def test_trusted_restore_defaults_missing_historical_authority_without_mutating_input():
+    source = SimpleContextManager(compaction_notice_enabled=False)
+    source_assembly = _assembly(source)
+    source_assembly.register("producer", stable_order=0).publish(
+        "head",
+        "historical authority",
+        target={"session_id": "logical", "kind": "conversation_head"},
+        retain_history=True,
+    )
+    historical = copy.deepcopy(await source.get_messages())
+    del historical[0]["metadata"]["amplifier:instruction"]["authority"]
+    original_historical = copy.deepcopy(historical)
+
+    restored = SimpleContextManager(compaction_notice_enabled=False)
+    restored_assembly = _assembly(restored)
+    await restored.restore_host_checkpoint(historical)
+
+    assert historical == original_historical
+    descriptor = restored.messages[0]["metadata"]["amplifier:instruction"]
+    assert descriptor["authority"] == "authoritative"
+    anchor = await _input(restored, restored_assembly, "h1", "human", "task")
+    view = await _view(restored, restored_assembly, "r1", anchor)
+    assert next(
+        message["metadata"]["amplifier:instruction"]["authority"]
+        for message in view
+        if message["content"] == "historical authority"
+    ) == "authoritative"
+
+
+@pytest.mark.asyncio
+async def test_trusted_restore_preserves_explicit_advisory_authority():
+    source = SimpleContextManager(compaction_notice_enabled=False)
+    source_assembly = _assembly(source)
+    source_assembly.register("producer", stable_order=0).publish(
+        "head",
+        "advisory authority",
+        target={"session_id": "logical", "kind": "conversation_head"},
+        retain_history=True,
+        authority="advisory",
+    )
+
+    restored = SimpleContextManager(compaction_notice_enabled=False)
+    _assembly(restored)
+    await restored.restore_host_checkpoint(await source.get_messages())
+
+    assert restored.messages[0]["metadata"]["amplifier:instruction"]["authority"] == "advisory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("authority", [True, None, 1, "unknown"])
+async def test_trusted_restore_rejects_invalid_authority_atomically(authority):
+    source = SimpleContextManager(compaction_notice_enabled=False)
+    source_assembly = _assembly(source)
+    source_assembly.register("producer", stable_order=0).publish(
+        "head",
+        "fixed authority",
+        target={"session_id": "logical", "kind": "conversation_head"},
+        retain_history=True,
+    )
+    malformed = copy.deepcopy(await source.get_messages())
+    malformed[0]["metadata"]["amplifier:instruction"]["authority"] = authority
+
+    restored = SimpleContextManager(compaction_notice_enabled=False)
+    _assembly(restored)
+    with pytest.raises(InstructionAssemblyError, match="authority"):
+        await restored.restore_host_checkpoint(malformed)
+    assert restored.messages == []
+
+
+@pytest.mark.asyncio
+async def test_trusted_restore_authority_keeps_descriptor_shape_closed():
+    source = SimpleContextManager(compaction_notice_enabled=False)
+    source_assembly = _assembly(source)
+    source_assembly.register("producer", stable_order=0).publish(
+        "head",
+        "fixed authority",
+        target={"session_id": "logical", "kind": "conversation_head"},
+        retain_history=True,
+        authority="advisory",
+    )
+    malformed = copy.deepcopy(await source.get_messages())
+    malformed[0]["metadata"]["amplifier:instruction"]["unexpected"] = "field"
+
+    restored = SimpleContextManager(compaction_notice_enabled=False)
+    _assembly(restored)
+    with pytest.raises(InstructionAssemblyError, match="closed shape"):
+        await restored.restore_host_checkpoint(malformed)
+    assert restored.messages == []
