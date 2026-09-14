@@ -24,6 +24,8 @@ messages removed. The same case on the fixed module reaches level 2 with 4
 truncations and 0 messages removed.
 """
 
+from copy import deepcopy
+
 import pytest
 
 from amplifier_module_context_simple import SimpleContextManager
@@ -77,7 +79,7 @@ async def _run_workload(ctx: SimpleContextManager) -> dict:
             }
         )
 
-    await ctx.get_messages_for_request()
+    view = await ctx.get_messages_for_request()
     stats = ctx._last_compaction_stats or {}
     truncated_tool_ids = sorted(
         msg["tool_call_id"]
@@ -90,6 +92,9 @@ async def _run_workload(ctx: SimpleContextManager) -> dict:
         "messages_removed": stats.get("messages_removed"),
         "messages_truncated": stats.get("messages_truncated"),
         "truncated_tool_ids": truncated_tool_ids,
+        "retained_tool_ids": sorted(
+            msg["tool_call_id"] for msg in view if msg.get("role") == "tool"
+        ),
     }
 
 
@@ -164,8 +169,9 @@ async def test_protecting_every_tool_result_still_works():
     result = await _run_workload(_make_context(protected_tool_results=N_TOOL_PAIRS))
 
     assert result["truncated_tool_ids"] == [], result
-    assert result["level"] == 3, result
-    assert result["messages_removed"] > 0, result
+    assert result["level"] >= 3, result
+    assert result["messages_removed"] == 0, result
+    assert result["retained_tool_ids"] == [f"t{i}" for i in range(N_TOOL_PAIRS)]
 
 
 # --------------------------------------------------------------------------
@@ -201,3 +207,120 @@ def test_protected_tool_indices_uses_real_positions_not_ordinals():
     """The returned indices are positions in the message list, not 0..N-1."""
     ctx = SimpleContextManager(protected_tool_results=2)
     assert ctx._protected_tool_indices([3, 11, 40, 57]) == {40, 57}
+
+
+@pytest.mark.asyncio
+async def test_default_protected_tool_results_survive_removal_compaction():
+    """The default five-result floor protects all four older tool groups."""
+    ctx = SimpleContextManager(max_tokens=120_000)
+    old_users = [f"old-user-{i}:" + ("x" * 100_000) for i in range(4)]
+    latest_user = "latest-user:" + ("y" * 100_000)
+    system_content = "system-stays:" + ("s" * 50_000)
+
+    await ctx.add_message({"role": "system", "content": system_content})
+    for i in range(4):
+        await ctx.add_message({"role": "user", "content": old_users[i]})
+        await ctx.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "thinking": {"opaque": f"opaque-thinking-{i}"},
+                "tool_calls": [
+                    {
+                        "id": f"call-{i}",
+                        "type": "function",
+                        "function": {"name": "read_file"},
+                    }
+                ],
+            }
+        )
+        await ctx.add_message(
+            {"role": "tool", "tool_call_id": f"call-{i}", "content": "z" * 512}
+        )
+    await ctx.add_message({"role": "user", "content": latest_user})
+    canonical = deepcopy(ctx.messages)
+
+    view = await ctx.get_messages_for_request()
+    stats = ctx._last_compaction_stats or {}
+
+    assert stats["strategy_level"] >= 4
+    assert any(message.get("_stubbed") for message in view)
+    assert any(
+        message.get("role") == "system" and message.get("content") == system_content
+        for message in view
+    )
+    assert any(message.get("role") == "user" and message.get("content") == latest_user for message in view)
+    for i in range(4):
+        owner = next(
+            message
+            for message in view
+            if message.get("role") == "assistant"
+            and message.get("tool_calls", [{}])[0].get("id") == f"call-{i}"
+        )
+        assert owner["thinking"] == {"opaque": f"opaque-thinking-{i}"}
+        assert next(
+            message
+            for message in view
+            if message.get("role") == "tool" and message.get("tool_call_id") == f"call-{i}"
+        )["content"] == "z" * 512
+
+    protected_seqs = {
+        SimpleContextManager._extract_seq(message)
+        for message in canonical
+        if message.get("role") == "tool"
+    }
+    assert ctx._removed_seqs.isdisjoint(protected_seqs)
+    assert ctx.messages == canonical
+
+
+def test_protected_result_keeps_its_entire_multi_call_batch_atomic():
+    """One protected sibling vetoes removal of its owner and older sibling."""
+    ctx = SimpleContextManager(protected_tool_results=1)
+    messages = [
+        {"role": "user", "content": "older-user"},
+        {
+            "role": "assistant",
+            "content": "",
+            "thinking": {"opaque": "generic-thinking-payload"},
+            "tool_calls": [
+                {"id": "older-call", "type": "function", "function": {"name": "read_file"}},
+                {"id": "protected-call", "type": "function", "function": {"name": "read_file"}},
+            ],
+        },
+        {"role": "tool", "tool_call_id": "older-call", "content": "old result"},
+        {"role": "tool", "tool_call_id": "protected-call", "content": "recent result"},
+        {"role": "user", "content": "latest-user"},
+    ]
+
+    result, removed, stubbed, _ = ctx._remove_messages_with_protection(
+        messages, target_tokens=1, protected_recent=0, system_tokens=0
+    )
+
+    assert removed == 0
+    assert stubbed == 0
+    assert result == messages
+
+
+def test_zero_protected_tool_results_allows_old_group_removal():
+    """With no result floor, an unprotected old group remains removable as a unit."""
+    ctx = SimpleContextManager(protected_tool_results=0)
+    assistant = {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [
+            {"id": "old-call", "type": "function", "function": {"name": "read_file"}}
+        ],
+    }
+    tool_result = {"role": "tool", "tool_call_id": "old-call", "content": "old result"}
+    latest_user = {"role": "user", "content": "latest-user"}
+
+    result, removed, stubbed, _ = ctx._remove_messages_with_protection(
+        [assistant, tool_result, latest_user],
+        target_tokens=1,
+        protected_recent=0,
+        system_tokens=0,
+    )
+
+    assert removed == 2
+    assert stubbed == 0
+    assert result == [latest_user]
