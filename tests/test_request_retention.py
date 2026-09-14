@@ -143,3 +143,13 @@ async def test_mount_advertises_additive_capability_and_keeps_old_getter():
         == []
     )
     await cleanup()
+
+
+@pytest.mark.asyncio
+async def test_stale_actual_meter_cannot_prevent_feasible_retention_compaction():
+    context, body = await pressured_context()
+    context.token_meter = "actual"
+    context._last_measured_prompt_tokens = 100
+    view = await context.get_messages_for_request_retaining(retain_contents=[body])
+    assert any(m["content"] == body for m in view)
+    assert context._estimate_tokens(view) <= context.max_tokens

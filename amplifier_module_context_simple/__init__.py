@@ -754,7 +754,11 @@ class SimpleContextManager:
         }
 
         # Check if compaction needed (using effective budget with notice reserve deducted)
-        if self._should_compact(token_count, effective_budget):
+        retained_view_over_budget = (
+            bool(self._request_retained_contents)
+            and estimated_tokens > effective_budget
+        )
+        if self._should_compact(token_count, effective_budget) or retained_view_over_budget:
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
                 effective_budget, working_messages
