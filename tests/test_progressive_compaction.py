@@ -15,18 +15,15 @@ from amplifier_module_context_simple import SimpleContextManager
 @pytest.mark.asyncio
 async def test_tool_result_truncation_phase1():
     """Phase 1 truncates old tool results while preserving structure."""
-    # Configure for easy testing: low tokens, aggressive truncation
-    # Use lower max_tokens to ensure compaction triggers with our message sizes
+    # Four results make the first 25% truncation wave nonempty. Its large
+    # result is unprotected; the three recent results must remain intact.
     context = SimpleContextManager(
-        max_tokens=300,  # Lower to ensure compaction triggers
-        compact_threshold=0.5,
-        target_usage=0.3,
+        max_tokens=2000,
+        compact_threshold=0.9,
+        target_usage=0.5,
         truncate_chars=50,
-        protected_recent=0.3,  # Protect recent messages but allow truncation of old tool
-        protected_tool_results=2,  # Only protect last 2 tool results
-        # Without this, the default 800-token notice reserve makes
-        # effective_budget = 300 - 800 = -700, which silently disables
-        # compaction entirely (see test_budget_guard.py).
+        protected_recent=0,
+        protected_tool_results=3,
         compaction_notice_enabled=False,
     )
 
@@ -46,19 +43,22 @@ async def test_tool_result_truncation_phase1():
         }
     )
     # Add a large tool result - this will push us over the threshold
-    large_content = "x" * 500  # 500 chars = ~125 tokens
+    large_content = "x" * 10000
     await context.add_message(
         {"role": "tool", "tool_call_id": "toolu_early", "content": large_content}
     )
 
-    # Add more messages to push tool pair into truncate zone (first 50%)
-    for i in range(10):
+    for i in range(3):
+        call_id = f"recent-call-{i}"
         await context.add_message(
-            {"role": "user", "content": f"message {i} with extra padding"}
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": call_id, "type": "function", "function": {"name": "read_file"}}
+            ]}
         )
         await context.add_message(
-            {"role": "assistant", "content": f"response {i} with extra padding"}
+            {"role": "tool", "tool_call_id": call_id, "content": "small result"}
         )
+    await context.add_message({"role": "user", "content": "continue"})
 
     # Trigger compaction
     messages = await context.get_messages_for_request()
@@ -70,14 +70,18 @@ async def test_tool_result_truncation_phase1():
             tool_result = msg
             break
 
-    # Verify truncation occurred
-    if tool_result:
-        content = tool_result.get("content", "")
-        assert "[truncated:" in content, "Tool result should be truncated"
-        assert tool_result.get("_truncated") is True, "Should have _truncated marker"
-        assert len(content) < 200, (
-            f"Truncated content should be small, got {len(content)}"
-        )
+    # Removal is not a substitute for the truncation this test promises.
+    assert tool_result is not None
+    content = tool_result.get("content", "")
+    assert "[truncated:" in content, "Tool result should be truncated"
+    assert tool_result.get("_truncated") is True
+    assert len(content) < 200
+    assert context._last_compaction_stats["strategy_level"] == 1
+    assert context._last_compaction_stats["messages_removed"] == 0
+    assert [
+        m["content"] for m in messages
+        if m.get("tool_call_id", "").startswith("recent-call-")
+    ] == ["small result"] * 3
 
 
 @pytest.mark.asyncio

@@ -1790,6 +1790,13 @@ class SimpleContextManager:
         for i in range(protected_boundary, len(messages)):
             protected_indices.add(i)
 
+        # The last N tool results are protected from removal as well as truncation.
+        # Their owning assistant and sibling results are vetoed atomically below.
+        tool_result_indices = [
+            i for i, msg in enumerate(messages) if msg.get("role") == "tool"
+        ]
+        protected_indices |= self._protected_tool_indices(tool_result_indices)
+
         # Removal candidates exclude ALL user messages (they can only be stubbed, not removed)
         removal_candidates = [
             i

@@ -102,6 +102,7 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 - **First human prompt**: The original human task/request is protected, using message metadata rather than treating every user-role message as human input
 - **Last human prompt**: The most recent human input is protected by the same metadata-based classification
 - **Recent messages**: Last N% of messages (configurable via `protected_recent`)
+- **Recent tool results**: The last `protected_tool_results` results (default 5) are protected from both truncation and removal; a protected sibling also prevents removal of its owning call group
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
 
 ### Request-scoped retention
@@ -117,6 +118,9 @@ pin every historical reminder, or rewrite canonical history. A missing required
 body or an irreducible required set that cannot fit raises `ContextLengthError`
 instead of silently dropping instructions. Failed assembly restores the prior
 compaction state.
+
+Protection takes precedence over the compaction target. A protected tool cohort
+can leave a view above that target; it is not a strict native-token ceiling.
 
 ### Compaction Phases
 
