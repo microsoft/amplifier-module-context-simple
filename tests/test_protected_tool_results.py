@@ -164,8 +164,8 @@ async def test_protecting_every_tool_result_still_works():
     result = await _run_workload(_make_context(protected_tool_results=N_TOOL_PAIRS))
 
     assert result["truncated_tool_ids"] == [], result
-    assert result["level"] == 3, result
-    assert result["messages_removed"] > 0, result
+    assert result["level"] >= 3, result
+    assert result["messages_removed"] == 0, result
 
 
 # --------------------------------------------------------------------------
@@ -201,3 +201,55 @@ def test_protected_tool_indices_uses_real_positions_not_ordinals():
     """The returned indices are positions in the message list, not 0..N-1."""
     ctx = SimpleContextManager(protected_tool_results=2)
     assert ctx._protected_tool_indices([3, 11, 40, 57]) == {40, 57}
+
+
+@pytest.mark.parametrize("protected", [0, 1, 5])
+def test_one_protected_sibling_vetoes_whole_batch_removal(protected):
+    """Removal honors the same last-N floor as truncation, including N=0."""
+    from copy import deepcopy
+
+    ctx = SimpleContextManager(protected_tool_results=protected)
+    messages = [
+        {"role": "user", "content": "first human"},
+        {"role": "assistant", "content": "", "thinking": {"opaque": "unchanged"},
+         "tool_calls": [
+             {"id": "old", "type": "function", "function": {"name": "read_file"}},
+             {"id": "recent", "type": "function", "function": {"name": "read_file"}},
+         ]},
+        {"role": "tool", "tool_call_id": "old", "content": "older sibling"},
+        {"role": "tool", "tool_call_id": "recent", "content": "protected sibling"},
+        {"role": "user", "content": "last human"},
+    ]
+    before = deepcopy(messages)
+    view, removed, stubbed, _ = ctx._remove_messages_with_protection(
+        messages, target_tokens=1, protected_recent=0, system_tokens=0,
+    )
+    assert messages == before
+    assert stubbed == 0
+    assert removed == (0 if protected else 3)
+    assert view == (before if protected else [before[0], before[-1]])
+
+
+@pytest.mark.asyncio
+async def test_default_tool_floor_survives_progressive_removal():
+    from copy import deepcopy
+
+    ctx = SimpleContextManager(max_tokens=120_000)
+    for index in range(4):
+        await ctx.add_message({"role": "user", "content": f"human-{index}:" + "x" * 100_000})
+        await ctx.add_message({
+            "role": "assistant", "content": "", "tool_calls": [
+                {"id": f"call-{index}", "type": "function", "function": {"name": "read_file"}}
+            ],
+        })
+        await ctx.add_message({
+            "role": "tool", "tool_call_id": f"call-{index}", "content": f"result-{index}",
+        })
+    await ctx.add_message({"role": "user", "content": "latest:" + "y" * 100_000})
+    canonical = deepcopy(ctx.messages)
+    view = await ctx.get_messages_for_request()
+    assert ctx._last_compaction_stats["strategy_level"] >= 4
+    assert [m["content"] for m in view if m.get("role") == "tool"] == [
+        f"result-{index}" for index in range(4)
+    ]
+    assert ctx.messages == canonical

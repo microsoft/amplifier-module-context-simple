@@ -99,10 +99,28 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 ### Protected Messages (Never Removed)
 
 - **System messages**: All system messages are always preserved
-- **First user message**: The original task/request is always protected (prevents losing context about what was originally asked)
-- **Last user message**: The most recent user input is always preserved
+- **First human prompt**: The original human task/request is protected, using message metadata rather than treating every user-role message as human input
+- **Last human prompt**: The most recent human input is protected by the same metadata-based classification
 - **Recent messages**: Last N% of messages (configurable via `protected_recent`)
+- **Recent tool results**: The last `protected_tool_results` results (default 5) are protected from both truncation and removal; a protected sibling also prevents removal of its owning call group
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
+
+### Request-scoped retention
+
+The optional `context.request_retention` capability lets an orchestrator name
+the exact persisted reminder bodies required for its next request. The newest
+matching admitted `ephemeral=True, persisted=True` user-role envelope is kept
+complete through compaction, along with the first/latest human prompts.
+Quoting reminder XML in an ordinary human prompt does not change its identity.
+
+This protects delivery in the request view; it does not change message roles,
+pin every historical reminder, or rewrite canonical history. A missing required
+body or an irreducible required set that cannot fit raises `ContextLengthError`
+instead of silently dropping instructions. Failed assembly restores the prior
+compaction state.
+
+Protection takes precedence over the compaction target. A protected tool cohort
+can leave a view above that target; it is not a strict native-token ceiling.
 
 ### Compaction Phases
 
@@ -279,7 +297,18 @@ a corresponding quality regression.
 
 ## Dependencies
 
-- `amplifier-core>=1.0.0`
+- Host-provided `amplifier-core>=1.6.1`, including
+  `amplifier_core.llm_errors.ContextLengthError` for fail-loud request retention.
+  Core remains provided by the host, not installed as a runtime module dependency.
+
+Development and CI pin the released `amplifier-core==1.6.1` package in `uv.lock`.
+A Git `main` source mapping can retain an older commit in the lockfile; the
+release pin ensures tests exercise the Core API required by this module.
+
+```bash
+uv sync --locked --all-extras --dev
+uv run --locked pytest -q
+```
 
 ## Contributing
 
