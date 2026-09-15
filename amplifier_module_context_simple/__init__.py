@@ -51,6 +51,24 @@ from amplifier_core.llm_errors import ContextLengthError
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024
+
+DEFAULT_MAX_TOKENS_FALLBACK = 200_000
+"""Budget used ONLY when the provider reports no usable context window.
+
+Calibrated to the SMALLEST context window across the current generation of
+the three major vendors, because a fallback is a guess and the safe direction
+for a guess is small -- an over-large budget overflows the request, an
+under-large one only compacts earlier:
+
+    Anthropic  claude-opus-5 / sonnet-5 / haiku-4-5   200,000  (base; 1M opt-in)
+    OpenAI     gpt-5.6, gpt-6-astra                   272,000  (default; ~900K opt-in)
+    Google     gemini-3.x                           1,048,576
+
+Reached only by providers that publish neither `get_model_info()` nor
+`get_info().defaults["context_window"]` + `["max_output_tokens"]`. Overridable
+per-session via config `max_tokens_fallback`; the right long-term fix for any
+provider landing here is for THAT provider to publish its window.
+"""
 _TOOL_RESULT_INGRESS_MARKER = (
     "[tool-result truncated at ingress: original_text_utf8_bytes={original_text_utf8_bytes}; "
     "retrieve missing content using narrower read/query parameters; do not repeat "
@@ -118,6 +136,28 @@ def _is_human_message(msg: dict[str, Any]) -> bool:
     )
 
 
+def _validated_max_tokens(raw: Any) -> int | None:
+    """Return a usable `max_tokens` cap, or None for 'no cap'.
+
+    A nonsense cap is refused LOUDLY and treated as absent rather than
+    honored, matching how `compaction_notice_token_reserve` handles a
+    self-defeating value: a cap of 0 or a negative number would drive the
+    budget to <= 0, and `_should_compact`'s `budget > 0` guard would then
+    silently disable compaction entirely -- the opposite of what someone
+    setting a cap is asking for.
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+        logger.warning(
+            f"context-simple: ignoring invalid max_tokens {raw!r} "
+            f"(expected a positive integer, or None for no cap); "
+            f"running uncapped at the model's own window"
+        )
+        return None
+    return raw
+
+
 async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = None):
     """
     Mount the simple context manager.
@@ -125,7 +165,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
     Args:
         coordinator: Module coordinator
         config: Optional configuration
-            - max_tokens: Maximum context size (default: 200,000)
+            - max_tokens: CAP on the effective token budget (default: None =
+              no cap, use everything the model allows). Set this only to use
+              LESS than the model's window. It is applied as
+              `min(model_derived_budget, max_tokens)`, so setting it ABOVE the
+              model's own window has no effect -- the lower of the two wins.
+            - max_tokens_fallback: Budget used only when the provider reports
+              no usable window (default: 200,000). Not a cap; see
+              DEFAULT_MAX_TOKENS_FALLBACK for how the number was chosen.
             - compact_threshold: Trigger compaction at this usage (default: 0.92)
             - target_usage: Compact down to this usage (default: 0.50)
             - protected_recent: Always protect last N% of messages (default: 0.30)
@@ -164,8 +211,13 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         )
         token_meter = TOKEN_METER_ESTIMATE
 
+    max_tokens = _validated_max_tokens(config.get("max_tokens"))
+
     context = SimpleContextManager(
-        max_tokens=config.get("max_tokens", 200_000),
+        max_tokens=max_tokens,
+        max_tokens_fallback=config.get(
+            "max_tokens_fallback", DEFAULT_MAX_TOKENS_FALLBACK
+        ),
         compact_threshold=config.get("compact_threshold", 0.92),
         target_usage=config.get("target_usage", 0.50),
         protected_recent=config.get("protected_recent", 0.30),
@@ -253,7 +305,8 @@ class SimpleContextManager:
 
     def __init__(
         self,
-        max_tokens: int = 200_000,
+        max_tokens: int | None = None,
+        max_tokens_fallback: int = DEFAULT_MAX_TOKENS_FALLBACK,
         compact_threshold: float = 0.92,
         target_usage: float = 0.50,
         protected_recent: float = 0.30,
@@ -272,7 +325,12 @@ class SimpleContextManager:
         Initialize the context manager.
 
         Args:
-            max_tokens: Maximum context size in tokens
+            max_tokens: Cap on the effective token budget, or None for no
+                cap (the default: use the whole window the model allows).
+                Applied as min(model_derived_budget, max_tokens), so a
+                value above the model's own window is a no-op.
+            max_tokens_fallback: Budget used only when the provider reports
+                no usable window. Not a cap.
             compact_threshold: Trigger compaction at this usage ratio (0.0-1.0)
             target_usage: Compact down to this usage ratio (0.0-1.0)
             protected_recent: Always protect last N% of messages (0.0-1.0)
@@ -312,6 +370,16 @@ class SimpleContextManager:
 
         self.messages: list[dict[str, Any]] = []
         self.max_tokens = max_tokens
+        self.max_tokens_fallback = max_tokens_fallback
+        # Last budget handed to a request; used for honest usage logging
+        # before any request has been made (see add_message).
+        self._last_effective_budget: int | None = None
+        # Provenance of the most recent budget calculation, and the last
+        # payload emitted, so `context:budget` fires on CHANGE rather than
+        # once per request (a per-request event would drown the record it
+        # is meant to make readable).
+        self._budget_provenance: dict[str, Any] = {}
+        self._last_emitted_budget: dict[str, Any] | None = None
         self.compact_threshold = compact_threshold
         self.target_usage = target_usage
         self.protected_recent = protected_recent
@@ -514,6 +582,42 @@ class SimpleContextManager:
             event_data["max_tool_result_bytes"],
         )
 
+    async def _emit_budget(self) -> None:
+        """Publish the effective budget where a session record can see it.
+
+        `_derive_budget` logs its result, but a log line is not an artifact:
+        it never reaches the session record and does not survive the process.
+        So "what budget did this session actually run on?" -- the first
+        question anyone asks when compaction fires early or a cap is
+        suspected -- was unanswerable after the fact.
+
+        Emitted on CHANGE, not per request: the value is stable for most of a
+        session, so a per-request event would be noise, while a change is
+        always worth a line (a provider swap, a mid-session cap, a fallback
+        kicking in).
+
+        Emitted at the DELIVERY boundary, not when the budget is calculated. A
+        request that raises or is cancelled rolls back and must leave no
+        observable trace -- an invariant `test_request_retention` pins
+        explicitly -- so this fires only once a view is actually being
+        returned, the same boundary `context:compaction` commits at.
+
+        Observability must never break a request, so a failed emission is
+        logged and swallowed -- the same contract as
+        `_emit_tool_result_ingress_truncation` and `context:compaction`.
+        """
+        payload = dict(self._budget_provenance)
+        if not payload or payload == self._last_emitted_budget:
+            return
+
+        self._last_emitted_budget = payload
+        if self._hooks is None:
+            return
+        try:
+            await self._hooks.emit("context:budget", payload)
+        except Exception as e:
+            logger.warning(f"Could not emit budget event: {e}")
+
     async def add_message(self, message: dict[str, Any]) -> None:
         """Add a message to the context.
 
@@ -554,7 +658,12 @@ class SimpleContextManager:
             await self._emit_tool_result_ingress_truncation(truncation_event)
 
         token_count = self._estimate_tokens(self.messages)
-        usage = token_count / self.max_tokens
+        # Report usage against the budget the last request actually ran on.
+        # Dividing by `max_tokens` (a cap that is usually unset, and never
+        # the governing number when a provider publishes a window) produced
+        # a percentage of nothing meaningful.
+        denominator = self._last_effective_budget or self.max_tokens_fallback
+        usage = token_count / denominator if denominator else 0.0
         logger.debug(
             f"Added message: {message.get('role', 'unknown')} - "
             f"{len(self.messages)} total messages, {token_count:,} tokens "
@@ -731,12 +840,14 @@ class SimpleContextManager:
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
             provider: Optional provider instance for dynamic budget calculation.
-                If provided, budget = context_window - max_output_tokens - safety_margin.
+                If provided, budget = context_window - max_output_tokens - safety_margin,
+                then capped at `max_tokens` when one is configured.
 
         Returns:
             Messages ready for LLM request, compacted if necessary.
         """
         budget = self._calculate_budget(token_budget, provider)
+        self._last_effective_budget = budget
 
         # Reserve token budget for potential compaction notice (if enabled)
         effective_budget = budget
@@ -860,6 +971,7 @@ class SimpleContextManager:
             compacted = sticky_view
         else:
             self._check_retained_budget(working_messages, budget)
+            await self._emit_budget()
             return self._strip_internal_metadata(working_messages)
 
         # Append compaction notice at the TAIL if enabled and level threshold met.
@@ -920,6 +1032,7 @@ class SimpleContextManager:
                 await self._hooks.emit("context:compaction", deferred_hard_fit_stats)
             except Exception as e:
                 logger.warning(f"Could not emit compaction event: {e}")
+        await self._emit_budget()
         return self._strip_internal_metadata(compacted)
 
     # Metadata keys that are internal bookkeeping only and must never cross
@@ -2352,13 +2465,50 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             )
 
     def _calculate_budget(self, token_budget: int | None, provider: Any | None) -> int:
-        """Calculate effective token budget from provider or fallback to config.
+        """Effective token budget: what the model offers, capped by `max_tokens`.
+
+        Two steps, deliberately separate:
+
+        1. DERIVE what is available (:meth:`_derive_budget`) -- the provider's
+           own window, or the fallback when it publishes none.
+        2. CAP it at the configured `max_tokens`, if one is set.
+
+        The cap is applied to EVERY derivation path, with no exceptions, so
+        the rule is one sentence: *the effective budget is the lower of what
+        the model allows and what you asked for.* `min()` can only lower a
+        budget, never raise it, which is why it is safe on every path -- a
+        smaller budget compacts earlier, it can never overflow a request.
+
+        `max_tokens` defaults to None (no cap). Setting it ABOVE the model's
+        own window is a no-op by construction rather than an error.
+        """
+        self._budget_provenance = {"source": "unknown"}
+        derived = self._derive_budget(token_budget, provider)
+
+        budget_capped = self.max_tokens is not None and derived > self.max_tokens
+        if budget_capped:
+            logger.info(
+                f"Budget capped by max_tokens: {derived:,} -> {self.max_tokens:,}"
+            )
+
+        self._budget_provenance = {
+            **self._budget_provenance,
+            "derived_budget": derived,
+            "max_tokens": self.max_tokens,
+            "max_tokens_fallback": self.max_tokens_fallback,
+            "capped": budget_capped,
+            "effective_budget": self.max_tokens if budget_capped else derived,
+        }
+        return self.max_tokens if budget_capped else derived
+
+    def _derive_budget(self, token_budget: int | None, provider: Any | None) -> int:
+        """Budget available BEFORE the `max_tokens` cap is applied.
 
         Priority:
         1. Explicit token_budget parameter (deprecated but supported)
         2. Provider model info (context_window - reserved_output - safety_margin)
         3. Provider defaults (legacy: some providers may put limits here)
-        4. Configured max_tokens fallback
+        4. Configured max_tokens_fallback
 
         Note: We reserve only 50% of max_output_tokens since most responses are
         much smaller than the maximum. This prevents over-conservative budgets
@@ -2367,6 +2517,7 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         # Explicit budget takes precedence (for backward compatibility)
         if token_budget is not None:
             logger.debug(f"Using explicit token_budget: {token_budget}")
+            self._budget_provenance = {"source": "explicit"}
             return token_budget
 
         safety_margin = 4096  # Buffer to avoid hitting hard limits
@@ -2390,6 +2541,12 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                                 f"(context={context_window:,}, reserved_output={reserved_output:,} "
                                 f"[{output_reserve_fraction:.0%} of {max_output:,}])"
                             )
+                            self._budget_provenance = {
+                                "source": "provider_model_info",
+                                "context_window": context_window,
+                                "max_output_tokens": max_output,
+                                "reserved_output": reserved_output,
+                            }
                             return budget
 
                 # Check provider info defaults (legacy approach)
@@ -2406,6 +2563,12 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
                         f"(context={context_window:,}, reserved_output={reserved_output:,} "
                         f"[{output_reserve_fraction:.0%} of {max_output_tokens:,}])"
                     )
+                    self._budget_provenance = {
+                        "source": "provider_defaults",
+                        "context_window": context_window,
+                        "max_output_tokens": max_output_tokens,
+                        "reserved_output": reserved_output,
+                    }
                     return budget
                 else:
                     logger.debug(
@@ -2415,9 +2578,13 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
             except Exception as e:
                 logger.debug(f"Could not get budget from provider: {e}")
 
-        # Fall back to configured max_tokens
-        logger.info(f"Using fallback max_tokens budget: {self.max_tokens:,}")
-        return self.max_tokens
+        # No provider window available anywhere -- use the calibrated fallback.
+        logger.info(
+            f"Provider published no usable window; using max_tokens_fallback: "
+            f"{self.max_tokens_fallback:,}"
+        )
+        self._budget_provenance = {"source": "max_tokens_fallback"}
+        return self.max_tokens_fallback
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Rough token estimation (chars / 4)."""
