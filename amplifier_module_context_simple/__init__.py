@@ -351,6 +351,11 @@ class SimpleContextManager:
         # transient. It is set only by get_messages_for_request_retaining()
         # and restored before that capability returns or raises.
         self._request_hard_fit = False
+        # A retention request rolls back its sticky decisions until its
+        # validated hard-fit compaction event is handed to hooks. This flag is
+        # request-local and is always restored by the retention wrapper.
+        self._request_compaction_delivery_started = False
+        self._request_retention_depth = 0
 
         # --- Sticky compaction decision state ---
         # Compaction decisions (remove / truncate / stub) are keyed by a
@@ -592,10 +597,16 @@ class SimpleContextManager:
         the caller supplies the current delivery requirements on every call.
         `hard_fit=True` is a capability-only request to target the supplied
         effective budget rather than the normal target_usage fraction.
+
+        A cancelled or failed assembly rolls back sticky decisions and
+        accounting until validated hard-fit compaction delivery begins. Starting
+        that delivery commits the view state; it does not imply an LLM/provider
+        request was dispatched.
         """
         previous_contents = self._request_retained_contents
         previous_seqs = self._request_protected_seqs
         previous_hard_fit = self._request_hard_fit
+        previous_delivery_started = self._request_compaction_delivery_started
         decisions = (
             self._removed_seqs.copy(),
             self._truncated_seqs.copy(),
@@ -604,26 +615,40 @@ class SimpleContextManager:
             self._last_compaction_stats,
             self._last_token_meter_stats,
         )
+        self._request_retention_depth += 1
         try:
             self._request_retained_contents = frozenset(retain_contents)
             self._request_hard_fit = hard_fit
+            self._request_compaction_delivery_started = False
             return await self.get_messages_for_request(token_budget, provider)
         except BaseException:
-            # A failed/cancelled assembly must not commit a reduction that was
-            # never delivered. Canonical history is unchanged throughout.
-            (
-                self._removed_seqs,
-                self._truncated_seqs,
-                self._stubbed_seqs,
-                self._sticky_level,
-                self._last_compaction_stats,
-                self._last_token_meter_stats,
-            ) = decisions
+            # A failed/cancelled assembly rolls back state until the validated
+            # hard-fit compaction event starts delivery. Canonical history is
+            # unchanged throughout; beginning delivery is not provider dispatch.
+            if not self._request_compaction_delivery_started:
+                (
+                    self._removed_seqs,
+                    self._truncated_seqs,
+                    self._stubbed_seqs,
+                    self._sticky_level,
+                    self._last_compaction_stats,
+                    self._last_token_meter_stats,
+                ) = decisions
             raise
         finally:
             self._request_retained_contents = previous_contents
             self._request_protected_seqs = previous_seqs
             self._request_hard_fit = previous_hard_fit
+            self._request_retention_depth -= 1
+            if self._request_retention_depth:
+                # A nested call propagates delivery to its outer handler,
+                # which owns the eventual restoration of transient state.
+                self._request_compaction_delivery_started = (
+                    previous_delivery_started
+                    or self._request_compaction_delivery_started
+                )
+            else:
+                self._request_compaction_delivery_started = previous_delivery_started
 
     def _protected_sequences(self, messages: list[dict[str, Any]]) -> set[int]:
         humans = [msg for msg in messages if _is_human_message(msg)]
@@ -888,6 +913,10 @@ class SimpleContextManager:
         self._check_retained_budget(compacted, budget)
         if deferred_hard_fit_stats is not None and self._hooks is not None:
             try:
+                # This is the request-retention commit boundary. It follows all
+                # final, notice-inclusive budget checks but does not mean the
+                # provider request has been dispatched.
+                self._request_compaction_delivery_started = True
                 await self._hooks.emit("context:compaction", deferred_hard_fit_stats)
             except Exception as e:
                 logger.warning(f"Could not emit compaction event: {e}")

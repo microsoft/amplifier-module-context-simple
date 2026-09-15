@@ -1,5 +1,6 @@
 """Required request content must survive actual compaction, not just storage."""
 
+import asyncio
 import copy
 
 import pytest
@@ -215,6 +216,120 @@ async def test_hard_fit_notice_failure_rolls_back_before_emitting_compaction():
     assert context._last_compaction_stats is None
     assert not context._removed_seqs
     assert context._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_pre_delivery_cancellation_rolls_back_compaction_request_state():
+    """Cancellation before delivery leaves neither an event nor sticky state."""
+    emitted: list[tuple[str, dict]] = []
+    compaction_suspended = asyncio.Event()
+    release_compaction = asyncio.Event()
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+
+    context, body = await pressured_context()
+    context._hooks = Hooks()
+    canonical = copy.deepcopy(await context.get_messages())
+    previous_state = (
+        context._removed_seqs.copy(),
+        context._truncated_seqs.copy(),
+        context._stubbed_seqs.copy(),
+        context._sticky_level,
+        context._last_compaction_stats,
+        context._last_token_meter_stats,
+    )
+    original_compact = context._compact_ephemeral
+
+    async def suspend_after_compaction(*args):
+        compacted = await original_compact(*args)
+        compaction_suspended.set()
+        await release_compaction.wait()
+        return compacted
+
+    context._compact_ephemeral = suspend_after_compaction
+    task = asyncio.create_task(
+        context.get_messages_for_request_retaining(
+            retain_contents=[body], token_budget=1500, hard_fit=True
+        )
+    )
+    try:
+        await asyncio.wait_for(compaction_suspended.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_compaction.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert not emitted
+    assert (
+        context._removed_seqs,
+        context._truncated_seqs,
+        context._stubbed_seqs,
+        context._sticky_level,
+        context._last_compaction_stats,
+        context._last_token_meter_stats,
+    ) == previous_state
+    assert context._request_retained_contents == frozenset()
+    assert context._request_protected_seqs == set()
+    assert context._request_hard_fit is False
+    assert context._request_compaction_delivery_started is False
+    assert await context.get_messages() == canonical
+
+
+@pytest.mark.asyncio
+async def test_delivery_boundary_cancellation_commits_compaction_state():
+    """Cancellation after event delivery begins keeps the validated hard fit."""
+    emitted: list[tuple[str, dict]] = []
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+            delivery_started.set()
+            await release_delivery.wait()
+
+    context, body = await pressured_context()
+    context._hooks = Hooks()
+    canonical = copy.deepcopy(await context.get_messages())
+    task = asyncio.create_task(
+        context.get_messages_for_request_retaining(
+            retain_contents=[body], token_budget=1500, hard_fit=True
+        )
+    )
+    try:
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_delivery.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert [event for event, _ in emitted] == ["context:compaction"]
+    assert context._last_compaction_stats is not None
+    assert context._last_token_meter_stats is not None
+    assert context._removed_seqs or context._truncated_seqs or context._stubbed_seqs
+    assert context._sticky_level > 0
+    assert context._request_retained_contents == frozenset()
+    assert context._request_protected_seqs == set()
+    assert context._request_hard_fit is False
+    assert context._request_compaction_delivery_started is False
+    assert await context.get_messages() == canonical
+
+    ordinary = await context.get_messages_for_request()
+    assert ordinary == await context.get_messages_for_request()
+    assert len(ordinary) < len(canonical)
+    assert [event for event, _ in emitted] == ["context:compaction"]
 
 
 @pytest.mark.asyncio
