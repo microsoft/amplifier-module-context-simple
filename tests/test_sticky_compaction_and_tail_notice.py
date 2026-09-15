@@ -826,6 +826,45 @@ async def test_notice_returns_once_tool_results_arrive():
         "Notice must not sit directly after an unanswered tool_calls message"
     )
 
+    # A repeated ordinary fetch must rebuild exactly one stable tail notice,
+    # rather than retaining the prior ephemeral notice and duplicating it.
+    repeated_view = await context.get_messages_for_request()
+    assert repeated_view == resumed_view
+    assert len(_notices(repeated_view)) == 1
+
+
+@pytest.mark.asyncio
+async def test_notice_waits_for_all_results_of_a_multi_call_group():
+    """A partial multi-result group is still an unsafe tail for a notice."""
+    context = _make_context()
+    await _fill_until_compacted(context)
+    await context.get_messages_for_request()
+
+    await context.add_message({"role": "user", "content": "run both tools"})
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "call_one", "type": "function", "function": {"name": "one"}},
+                {"id": "call_two", "type": "function", "function": {"name": "two"}},
+            ],
+        }
+    )
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "call_one", "content": "first result"}
+    )
+
+    partial_view = await context.get_messages_for_request()
+    assert not _notices(partial_view)
+
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "call_two", "content": "second result"}
+    )
+    complete_view = await context.get_messages_for_request()
+    assert len(_notices(complete_view)) == 1
+    assert complete_view[-1] is _notices(complete_view)[0]
+
 
 # ---------------------------------------------------------------------------
 # (e) `_seq` is internal bookkeeping and must not cross the module boundary

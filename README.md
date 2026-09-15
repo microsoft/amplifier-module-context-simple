@@ -122,6 +122,14 @@ compaction state.
 Protection takes precedence over the compaction target. A protected tool cohort
 can leave a view above that target; it is not a strict native-token ceiling.
 
+After a compaction decision, every later provider-facing request reuses the
+same reduced view before it is measured; canonical history remains complete.
+The capability also accepts `hard_fit=True` for a provider-directed forced
+rebuild: it targets the supplied effective request budget rather than applying
+`target_usage` again. This is an additive capability keyword for orchestrators,
+not a user configuration setting; ordinary `token_budget` calls keep their
+existing `target_usage` semantics.
+
 ### Compaction Phases
 
 1. **Phase 1 - Tool Result Truncation**: Older tool results are truncated to reduce token usage

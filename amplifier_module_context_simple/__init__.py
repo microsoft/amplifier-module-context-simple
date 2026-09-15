@@ -347,6 +347,10 @@ class SimpleContextManager:
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
         self._request_retained_contents: frozenset[str] = frozenset()
         self._request_protected_seqs: set[int] = set()
+        # Request-retention's optional provider-directed fit is deliberately
+        # transient. It is set only by get_messages_for_request_retaining()
+        # and restored before that capability returns or raises.
+        self._request_hard_fit = False
 
         # --- Sticky compaction decision state ---
         # Compaction decisions (remove / truncate / stub) are keyed by a
@@ -578,6 +582,7 @@ class SimpleContextManager:
         retain_contents: list[str],
         provider: Any | None = None,
         token_budget: int | None = None,
+        hard_fit: bool = False,
     ) -> list[dict[str, Any]]:
         """Optional capability: retain current persisted injections for one view.
 
@@ -585,9 +590,12 @@ class SimpleContextManager:
         ephemeral=True and persisted=True. Only the newest matching copy is
         protected. This neither admits messages nor changes their lifetime;
         the caller supplies the current delivery requirements on every call.
+        `hard_fit=True` is a capability-only request to target the supplied
+        effective budget rather than the normal target_usage fraction.
         """
         previous_contents = self._request_retained_contents
         previous_seqs = self._request_protected_seqs
+        previous_hard_fit = self._request_hard_fit
         decisions = (
             self._removed_seqs.copy(),
             self._truncated_seqs.copy(),
@@ -598,6 +606,7 @@ class SimpleContextManager:
         )
         try:
             self._request_retained_contents = frozenset(retain_contents)
+            self._request_hard_fit = hard_fit
             return await self.get_messages_for_request(token_budget, provider)
         except BaseException:
             # A failed/cancelled assembly must not commit a reduction that was
@@ -614,6 +623,7 @@ class SimpleContextManager:
         finally:
             self._request_retained_contents = previous_contents
             self._request_protected_seqs = previous_seqs
+            self._request_hard_fit = previous_hard_fit
 
     def _protected_sequences(self, messages: list[dict[str, Any]]) -> set[int]:
         humans = [msg for msg in messages if _is_human_message(msg)]
@@ -641,12 +651,39 @@ class SimpleContextManager:
     def _check_retained_budget(
         self, messages: list[dict[str, Any]], budget: int
     ) -> None:
-        if self._request_retained_contents and self._estimate_tokens(messages) > budget:
+        if (
+            (self._request_retained_contents or self._request_hard_fit)
+            and self._estimate_tokens(messages) > budget
+        ):
             raise ContextLengthError(
                 "Context cannot fit the current injections and protected conversation "
                 "within the estimated input budget; shorten the active instructions "
                 "or use a larger context window. Required content was not discarded."
             )
+
+    @staticmethod
+    def _tail_has_unanswered_tool_calls(messages: list[dict[str, Any]]) -> bool:
+        """Return whether the trailing tool-call group is incomplete.
+
+        A tail can end on the assistant tool-call message itself or on one of
+        several sibling tool results. A notice is safe only after every call
+        declared by that final assistant message has a result.
+        """
+        trailing_result_ids: set[str] = set()
+        for message in reversed(messages):
+            if message.get("role") == "tool":
+                tool_call_id = message.get("tool_call_id")
+                if tool_call_id:
+                    trailing_result_ids.add(tool_call_id)
+                continue
+            if message.get("role") != "assistant" or not message.get("tool_calls"):
+                return False
+            declared_ids = {
+                tool_call.get("id") or tool_call.get("tool_call_id")
+                for tool_call in message["tool_calls"]
+            }
+            return bool(declared_ids - trailing_result_ids)
+        return False
 
     async def get_messages_for_request(
         self,
@@ -663,9 +700,8 @@ class SimpleContextManager:
         Applies EPHEMERAL compaction if needed - returns a NEW list without
         modifying self.messages. The original history is always preserved.
 
-        If compaction occurs and notice is enabled, a system-reminder is inserted
-        at position 1 (after main system message) to inform the LLM about what
-        was compacted.
+        If compaction occurs and notice is enabled, a tail system-reminder
+        informs the LLM about what was compacted without changing its prefix.
 
         Args:
             token_budget: Optional explicit token limit (deprecated, prefer provider).
@@ -734,8 +770,22 @@ class SimpleContextManager:
             effective_budget,
         )
 
+        # Materialize every recorded sticky decision before measuring or deciding
+        # whether more compaction is needed. Canonical history stays untouched:
+        # only this request view receives the old removal/truncation/stubbing
+        # transforms. New messages have no decision and remain visible.
+        system_messages = [
+            dict(msg) for msg in working_messages if msg.get("role") == "system"
+        ]
+        sticky_view = system_messages + self._apply_sticky_decisions(
+            [msg for msg in working_messages if msg.get("role") != "system"]
+        )
+        has_sticky_decisions = bool(
+            self._removed_seqs or self._truncated_seqs or self._stubbed_seqs
+        )
+
         token_count, meter_source, estimated_tokens = self._measure_working_tokens(
-            working_messages
+            sticky_view
         )
         self._last_token_meter_stats = {
             "mode": self.token_meter,
@@ -747,12 +797,24 @@ class SimpleContextManager:
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
 
-        # Check if compaction needed (using effective budget with notice reserve deducted)
+        # Check whether this request needs a new compaction escalation. A
+        # provider-directed hard fit applies at the full forced budget, not at
+        # the ordinary compact_threshold or target_usage fraction of it.
         retained_view_over_budget = (
             bool(self._request_retained_contents)
             and estimated_tokens > effective_budget
         )
-        if self._should_compact(token_count, effective_budget) or retained_view_over_budget:
+        hard_fit_view_over_budget = (
+            self._request_hard_fit and estimated_tokens > effective_budget
+        )
+        should_compact = (
+            self._should_compact(token_count, effective_budget)
+            or retained_view_over_budget
+            or hard_fit_view_over_budget
+        )
+        previous_compaction_stats = self._last_compaction_stats
+        deferred_hard_fit_stats: dict[str, Any] | None = None
+        if should_compact:
             # Compact EPHEMERALLY - returns new list, working_messages unchanged
             compacted = await self._compact_ephemeral(
                 effective_budget, working_messages
@@ -760,91 +822,76 @@ class SimpleContextManager:
             logger.info(
                 f"Ephemeral compaction: {len(working_messages)} -> {len(compacted)} messages for this request"
             )
+            if (
+                self._request_hard_fit
+                and self._last_compaction_stats is not previous_compaction_stats
+            ):
+                deferred_hard_fit_stats = self._last_compaction_stats
 
-            # Append compaction notice at the TAIL if enabled and level threshold met.
+        elif has_sticky_decisions:
+            # Sticky decisions are sender-view state, not only an input to a
+            # future escalation. Return that stable reduced view even below the
+            # ordinary threshold (including inactive/direct fetches).
+            compacted = sticky_view
+        else:
+            self._check_retained_budget(working_messages, budget)
+            return self._strip_internal_metadata(working_messages)
+
+        # Append compaction notice at the TAIL if enabled and level threshold met.
+        # CRITICAL (prompt cache stability): this notice must never be inserted
+        # into the prefix. Two things make the tail the only safe placement:
             #
-            # CRITICAL (prompt cache stability): this notice must never be inserted
-            # into the prefix. Two things make the tail the only safe placement:
-            #
-            # 1. role: previously this was "system", which -- for the Anthropic
-            #    provider -- gets extracted OUT of the conversation entirely and
-            #    merged into the single top-level system content block (see
-            #    provider-anthropic's `_complete_chat_request`: `system_msgs = [m
-            #    for m in request.messages if m.role == "system"]`, combined by
-            #    `_format_system_with_cache`). That means a "system"-role notice
-            #    inserted anywhere -- even at the tail -- would change the system
-            #    block's text on every compaction, busting the SYSTEM cache
-            #    breakpoint too, not just the conversation-region one. Using
-            #    "user" keeps this message in the conversation region, where the
-            #    provider's ephemeral-exclusion logic can see and skip it.
-            # 2. metadata.ephemeral=True + tail position: the Anthropic provider's
-            #    `_count_trailing_ephemeral_messages` walks backward from the end
-            #    of the conversation and excludes trailing messages carrying
-            #    `metadata.ephemeral=True` from cache-breakpoint placement. A
-            #    "system"-role message is excluded from that walk entirely (it
-            #    never reaches the conversation list), and content anywhere
-            #    other than the tail is not "trailing" and would still corrupt
-            #    the cached prefix. Tail + ephemeral=True + role != "system" is
-            #    the only combination the existing provider fix recognizes.
-            #
-            # The notice content itself only changes when a NEW compaction
-            # escalation actually occurs (see _compact_ephemeral's sticky decision
-            # state) -- so on calls between escalations, this tail addition is
-            # byte-identical, and everything before it (the real prefix) is
-            # completely undisturbed either way.
-            if self.compaction_notice_enabled and self._last_compaction_stats:
-                level = self._last_compaction_stats.get("strategy_level", 0)
-                # GUARD: never append into an unanswered tool_calls turn.
-                #
-                # Appending at the tail is what makes the notice cache-safe
-                # (above), but the tail is not always a safe place to stand: if
-                # the view ends with an assistant message carrying tool_calls,
-                # its tool results have not been added yet, and a user-role
-                # notice would land BETWEEN the tool call and its results.
-                # Providers reject or mishandle that interleaving -- the same
-                # tool_use/tool_result atomicity the compaction levels work hard
-                # to preserve. (This is new exposure from the move to the tail;
-                # the old index-1 insert could never land here.)
-                #
-                # Skip rather than reposition: placing it before the assistant
-                # message would put it back INSIDE the prefix, re-introducing
-                # exactly the cache-busting this fix exists to prevent. Skipping
-                # costs nothing -- the notice is derived from sticky stats that
-                # persist, so it reappears on the very next request once the
-                # tool results have arrived and the tail is a safe place again.
-                if compacted and compacted[-1].get("tool_calls"):
-                    logger.debug(
-                        "Skipping compaction notice this request: view ends with "
-                        "an assistant message with unanswered tool_calls; the "
-                        "notice would interleave between tool_use and tool_result. "
-                        "It will be appended on the next request instead."
+        # 1. role: previously this was "system", which -- for the Anthropic
+        #    provider -- gets extracted OUT of the conversation entirely and
+        #    merged into the single top-level system content block. Using "user"
+        #    keeps it in the conversation region, where ephemeral exclusion can
+        #    recognize it.
+        # 2. metadata.ephemeral=True + tail position: the provider's trailing
+        #    ephemeral walk-back can exclude it without corrupting the cached
+        #    prefix.
+        #
+        # The notice comes from cumulative sticky stats, so a stable view gets
+        # exactly one byte-identical notice on every safe request.
+        if self.compaction_notice_enabled and self._last_compaction_stats:
+            level = self._last_compaction_stats.get("strategy_level", 0)
+            # Do not interleave a user-role notice between an unanswered
+            # assistant tool call and its result. Sticky stats persist, so it
+            # safely reappears once the result reaches the history.
+            if self._tail_has_unanswered_tool_calls(compacted):
+                logger.debug(
+                    "Skipping compaction notice this request: the trailing "
+                    "tool-call group has unanswered calls; the notice would "
+                    "interleave between tool_use and tool_result. It will be "
+                    "appended on the next request instead."
+                )
+            elif level >= self.compaction_notice_min_level:
+                notice = self._format_compaction_notice()
+                if notice:
+                    compacted.append(
+                        {
+                            "role": "user",
+                            "content": notice,
+                            "metadata": {
+                                "source": "context-compaction",
+                                "ephemeral": True,
+                            },
+                        }
                     )
-                elif level >= self.compaction_notice_min_level:
-                    notice = self._format_compaction_notice()
-                    if notice:
-                        compacted.append(
-                            {
-                                "role": "user",
-                                "content": notice,
-                                "metadata": {
-                                    "source": "context-compaction",
-                                    "ephemeral": True,
-                                },
-                            }
-                        )
-                        logger.debug(
-                            f"Appended compaction notice at tail (level {level}, "
-                            f"verbosity: {self.compaction_notice_verbosity})"
-                        )
+                    logger.debug(
+                        f"Appended compaction notice at tail (level {level}, "
+                        f"verbosity: {self.compaction_notice_verbosity})"
+                    )
 
-            # Strip internal bookkeeping at the module boundary -- everything
-            # above this point (sticky decisions, token accounting) still runs
-            # on messages carrying `_seq`; only what leaves has it removed.
-            self._check_retained_budget(compacted, budget)
-            return self._strip_internal_metadata(compacted)
-
-        self._check_retained_budget(working_messages, budget)
-        return self._strip_internal_metadata(working_messages)
+        # Strip internal bookkeeping at the module boundary -- everything above
+        # this point (sticky decisions, token accounting) still runs on messages
+        # carrying `_seq`; only what leaves has it removed.
+        self._check_retained_budget(compacted, budget)
+        if deferred_hard_fit_stats is not None and self._hooks is not None:
+            try:
+                await self._hooks.emit("context:compaction", deferred_hard_fit_stats)
+            except Exception as e:
+                logger.warning(f"Could not emit compaction event: {e}")
+        return self._strip_internal_metadata(compacted)
 
     # Metadata keys that are internal bookkeeping only and must never cross
     # the module boundary into a provider-facing view. `_seq` is sticky
@@ -1196,7 +1243,7 @@ class SimpleContextManager:
             source_messages if source_messages is not None else self.messages
         )
         self._request_protected_seqs = self._protected_sequences(messages_to_compact)
-        target_tokens = int(budget * self.target_usage)
+        target_tokens = budget if self._request_hard_fit else int(budget * self.target_usage)
         old_count = len(messages_to_compact)
         old_tokens = self._estimate_tokens(messages_to_compact)
 
@@ -1293,7 +1340,9 @@ class SimpleContextManager:
         # enough) -- this module fires the escalation honestly, but the
         # sizing of that escalation is only as good as the estimator was
         # before this meter existed.
-        needs_escalation = self._exceeds_threshold(current_tokens, budget)
+        needs_escalation = self._exceeds_threshold(current_tokens, budget) or (
+            self._request_hard_fit and current_tokens > budget
+        )
         if not needs_escalation:
             # Sticky state alone already keeps us under the threshold that
             # triggered compaction in the first place -- nothing NEW needs
@@ -1997,7 +2046,13 @@ class SimpleContextManager:
         for tc in assistant_msg.get("tool_calls", []):
             tc_id = tc.get("id") or tc.get("tool_call_id")
             if tc_id:
-                for k in tool_call_id_to_indices.get(tc_id, []):
+                result_indices = tool_call_id_to_indices.get(tc_id, [])
+                # An unanswered call must remain until its result arrives.
+                # Removing it now would make a subsequently admitted result
+                # orphaned in the provider-facing view.
+                if not result_indices:
+                    all_removable = False
+                for k in result_indices:
                     if k in protected_indices:
                         all_removable = False
                     else:
@@ -2083,6 +2138,16 @@ class SimpleContextManager:
                 f"{cause}."
             )
 
+        # A provider-directed hard fit must fail before committing observable
+        # compaction state. The request-retention wrapper then restores its
+        # local decisions, and hook consumers never see a phantom compaction.
+        if self._request_hard_fit and final_tokens > budget:
+            raise ContextLengthError(
+                "Context cannot fit the current injections and protected conversation "
+                "within the estimated input budget; shorten the active instructions "
+                "or use a larger context window. Required content was not discarded."
+            )
+
         # Cumulative high-water mark across ALL escalations ever, not just
         # this one -- monotonic, never goes backward. This is what feeds the
         # compaction notice, so its content only changes when a genuinely
@@ -2113,8 +2178,9 @@ class SimpleContextManager:
         }
         self._last_compaction_stats = stats
 
-        # Emit event if hooks available
-        if self._hooks is not None:
+        # A hard fit delays emission until its tail notice is added and the
+        # complete provider-facing view passes its final budget check.
+        if self._hooks is not None and not self._request_hard_fit:
             try:
                 await self._hooks.emit("context:compaction", stats)
             except Exception as e:
