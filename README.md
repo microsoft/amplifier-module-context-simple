@@ -43,8 +43,13 @@ module = "context-simple"
 name = "simple"
 
 [contexts.config]
+max_tokens = 500000             # Optional CAP; default None = use the model's full window
+max_tokens_fallback = 200000    # Only used when the provider publishes no window
 max_tool_result_bytes = 131072  # Optional override; default is 128 KiB
 ```
+
+`max_tokens` is the knob to reach for when you want to use **less** context
+than the model allows -- see [`max_tokens` is a cap](#max_tokens-is-a-cap).
 
 ### Tool-result text ingress cap
 
@@ -94,7 +99,7 @@ The SimpleContextManager uses **ephemeral compaction** -
 admitted internal message history. Ingress-clipped tool text is irreversible
 and is not retained in the canonical transcript; compaction remains view-only.
 
-Compaction triggers when token usage reaches the configured threshold (default: 92% of the **effective budget** -- which is derived from the provider, *not* from `max_tokens`; see [Where the compaction trigger comes from](#where-the-compaction-trigger-comes-from)):
+Compaction triggers when token usage reaches the configured threshold (default: 92% of the **effective budget** -- the provider's own window, capped by `max_tokens` if you set one; see [Where the compaction trigger comes from](#where-the-compaction-trigger-comes-from)):
 
 ### Protected Messages (Never Removed)
 
@@ -156,36 +161,83 @@ The trigger is one multiplication:
 trigger = compact_threshold * effective_budget
 ```
 
-`effective_budget` comes from `_calculate_budget()`, in this priority order:
+`effective_budget` is computed in two steps.
 
-1. an explicit `token_budget=` argument (deprecated, rarely used);
+**Step 1 -- derive what the model offers** (`_derive_budget()`), in priority order:
+
+1. an explicit `token_budget=` argument (the provider's own overflow-shrink retry);
 2. `provider.get_model_info()` -> `context_window - 0.5 * max_output_tokens - 4096`;
 3. `provider.get_info().defaults` -> the same formula;
-4. **only if none of the above yields a window**: the configured `max_tokens`.
+4. **only if none of the above yields a window**: `max_tokens_fallback`.
 
-### `max_tokens` is a fallback, not a cap
+**Step 2 -- cap it** at `max_tokens`, if one is configured:
 
-Orchestrators call `get_messages_for_request(provider=provider)`, so in
-practice branch 2 or 3 always answers and **branch 4 is never reached**.
-The `max_tokens` value in your bundle config (the shipped foundation bundle
-sets `max_tokens: 300000`) therefore has **no effect on when compaction
-fires**. Lowering it to compact sooner, or raising it to compact later, is a
-no-op on the wire.
+```
+effective_budget = min(derived_budget, max_tokens)
+```
 
-This is a real trap, not a theoretical one. The cadence probe that produced
-the numbers below could not move the trigger with config at all: its harness
+### `max_tokens` is a cap
+
+`max_tokens` defaults to **`None`**, meaning *no cap* -- use the whole window
+the model allows. Set it only when you want to use **less** than the model
+offers:
+
+```yaml
+context:
+  module: context-simple
+  config:
+    max_tokens: 500000    # compact as if the window were 500k
+```
+
+The lower of the two always wins, so setting `max_tokens` **above** the
+model's own window is a no-op by construction, not an error. The cap applies
+on every derivation path with no exceptions -- `min()` can only lower a
+budget, never raise it, so a cap can make compaction fire earlier but can
+never overflow a request.
+
+### `max_tokens_fallback` is the other half
+
+`max_tokens_fallback` (default **200,000**) answers only when a provider
+publishes no usable window at all -- it is a floor under a missing number, not
+a cap. 200,000 is the smallest context window across the current generation of
+the three major vendors (Anthropic 200K base, OpenAI 272K default, Google
+~1M), chosen small because a guess that is too large overflows a request while
+one that is too small merely compacts early.
+
+A provider landing on this branch is a bug in **that provider** -- the durable
+fix is for it to publish its window, not to tune this number. Both keys are
+overridable per session:
+
+```yaml
+# ~/.amplifier/settings.yaml
+overrides:
+  context-simple:
+    config:
+      max_tokens_fallback: 400000
+```
+
+### History: this knob used to be dead
+
+Before the cap existed, `max_tokens` was consulted **only** at step 1.4 --
+as a fallback. Orchestrators always call
+`get_messages_for_request(provider=provider)`, so branch 2 or 3 always
+answered and branch 4 was never reached: the `max_tokens` in your bundle
+config had **no effect on when compaction fired**, in either direction.
+
+That was a real trap, not a theoretical one. The cadence probe that produced
+the numbers below could not move the trigger with config at all -- its harness
 had to patch this module's source in-container to add
-`budget = min(budget, self.max_tokens)` before either of its arms would
-compact in a bounded run.
+`budget = min(budget, self.max_tokens)`, which is precisely the behavior this
+module now ships as a supported option.
 
-`tests/test_compaction_trigger_provenance.py` pins this behavior in both
-directions -- same history and same config compacts with no provider and does
-*not* compact with one -- so the trap fails a test rather than a measurement
-run.
+`tests/test_compaction_trigger_provenance.py` pins the current contract in
+both directions: a cap below the provider window moves the trigger, an unset
+cap leaves the provider budget untouched, and a cap above the window is a
+no-op.
 
-**To move the trigger, move `compact_threshold`.** It is the only shipped knob
-that expresses "compact later" independently of the provider, and the old
-value stays reachable:
+**To move the trigger as a *fraction*, move `compact_threshold`.** It
+expresses "compact later" independently of the provider, where `max_tokens`
+expresses it as an absolute ceiling:
 
 ```yaml
 context:
