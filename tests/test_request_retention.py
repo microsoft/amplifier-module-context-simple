@@ -329,7 +329,14 @@ async def test_delivery_boundary_cancellation_commits_compaction_state():
     ordinary = await context.get_messages_for_request()
     assert ordinary == await context.get_messages_for_request()
     assert len(ordinary) < len(canonical)
-    assert [event for event, _ in emitted] == ["context:compaction"]
+    # The cancelled delivery emitted no further compaction event. `context:budget`
+    # appears exactly once here, from the first ordinary request that reached the
+    # delivery boundary -- it fires on CHANGE, so the identical second request
+    # adds nothing.
+    assert [event for event, _ in emitted] == [
+        "context:compaction",
+        "context:budget",
+    ]
 
 
 @pytest.mark.asyncio

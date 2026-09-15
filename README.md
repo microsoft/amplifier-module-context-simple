@@ -216,6 +216,28 @@ overrides:
       max_tokens_fallback: 400000
 ```
 
+### Seeing the budget a session actually ran on
+
+`context-simple` emits a `context:budget` event carrying the effective budget
+and where it came from:
+
+```json
+{"source": "provider_defaults", "context_window": 1048576,
+ "max_output_tokens": 65536, "reserved_output": 32768,
+ "derived_budget": 1011712, "max_tokens": 500000,
+ "max_tokens_fallback": 200000, "capped": true, "effective_budget": 500000}
+```
+
+`source` is one of `provider_model_info`, `provider_defaults`,
+`max_tokens_fallback` or `explicit`, and `capped` says whether `max_tokens`
+bit. The module also logs the same number, but a log line is not an artifact --
+it never reaches the session record, which made "what budget did this session
+run on?" unanswerable after the fact.
+
+It fires at the delivery boundary, so a cancelled or failed request leaves no
+trace, and only when the value CHANGES, so a long session carries a readable
+handful of lines rather than one per request.
+
 ### History: this knob used to be dead
 
 Before the cap existed, `max_tokens` was consulted **only** at step 1.4 --
