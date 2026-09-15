@@ -116,11 +116,26 @@ Quoting reminder XML in an ordinary human prompt does not change its identity.
 This protects delivery in the request view; it does not change message roles,
 pin every historical reminder, or rewrite canonical history. A missing required
 body or an irreducible required set that cannot fit raises `ContextLengthError`
-instead of silently dropping instructions. Failed assembly restores the prior
-compaction state.
+instead of silently dropping instructions. Failed assembly before compaction
+event delivery restores the prior compaction state.
 
 Protection takes precedence over the compaction target. A protected tool cohort
 can leave a view above that target; it is not a strict native-token ceiling.
+
+After a compaction decision, every later provider-facing request reuses the
+same reduced view before it is measured; canonical history remains complete.
+The capability also accepts `hard_fit=True` for a provider-directed forced
+rebuild: it targets the supplied effective request budget rather than applying
+`target_usage` again. This is an additive capability keyword for orchestrators,
+not a user configuration setting; ordinary `token_budget` calls keep their
+existing `target_usage` semantics.
+
+For a hard-fit request, sticky compaction decisions and their accounting roll
+back if assembly fails or is cancelled before the final, notice-inclusive view
+starts `context:compaction` event delivery. Once delivery starts, that validated
+compaction is retained even if the caller is cancelled. The event marks this
+compaction commit boundary only; it does **not** imply that a provider request
+was dispatched.
 
 ### Compaction Phases
 

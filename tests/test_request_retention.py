@@ -1,5 +1,6 @@
 """Required request content must survive actual compaction, not just storage."""
 
+import asyncio
 import copy
 
 import pytest
@@ -144,7 +145,15 @@ async def test_impossible_retention_fails_before_returning_an_overfull_view():
 
 @pytest.mark.asyncio
 async def test_post_compaction_failure_rolls_back_request_state_and_decisions():
-    context = SimpleContextManager(max_tokens=1000, compaction_notice_enabled=False)
+    emitted: list[tuple[str, dict]] = []
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+
+    context = SimpleContextManager(
+        max_tokens=1000, compaction_notice_enabled=False, hooks=Hooks()
+    )
     required = "<system-reminders>Active retention requirement.</system-reminders>"
     await context.add_message(human("First human request."))
     await context.add_message(reminder(required))
@@ -158,7 +167,9 @@ async def test_post_compaction_failure_rolls_back_request_state_and_decisions():
     await context.add_message(human("Latest human correction."))
 
     with pytest.raises(ContextLengthError, match="Required content was not discarded"):
-        await context.get_messages_for_request_retaining(retain_contents=[required])
+        await context.get_messages_for_request_retaining(
+            retain_contents=[required], hard_fit=True
+        )
 
     assert context._last_compaction_stats is None
     assert context._last_token_meter_stats is None
@@ -166,6 +177,335 @@ async def test_post_compaction_failure_rolls_back_request_state_and_decisions():
     assert not context._truncated_seqs
     assert not context._stubbed_seqs
     assert context._sticky_level == 0
+    assert context._request_hard_fit is False
+    assert not emitted
+
+
+@pytest.mark.asyncio
+async def test_hard_fit_notice_failure_rolls_back_before_emitting_compaction():
+    """A rejected final view must not publish a compaction that was rolled back."""
+    emitted: list[tuple[str, dict]] = []
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+
+    context = SimpleContextManager(
+        max_tokens=1000,
+        compact_threshold=0.5,
+        target_usage=0.5,
+        protected_recent=0.2,
+        compaction_notice_enabled=True,
+        compaction_notice_token_reserve=1,
+        hooks=Hooks(),
+    )
+    await context.add_message(human("Original human request."))
+    for i in range(20):
+        await context.add_message(
+            {"role": "assistant", "content": f"Historical bulk {i}: " + "x" * 300}
+        )
+    await context.add_message(human("Latest human correction."))
+    context._format_compaction_notice = lambda: "notice " * 1000
+
+    with pytest.raises(ContextLengthError, match="Required content was not discarded"):
+        await context.get_messages_for_request_retaining(
+            retain_contents=[], token_budget=1000, hard_fit=True
+        )
+
+    assert not emitted
+    assert context._last_compaction_stats is None
+    assert not context._removed_seqs
+    assert context._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_pre_delivery_cancellation_rolls_back_compaction_request_state():
+    """Cancellation before delivery leaves neither an event nor sticky state."""
+    emitted: list[tuple[str, dict]] = []
+    compaction_suspended = asyncio.Event()
+    release_compaction = asyncio.Event()
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+
+    context, body = await pressured_context()
+    context._hooks = Hooks()
+    canonical = copy.deepcopy(await context.get_messages())
+    previous_state = (
+        context._removed_seqs.copy(),
+        context._truncated_seqs.copy(),
+        context._stubbed_seqs.copy(),
+        context._sticky_level,
+        context._last_compaction_stats,
+        context._last_token_meter_stats,
+    )
+    original_compact = context._compact_ephemeral
+
+    async def suspend_after_compaction(*args):
+        compacted = await original_compact(*args)
+        compaction_suspended.set()
+        await release_compaction.wait()
+        return compacted
+
+    context._compact_ephemeral = suspend_after_compaction
+    task = asyncio.create_task(
+        context.get_messages_for_request_retaining(
+            retain_contents=[body], token_budget=1500, hard_fit=True
+        )
+    )
+    try:
+        await asyncio.wait_for(compaction_suspended.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_compaction.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert not emitted
+    assert (
+        context._removed_seqs,
+        context._truncated_seqs,
+        context._stubbed_seqs,
+        context._sticky_level,
+        context._last_compaction_stats,
+        context._last_token_meter_stats,
+    ) == previous_state
+    assert context._request_retained_contents == frozenset()
+    assert context._request_protected_seqs == set()
+    assert context._request_hard_fit is False
+    assert context._request_compaction_delivery_started is False
+    assert await context.get_messages() == canonical
+
+
+@pytest.mark.asyncio
+async def test_delivery_boundary_cancellation_commits_compaction_state():
+    """Cancellation after event delivery begins keeps the validated hard fit."""
+    emitted: list[tuple[str, dict]] = []
+    delivery_started = asyncio.Event()
+    release_delivery = asyncio.Event()
+
+    class Hooks:
+        async def emit(self, event: str, data: dict) -> None:
+            emitted.append((event, data))
+            delivery_started.set()
+            await release_delivery.wait()
+
+    context, body = await pressured_context()
+    context._hooks = Hooks()
+    canonical = copy.deepcopy(await context.get_messages())
+    task = asyncio.create_task(
+        context.get_messages_for_request_retaining(
+            retain_contents=[body], token_budget=1500, hard_fit=True
+        )
+    )
+    try:
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release_delivery.set()
+        if not task.done():
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    assert [event for event, _ in emitted] == ["context:compaction"]
+    assert context._last_compaction_stats is not None
+    assert context._last_token_meter_stats is not None
+    assert context._removed_seqs or context._truncated_seqs or context._stubbed_seqs
+    assert context._sticky_level > 0
+    assert context._request_retained_contents == frozenset()
+    assert context._request_protected_seqs == set()
+    assert context._request_hard_fit is False
+    assert context._request_compaction_delivery_started is False
+    assert await context.get_messages() == canonical
+
+    ordinary = await context.get_messages_for_request()
+    assert ordinary == await context.get_messages_for_request()
+    assert len(ordinary) < len(canonical)
+    assert [event for event, _ in emitted] == ["context:compaction"]
+
+
+@pytest.mark.asyncio
+async def test_hard_fit_targets_forced_budget_and_stable_view_survives_inactive_fetches():
+    """A provider-forced fit is full-budget, while ordinary explicit budgets are not."""
+    hard, body = await pressured_context()
+    canonical = copy.deepcopy(await hard.get_messages())
+
+    forced = await hard.get_messages_for_request_retaining(
+        retain_contents=[body],
+        token_budget=1500,
+        hard_fit=True,
+    )
+    assert hard._last_compaction_stats is not None
+    assert hard._last_compaction_stats["target_tokens"] == 1500
+    assert hard._request_hard_fit is False
+    assert await hard.get_messages() == canonical
+    removed_contents = {
+        message["content"]
+        for message in canonical
+        if message["metadata"]["_seq"] in hard._removed_seqs
+    }
+    assert removed_contents, "Setup must record an old sticky removal"
+
+    # The forced view is now the stable provider-facing view even when a later
+    # caller has no active retention requirement and uses the ordinary getter.
+    ordinary = await hard.get_messages_for_request()
+    inactive = await hard.get_messages_for_request_retaining(retain_contents=[])
+    assert ordinary == forced == inactive
+    assert not removed_contents & {message.get("content") for message in ordinary}
+
+    normal, normal_body = await pressured_context()
+    ordinary_budget = await normal.get_messages_for_request_retaining(
+        retain_contents=[normal_body],
+        token_budget=1500,
+    )
+    assert normal._last_compaction_stats is not None
+    assert normal._last_compaction_stats["target_tokens"] == 750
+    assert normal._request_hard_fit is False
+    assert normal._estimate_tokens(ordinary_budget) <= normal.max_tokens
+
+    empty, _ = await pressured_context()
+    await empty.get_messages_for_request_retaining(
+        retain_contents=[], token_budget=1500, hard_fit=True
+    )
+    assert empty._last_compaction_stats is not None
+    assert empty._last_compaction_stats["target_tokens"] == 1500
+    assert empty._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_hard_fit_keeps_new_human_reminder_and_current_tool_result():
+    """New growth is visible, but old sticky removals never reinflate."""
+    context = SimpleContextManager(
+        max_tokens=1800,
+        protected_tool_results=1,
+        compaction_notice_enabled=False,
+    )
+    first = "Original human task: retain this complete prompt."
+    required = "<system-reminders>" + "active policy " * 150 + "</system-reminders>"
+    await context.add_message(human(first))
+    await context.add_message(reminder(required))
+    for i in range(30):
+        await context.add_message(
+            {"role": "assistant", "content": f"Historical bulk {i}: " + "x" * 900}
+        )
+
+    await context.get_messages_for_request_retaining(
+        retain_contents=[required], token_budget=1500, hard_fit=True
+    )
+    removed_contents = {
+        message["content"]
+        for message in await context.get_messages()
+        if message["metadata"]["_seq"] in context._removed_seqs
+    }
+    assert removed_contents, "Setup must record an old sticky removal"
+
+    latest = "Latest human correction: preserve current tool output."
+    tool_output = "CURRENT_TOOL_RESULT " + "z" * 500
+    await context.add_message(human(latest))
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "current_call", "type": "function", "function": {"name": "read"}}
+            ],
+        }
+    )
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "current_call", "content": tool_output}
+    )
+
+    view = await context.get_messages_for_request_retaining(
+        retain_contents=[required], token_budget=1500, hard_fit=True
+    )
+    contents = {message.get("content") for message in view}
+    assert {first, latest, required, tool_output}.issubset(contents)
+    assert not removed_contents & contents
+    assert context._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_hard_fit_with_empty_retention_targets_the_full_forced_budget():
+    """An empty requirement set must not silently fall back to the half target."""
+    context, _ = await pressured_context()
+    forced_budget = 1500
+
+    await context.get_messages_for_request_retaining(
+        retain_contents=[],
+        token_budget=forced_budget,
+        hard_fit=True,
+    )
+
+    assert context._last_compaction_stats is not None
+    assert context._last_compaction_stats["target_tokens"] == forced_budget
+    assert context._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_hard_fit_protects_appended_human_reminder_and_tool_result():
+    """A provider-directed fit keeps current protected growth and old reductions."""
+    context = SimpleContextManager(
+        max_tokens=1800,
+        protected_tool_results=1,
+        compaction_notice_enabled=False,
+    )
+    first = "Original human task: retain this complete prompt."
+    required = "<system-reminders>" + "active policy " * 150 + "</system-reminders>"
+    forced_budget = 1500
+    await context.add_message(human(first))
+    await context.add_message(reminder(required))
+    for i in range(30):
+        await context.add_message(
+            {"role": "assistant", "content": f"Historical bulk {i}: " + "x" * 900}
+        )
+
+    await context.get_messages_for_request_retaining(
+        retain_contents=[required],
+        token_budget=forced_budget,
+        hard_fit=True,
+    )
+    removed_contents = {
+        message["content"]
+        for message in await context.get_messages()
+        if message["metadata"]["_seq"] in context._removed_seqs
+    }
+    assert removed_contents, "Setup must record an old sticky removal"
+
+    latest = "Latest human correction: preserve current tool output."
+    tool_output = "CURRENT_TOOL_RESULT " + "z" * 500
+    await context.add_message(human(latest))
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {"id": "current_call", "type": "function", "function": {"name": "read"}}
+            ],
+        }
+    )
+    await context.add_message(
+        {"role": "tool", "tool_call_id": "current_call", "content": tool_output}
+    )
+
+    view = await context.get_messages_for_request_retaining(
+        retain_contents=[required],
+        token_budget=forced_budget,
+        hard_fit=True,
+    )
+    contents = {message.get("content") for message in view}
+    assert {first, latest, required, tool_output}.issubset(contents)
+    assert not removed_contents & contents
+    assert context._last_compaction_stats is not None
+    assert context._last_compaction_stats["target_tokens"] == forced_budget
+    assert context._request_hard_fit is False
 
 
 @pytest.mark.asyncio
