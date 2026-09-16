@@ -259,6 +259,14 @@ async def mount(coordinator: ModuleCoordinator, config: dict[str, Any] | None = 
         register_capability(
             "context.request_retention", context.get_messages_for_request_retaining
         )
+        register_capability("context.foreground_usage", context.claim_foreground_usage)
+        # This is deliberately absent in estimate mode.  The loop must opt in
+        # only when both its provider and Context can make the same complete
+        # request count; the legacy getter remains the estimate-mode path.
+        if token_meter == TOKEN_METER_ACTUAL:
+            register_capability(
+                "context.measured_request_view", context.get_measured_request_view
+            )
     logger.info(f"Mounted SimpleContextManager (token_meter={token_meter!r})")
 
     async def cleanup() -> None:
@@ -412,6 +420,12 @@ class SimpleContextManager:
         # "estimate" mode -- see README "Real-usage token meter".
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
+        # A Loop that understands foreground ownership claims this once, then
+        # writes only its successful foreground response usage through the
+        # recorder.  Generic llm:response remains a compatibility fallback
+        # until that persistent claim, but can never overwrite owned data.
+        self._foreground_usage_claimed = False
+        self._foreground_usage_stale = False
         self._system_prompt_factory: Callable[[], Awaitable[str]] | None = None
         self._request_retained_contents: frozenset[str] = frozenset()
         self._request_protected_seqs: set[int] = set()
@@ -424,6 +438,9 @@ class SimpleContextManager:
         # request-local and is always restored by the retention wrapper.
         self._request_compaction_delivery_started = False
         self._request_retention_depth = 0
+        # The measured capability stages the legacy fallback too, so a
+        # callback cancellation cannot publish a compaction no request sent.
+        self._defer_compaction_delivery = False
 
         # --- Sticky compaction decision state ---
         # Compaction decisions (remove / truncate / stub) are keyed by a
@@ -759,6 +776,607 @@ class SimpleContextManager:
             else:
                 self._request_compaction_delivery_started = previous_delivery_started
 
+    def claim_foreground_usage(self) -> Callable[..., bool]:
+        """Claim the persistent foreground usage meter and return its recorder.
+
+        This capability is intentionally not a temporary dispatch lease:
+        helper/naming/evaluator responses can arrive after a prompt completes,
+        so a ContextVar or an around-send flag would reopen the generic hook
+        race.  The first claim discards an unowned hook reading; later claims
+        are idempotent and return the same stateful recorder.
+        """
+        if not self._foreground_usage_claimed:
+            self._foreground_usage_claimed = True
+            self._last_measured_prompt_tokens = None
+            self._foreground_usage_stale = False
+        return self._record_foreground_usage
+
+    def _record_foreground_usage(
+        self, *, input_tokens: Any, cache_write_tokens: Any = 0
+    ) -> bool:
+        """Record one scoped foreground response, refusing malformed usage."""
+        valid = (
+            isinstance(input_tokens, int)
+            and not isinstance(input_tokens, bool)
+            and input_tokens >= 0
+            and isinstance(cache_write_tokens, int)
+            and not isinstance(cache_write_tokens, bool)
+            and cache_write_tokens >= 0
+        )
+        if not valid:
+            # Keep an earlier owned reading, but state plainly that it is not a
+            # fresh scoped value.  Turning malformed input into zero would be a
+            # false measurement and could suppress necessary compaction.
+            self._foreground_usage_stale = True
+            logger.debug(
+                "context-simple: foreground usage was malformed; retaining the "
+                "previous owned reading as stale"
+            )
+            return False
+        self._last_measured_prompt_tokens = input_tokens + cache_write_tokens
+        self._foreground_usage_stale = False
+        return True
+
+    @staticmethod
+    def _is_nonnegative_int(value: Any) -> bool:
+        return isinstance(value, int) and not isinstance(value, bool) and value >= 0
+
+    def _measured_transaction(self) -> "_MeasuredViewTransaction":
+        """Snapshot all sticky decisions which a measured candidate may stage."""
+        return _MeasuredViewTransaction(self)
+
+    def _append_compaction_notice(
+        self, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return the one safe, qualitative tail notice for a measured view."""
+        result = list(messages)
+        if (
+            self.compaction_notice_enabled
+            and self._last_compaction_stats
+            and self._last_compaction_stats.get("strategy_level", 0)
+            >= self.compaction_notice_min_level
+            and not self._tail_has_unanswered_tool_calls(result)
+        ):
+            notice = self._format_compaction_notice()
+            if notice:
+                result.append(
+                    {
+                        "role": "user",
+                        "content": notice,
+                        "metadata": {
+                            "source": "context-compaction",
+                            "ephemeral": True,
+                        },
+                    }
+                )
+        return result
+
+    def _measured_budget_decision(
+        self, envelope: dict[str, Any]
+    ) -> tuple[int, int, int, str] | None:
+        """Validate old hard-safety fields and additive native-count fields.
+
+        A non-dictionary callback envelope is a broken capability contract, not
+        an unavailable measurement.  Missing/malformed *advertised*
+        measurement, however, is explicitly an unavailable count so an older
+        provider can retain its compatibility path.  The pre-existing
+        estimated-input/limit pair remains mandatory whenever a decision is
+        supplied, regardless of measurement availability.
+        """
+        decision = envelope.get("budget_decision")
+        if decision is None:
+            return None
+        if not isinstance(decision, dict):
+            raise TypeError("count_view returned a non-dictionary budget_decision")
+        estimated = decision.get("estimated_input_tokens")
+        limit = decision.get("input_limit_tokens")
+        if not self._is_nonnegative_int(estimated) or not self._is_nonnegative_int(
+            limit
+        ):
+            raise TypeError(
+                "count_view budget_decision requires nonnegative integer "
+                "estimated_input_tokens and input_limit_tokens"
+            )
+        measurement = decision.get("measurement")
+        if not isinstance(measurement, dict):
+            return None
+        count = measurement.get("input_tokens")
+        if (
+            measurement.get("kind") != "provider_count"
+            or not isinstance(measurement.get("source"), str)
+            or not measurement["source"]
+            or not self._is_nonnegative_int(count)
+            or not self._is_nonnegative_int(estimated)
+            or not self._is_nonnegative_int(limit)
+            or estimated < count
+        ):
+            return None
+        return count, estimated, limit, measurement["source"]
+
+    def _measured_hard_oversize(self, envelope: dict[str, Any]) -> bool:
+        """Whether a validated callback envelope exceeds its old hard limit."""
+        decision = envelope.get("budget_decision")
+        return (
+            isinstance(decision, dict)
+            and decision["estimated_input_tokens"] > decision["input_limit_tokens"]
+        )
+
+    async def _count_measured_view(
+        self, count_view: Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]],
+        view: list[dict[str, Any]],
+    ) -> tuple[
+        list[dict[str, Any]],
+        dict[str, Any],
+        tuple[int, int, int, str] | None,
+    ]:
+        """Count exactly the provider-facing candidate, without reassembly."""
+        public_view = self._strip_internal_metadata(self._append_compaction_notice(view))
+        envelope = await count_view(public_view)
+        if not isinstance(envelope, dict) or "dispatch" not in envelope:
+            raise TypeError("count_view must return {dispatch, budget_decision}")
+        return public_view, envelope, self._measured_budget_decision(envelope)
+
+    def _measured_apply_rung(
+        self,
+        rung: int,
+        view: list[dict[str, Any]],
+        developer_seqs: set[int],
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Apply one existing legal compaction rung without local success claims."""
+        systems = [dict(msg) for msg in view if msg.get("role") == "system"]
+        working = [dict(msg) for msg in view if msg.get("role") != "system"]
+        before = (
+            self._removed_seqs.copy(),
+            self._truncated_seqs.copy(),
+            self._stubbed_seqs.copy(),
+        )
+        tool_indices = [
+            index for index, message in enumerate(working) if message.get("role") == "tool"
+        ]
+        protected_tools = self._protected_tool_indices(tool_indices)
+
+        def truncate(indices: list[int]) -> None:
+            # Unlike the legacy local-estimate helper, this exhausts the
+            # rung.  Only an actual transformation becomes a sticky decision,
+            # so a short/protected wave remains a genuine no-op.
+            for index in indices:
+                if index in protected_tools:
+                    continue
+                message = working[index]
+                if message.get("_truncated"):
+                    continue
+                reduced = self._truncate_tool_result(message)
+                if reduced is message:
+                    continue
+                working[index] = reduced
+                self._record_truncated(message)
+
+        if rung == 1:
+            truncate(tool_indices[: int(len(tool_indices) * 0.25)])
+        elif rung == 2:
+            truncate(
+                tool_indices[
+                    int(len(tool_indices) * 0.25) : int(len(tool_indices) * 0.50)
+                ]
+            )
+        elif rung in (3, 5, 7):
+            protection = {
+                3: self.protected_recent,
+                5: self.protected_recent * 0.6,
+                7: self.protected_recent * 0.3,
+            }[rung]
+            working, _, _, _ = self._remove_messages_with_protection(
+                working,
+                -1,  # exhaust legal candidates; count_view decides success
+                protected_recent=protection,
+                system_tokens=self._estimate_tokens(systems),
+                additional_protected_seqs=developer_seqs,
+            )
+        elif rung == 4:
+            truncate(
+                tool_indices[
+                    int(len(tool_indices) * 0.50) : int(len(tool_indices) * 0.75)
+                ]
+            )
+        elif rung == 6:
+            truncate(tool_indices)
+        elif rung == 8:
+            user_indices = [
+                index
+                for index, message in enumerate(working)
+                if message.get("role") == "user"
+            ]
+            first_user = user_indices[0] if user_indices else None
+            last_user = user_indices[-1] if user_indices else None
+            # This is the legacy level-eight machine-prefix rule, deliberately
+            # retaining actual human boundaries and request-retained bodies.
+            if first_user is not None and first_user != last_user:
+                first = working[first_user]
+                reduced = self._stub_user_message(first)
+                if (
+                    not self._is_request_protected(first, developer_seqs)
+                    and not _is_human_message(first)
+                    and not first.get("_stubbed")
+                    and reduced is not first
+                ):
+                    working[first_user] = reduced
+                    self._record_stubbed(first)
+            protected_boundary = int(len(working) * (1 - self.protected_recent * 0.3))
+            for index, message in list(enumerate(working)):
+                if (
+                    index >= protected_boundary
+                    or index == last_user
+                    or not message.get("_stubbed")
+                    or self._is_request_protected(message, developer_seqs)
+                ):
+                    continue
+                self._record_removed(message)
+            working = [
+                message
+                for message in working
+                if self._extract_seq(message) not in self._removed_seqs
+            ]
+        else:  # Defensive boundary for this private fixed eight-rung policy.
+            raise ValueError(f"unknown measured compaction rung {rung}")
+
+        after = (self._removed_seqs, self._truncated_seqs, self._stubbed_seqs)
+        changed = after != before
+        return systems + working, changed
+
+    def _stage_measured_stats(
+        self,
+        *,
+        initial_view: list[dict[str, Any]],
+        final_view: list[dict[str, Any]],
+        strategy_level: int,
+        budget: int,
+        measured_before: int,
+        measured_after: int,
+        measurement_source: str,
+        trigger: float,
+        target: int,
+        outcome: str,
+        count_calls: int,
+    ) -> None:
+        """Stage telemetry for a candidate; transaction commit makes it sticky."""
+        self._sticky_level = max(self._sticky_level, strategy_level)
+        self._last_compaction_stats = {
+            "before_tokens": self._estimate_tokens(initial_view),
+            "after_tokens": self._estimate_tokens(final_view),
+            "before_messages": len(initial_view),
+            "after_messages": len(final_view),
+            "messages_removed": len(self._removed_seqs),
+            "messages_truncated": len(self._truncated_seqs),
+            "user_messages_stubbed": len(self._stubbed_seqs),
+            "system_messages_preserved": sum(
+                message.get("role") == "system" for message in final_view
+            ),
+            "strategy_level": self._sticky_level,
+            "budget": budget,
+            "target_tokens": target,
+            "protected_recent": self.protected_recent,
+            "protected_tool_results": self.protected_tool_results,
+            "measurement_kind": "provider_count",
+            "measurement_source": measurement_source,
+            "measured_before": measured_before,
+            "measured_after": measured_after,
+            "trigger": trigger,
+            "policy_budget": budget,
+            "outcome": outcome,
+            "count_calls": count_calls,
+        }
+
+    async def get_measured_request_view(
+        self,
+        *,
+        provider: Any,
+        retain_contents: list[str],
+        count_view: Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]],
+    ) -> dict[str, Any]:
+        """Build and reduce one complete request using provider-native counts.
+
+        The loop owns request construction.  Context owns only canonical
+        history, its one materialized policy snapshot, and the established
+        eight legal reduction rungs.  The returned envelope is the exact
+        callback object that counted the final provider-facing request.
+        """
+        if self.token_meter != TOKEN_METER_ACTUAL:
+            raise RuntimeError("measured request views require token_meter='actual'")
+
+        previous_contents = self._request_retained_contents
+        previous_seqs = self._request_protected_seqs
+        previous_hard_fit = self._request_hard_fit
+        previous_delivery = self._request_compaction_delivery_started
+        cycle_snapshot = (
+            self._removed_seqs.copy(),
+            self._truncated_seqs.copy(),
+            self._stubbed_seqs.copy(),
+            self._sticky_level,
+            self._last_compaction_stats,
+            self._last_token_meter_stats,
+        )
+        transaction: _MeasuredViewTransaction | None = None
+        try:
+            self._request_retained_contents = frozenset(retain_contents)
+            self._request_hard_fit = False
+            self._request_compaction_delivery_started = False
+
+            # Materialize the dynamic factory exactly once.  The callback adds
+            # all loop-owned overlays to every candidate from this same base.
+            if self._system_prompt_factory:
+                system_content = await self._system_prompt_factory()
+                working = [{"role": "system", "content": system_content}] + [
+                    message
+                    for message in self.messages
+                    if message.get("role") != "system"
+                    or (message.get("metadata") or {}).get("source") == "hook"
+                ]
+            else:
+                working = list(self.messages)
+
+            developer_seqs = {
+                seq
+                for message in working
+                if message.get("role") == "developer"
+                and (seq := self._extract_seq(message)) is not None
+            }
+            self._request_protected_seqs = self._protected_sequences(working)
+            budget = self._calculate_budget(None, provider)
+            if self.compaction_notice_enabled:
+                effective_budget = budget - self.compaction_notice_token_reserve
+                if effective_budget <= 0:
+                    logger.warning(
+                        "compaction_notice_token_reserve consumes measured request "
+                        "budget; ignoring it for this request"
+                    )
+                    effective_budget = budget
+            else:
+                effective_budget = budget
+            self._last_effective_budget = effective_budget
+            trigger = effective_budget * self.compact_threshold
+            target = int(effective_budget * self.target_usage)
+            initial = [
+                *[dict(message) for message in working if message.get("role") == "system"],
+                *self._apply_sticky_decisions(
+                    [message for message in working if message.get("role") != "system"],
+                    additional_protected_seqs=developer_seqs,
+                ),
+            ]
+            initial_view, initial_attempt, initial_measurement = await self._count_measured_view(
+                count_view, initial
+            )
+            if initial_measurement is None:
+                if self._measured_hard_oversize(initial_attempt):
+                    raise ContextLengthError(
+                        "Context cannot fit protected content within the provider "
+                        "input limit."
+                    )
+                # Native count availability is dynamic.  Preserve the old
+                # actual-meter/estimate behavior from this already-created
+                # snapshot; never call the factory or replay loop overlays.
+                legacy_count, _, legacy_estimate = self._measure_working_tokens(initial)
+                legacy_needed = self._should_compact(
+                    legacy_count, effective_budget
+                ) or (
+                    bool(self._request_retained_contents)
+                    and legacy_estimate > effective_budget
+                )
+                if legacy_needed:
+                    transaction = _MeasuredViewTransaction(self, snapshot=cycle_snapshot)
+                    self._defer_compaction_delivery = True
+                    try:
+                        fallback = await self._compact_ephemeral(
+                            effective_budget,
+                            working,
+                            additional_protected_seqs=developer_seqs,
+                        )
+                    finally:
+                        self._defer_compaction_delivery = False
+                    changed = (
+                        self._removed_seqs,
+                        self._truncated_seqs,
+                        self._stubbed_seqs,
+                    ) != cycle_snapshot[:3]
+                    if changed:
+                        fallback_view, fallback_attempt, _fallback_measurement = (
+                            await self._count_measured_view(count_view, fallback)
+                        )
+                        if self._measured_hard_oversize(fallback_attempt):
+                            transaction.rollback()
+                            raise ContextLengthError(
+                                "Context cannot fit protected content within the "
+                                "provider input limit."
+                            )
+                        return {
+                            "base_view": fallback_view,
+                            "final_attempt": fallback_attempt,
+                            "outcome": "measurement_unavailable",
+                            "measured_before": None,
+                            "measured_after": None,
+                            "policy_budget": effective_budget,
+                            "trigger": trigger,
+                            "target": target,
+                            "count_calls": 2,
+                            "transaction": transaction,
+                        }
+                    transaction.rollback()
+                    transaction = None
+                return {
+                    "base_view": initial_view,
+                    "final_attempt": initial_attempt,
+                    "outcome": "measurement_unavailable",
+                    "measured_before": None,
+                    "measured_after": None,
+                    "policy_budget": effective_budget,
+                    "trigger": trigger,
+                    "target": target,
+                    "count_calls": 1,
+                    "transaction": None,
+                }
+
+            before, estimated, limit, measurement_source = initial_measurement
+            known_hard_oversize = estimated > limit
+            needs_compaction = before >= trigger or estimated > limit
+            if not needs_compaction:
+                return {
+                    "base_view": initial_view,
+                    "final_attempt": initial_attempt,
+                    "outcome": "not_needed",
+                    "measured_before": before,
+                    "measured_after": before,
+                    "policy_budget": effective_budget,
+                    "trigger": trigger,
+                    "target": target,
+                    "count_calls": 1,
+                    "transaction": None,
+                }
+
+            transaction = _MeasuredViewTransaction(self, snapshot=cycle_snapshot)
+            candidate = initial
+            final_view = initial_view
+            final_attempt = initial_attempt
+            final_measurement = initial_measurement
+            count_calls = 1
+            changed_any = False
+            last_changed_rung = 0
+            for rung in range(1, 9):
+                candidate, changed = self._measured_apply_rung(
+                    rung, candidate, developer_seqs
+                )
+                if not changed:
+                    continue
+                changed_any = True
+                last_changed_rung = rung
+                # Stage qualitative notice/statistics before counting this
+                # complete candidate; never append a post-count outcome notice.
+                self._stage_measured_stats(
+                    initial_view=initial,
+                    final_view=candidate,
+                    strategy_level=rung,
+                    budget=effective_budget,
+                    measured_before=before,
+                    measured_after=final_measurement[0],
+                    measurement_source=final_measurement[3],
+                    trigger=trigger,
+                    target=target,
+                    outcome="compacting",
+                    count_calls=count_calls + 1,
+                )
+                final_view, final_attempt, final_measurement = await self._count_measured_view(
+                    count_view, candidate
+                )
+                count_calls += 1
+                if final_measurement is None:
+                    known_hard_oversize = (
+                        known_hard_oversize
+                        or self._measured_hard_oversize(final_attempt)
+                    )
+                    transaction.rollback()
+                    if known_hard_oversize:
+                        raise ContextLengthError(
+                            "Context cannot fit protected content within the provider "
+                            "input limit after its recount became unavailable."
+                        )
+                    return {
+                        "base_view": initial_view,
+                        "final_attempt": initial_attempt,
+                        "outcome": "measurement_unavailable",
+                        "measured_before": before,
+                        "measured_after": before,
+                        "policy_budget": effective_budget,
+                        "trigger": trigger,
+                        "target": target,
+                        "count_calls": count_calls,
+                        "transaction": None,
+                    }
+                measured_after, estimated_after, limit_after, measured_source = final_measurement
+                known_hard_oversize = known_hard_oversize or estimated_after > limit_after
+                if measured_after <= target and estimated_after <= limit_after:
+                    self._stage_measured_stats(
+                        initial_view=initial,
+                        final_view=candidate,
+                        strategy_level=rung,
+                        budget=effective_budget,
+                        measured_before=before,
+                        measured_after=measured_after,
+                        measurement_source=measured_source,
+                        trigger=trigger,
+                        target=target,
+                        outcome="target_reached",
+                        count_calls=count_calls,
+                    )
+                    return {
+                        "base_view": final_view,
+                        "final_attempt": final_attempt,
+                        "outcome": "target_reached",
+                        "measured_before": before,
+                        "measured_after": measured_after,
+                        "policy_budget": effective_budget,
+                        "trigger": trigger,
+                        "target": target,
+                        "count_calls": count_calls,
+                        "transaction": transaction,
+                    }
+
+            measured_after, estimated_after, limit_after, measured_source = final_measurement
+            if estimated_after > limit_after:
+                transaction.rollback()
+                raise ContextLengthError(
+                    "Context cannot fit protected content within the provider input "
+                    "limit; required content was not discarded."
+                )
+            if not changed_any:
+                # A protected floor is a real answer to the one exact probe,
+                # not a new compaction decision.  Do not manufacture sticky
+                # stats/notices/events (or a transaction) from a no-op walk.
+                transaction.rollback()
+                return {
+                    "base_view": initial_view,
+                    "final_attempt": initial_attempt,
+                    "outcome": "protected_floor",
+                    "measured_before": before,
+                    "measured_after": before,
+                    "policy_budget": effective_budget,
+                    "trigger": trigger,
+                    "target": target,
+                    "count_calls": count_calls,
+                    "transaction": None,
+                }
+            self._stage_measured_stats(
+                initial_view=initial,
+                final_view=candidate,
+                strategy_level=last_changed_rung,
+                budget=effective_budget,
+                measured_before=before,
+                measured_after=measured_after,
+                measurement_source=measured_source,
+                trigger=trigger,
+                target=target,
+                outcome="protected_floor",
+                count_calls=count_calls,
+            )
+            return {
+                "base_view": final_view,
+                "final_attempt": final_attempt,
+                "outcome": "protected_floor",
+                "measured_before": before,
+                "measured_after": measured_after,
+                "policy_budget": effective_budget,
+                "trigger": trigger,
+                "target": target,
+                "count_calls": count_calls,
+                "transaction": transaction,
+            }
+        except BaseException:
+            if transaction is not None:
+                transaction.rollback()
+            raise
+        finally:
+            self._request_retained_contents = previous_contents
+            self._request_protected_seqs = previous_seqs
+            self._request_hard_fit = previous_hard_fit
+            self._request_compaction_delivery_started = previous_delivery
+
     def _protected_sequences(self, messages: list[dict[str, Any]]) -> set[int]:
         humans = [msg for msg in messages if _is_human_message(msg)]
         protected = [humans[0], humans[-1]] if humans else []
@@ -779,8 +1397,19 @@ class SimpleContextManager:
             raise ValueError("Requested retained injection is not in admitted history")
         return {seq for msg in protected if (seq := self._extract_seq(msg)) is not None}
 
-    def _is_request_protected(self, msg: dict[str, Any]) -> bool:
-        return self._extract_seq(msg) in self._request_protected_seqs
+    def _is_request_protected(
+        self,
+        msg: dict[str, Any],
+        additional_protected_seqs: set[int] | None = None,
+    ) -> bool:
+        seq = self._extract_seq(msg)
+        return (
+            seq in self._request_protected_seqs
+            or (
+                additional_protected_seqs is not None
+                and seq in additional_protected_seqs
+            )
+        )
 
     def _check_retained_budget(
         self, messages: list[dict[str, Any]], budget: int
@@ -929,6 +1558,7 @@ class SimpleContextManager:
             "used_tokens": token_count,
             "estimated_tokens": estimated_tokens,
             "measured_tokens": self._last_measured_prompt_tokens,
+            "foreground_usage_stale": self._foreground_usage_stale,
             "budget": effective_budget,
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
@@ -1131,6 +1761,9 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
+        # Ownership is a capability claim, not a turn-local meter value.  A
+        # cleared Context must not permit utility hook traffic to take it back.
+        self._foreground_usage_stale = self._foreground_usage_claimed
         logger.info("Context cleared")
 
     async def should_compact(self) -> bool:
@@ -1214,7 +1847,12 @@ class SimpleContextManager:
             self.token_meter == TOKEN_METER_ACTUAL
             and self._last_measured_prompt_tokens is not None
         ):
-            return self._last_measured_prompt_tokens, "measured", estimated_tokens
+            source = (
+                "owned_stale"
+                if self._foreground_usage_claimed and self._foreground_usage_stale
+                else "measured"
+            )
+            return self._last_measured_prompt_tokens, source, estimated_tokens
         return estimated_tokens, "estimate", estimated_tokens
 
     async def _on_llm_response(self, event: str, data: dict[str, Any]) -> Any:
@@ -1251,16 +1889,27 @@ class SimpleContextManager:
         """
         from amplifier_core.models import HookResult
 
+        if self._foreground_usage_claimed:
+            # The Loop has claimed responsibility for successful foreground
+            # responses.  This broad hook also sees utility replies and may
+            # run after the foreground turn, so it must become permanently
+            # observational once ownership exists.
+            return HookResult(action="continue")
+
         usage = (data or {}).get("usage") or {}
         input_tokens = usage.get("input_tokens")
-        cache_write_tokens = usage.get("cache_write_tokens") or 0
-        if isinstance(input_tokens, int | float):
-            total = int(input_tokens) + int(cache_write_tokens)
+        cache_write_tokens = (
+            usage["cache_write_tokens"] if "cache_write_tokens" in usage else 0
+        )
+        if self._is_nonnegative_int(input_tokens) and self._is_nonnegative_int(
+            cache_write_tokens
+        ):
+            total = input_tokens + cache_write_tokens
             self._last_measured_prompt_tokens = total
             logger.debug(
                 f"context-simple: token_meter recorded real usage from "
-                f"llm:response -- input_tokens={int(input_tokens):,} + "
-                f"cache_write_tokens={int(cache_write_tokens):,} = {total:,} total"
+                f"llm:response -- input_tokens={input_tokens:,} + "
+                f"cache_write_tokens={cache_write_tokens:,} = {total:,} total"
             )
         else:
             logger.debug(
@@ -1317,7 +1966,9 @@ class SimpleContextManager:
             self._stubbed_seqs.add(seq)
 
     def _apply_sticky_decisions(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        additional_protected_seqs: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Cheaply (O(n), no search) re-apply every previously-recorded
         compaction decision to a fresh copy of `messages`.
@@ -1339,7 +1990,7 @@ class SimpleContextManager:
         result: list[dict[str, Any]] = []
         for msg in messages:
             seq = self._extract_seq(msg)
-            if self._is_request_protected(msg):
+            if self._is_request_protected(msg, additional_protected_seqs):
                 result.append(dict(msg))
                 continue
             if seq is not None and seq in self._removed_seqs:
@@ -1353,7 +2004,10 @@ class SimpleContextManager:
         return result
 
     async def _compact_ephemeral(
-        self, budget: int, source_messages: list[dict[str, Any]] | None = None
+        self,
+        budget: int,
+        source_messages: list[dict[str, Any]] | None = None,
+        additional_protected_seqs: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Compact the context EPHEMERALLY using progressive interleaved strategy.
@@ -1421,7 +2075,10 @@ class SimpleContextManager:
         # escalation has happened: deterministic given the same input messages,
         # so it reproduces exactly what was returned last time for anything not
         # newly appended -- which is what keeps the shared prefix byte-stable.
-        working_messages = self._apply_sticky_decisions(non_system_messages)
+        working_messages = self._apply_sticky_decisions(
+            non_system_messages,
+            additional_protected_seqs=additional_protected_seqs,
+        )
 
         # === UNITS CONVENTION: TOTAL vs TOTAL, everywhere in this path ===
         #
@@ -1586,6 +2243,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level3_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -1652,6 +2310,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level5_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -1715,6 +2374,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level7_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -1745,7 +2405,9 @@ class SimpleContextManager:
             if (
                 first_user_idx is not None
                 and first_user_idx != last_user_idx
-                and not self._is_request_protected(working_messages[first_user_idx])
+                and not self._is_request_protected(
+                    working_messages[first_user_idx], additional_protected_seqs
+                )
                 and not _is_human_message(working_messages[first_user_idx])
             ):
                 first_msg = working_messages[first_user_idx]
@@ -1775,7 +2437,7 @@ class SimpleContextManager:
                     if msg.get("_stubbed")
                     and i < protected_boundary  # Outside protected recent zone
                     and i != last_user_idx  # Never remove last user message
-                    and not self._is_request_protected(msg)
+                    and not self._is_request_protected(msg, additional_protected_seqs)
                 ]
 
                 stubs_removed = 0
@@ -1914,6 +2576,7 @@ class SimpleContextManager:
         target_tokens: int,
         protected_recent: float,
         system_tokens: int,
+        additional_protected_seqs: set[int] | None = None,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -1969,7 +2632,9 @@ class SimpleContextManager:
             )
 
         protected_indices.update(
-            i for i, msg in enumerate(messages) if self._is_request_protected(msg)
+            i
+            for i, msg in enumerate(messages)
+            if self._is_request_protected(msg, additional_protected_seqs)
         )
         if first_user_idx is not None:
             protected_indices.add(first_user_idx)
@@ -2322,7 +2987,11 @@ class SimpleContextManager:
 
         # A hard fit delays emission until its tail notice is added and the
         # complete provider-facing view passes its final budget check.
-        if self._hooks is not None and not self._request_hard_fit:
+        if (
+            self._hooks is not None
+            and not self._request_hard_fit
+            and not self._defer_compaction_delivery
+        ):
             try:
                 await self._hooks.emit("context:compaction", stats)
             except Exception as e:
@@ -2404,9 +3073,8 @@ class SimpleContextManager:
         removed = stats.get("messages_removed", 0)
         stubbed = stats.get("user_messages_stubbed", 0)
         truncated = stats.get("messages_truncated", 0)
-        old_tokens = stats.get("before_tokens", 0)
-        new_tokens = stats.get("after_tokens", 0)
-        target_tokens = stats.get("target_tokens", 0)
+        # Local chars/4 statistics are not provider input counts; keep them
+        # in diagnostic stats rather than presenting them as tokens to the model.
         protected_recent = stats.get("protected_recent", 0.0)
         protected_tool_results = stats.get("protected_tool_results", 0)
 
@@ -2417,7 +3085,6 @@ Compaction summary:
 - Strategy level: {level}/8
 - Messages: {old_count} → {new_count} ({removed} removed, {stubbed} stubbed)
 - Tool results: {truncated} truncated
-- Tokens: {old_tokens:,} → {new_tokens:,} (target: {target_tokens:,})
 
 What was preserved:
 - All system messages (your instructions and identity)
@@ -2589,3 +3256,70 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
         """Rough token estimation (chars / 4)."""
         return sum(len(str(msg)) // 4 for msg in messages)
+
+
+class _MeasuredViewTransaction:
+    """Idempotent commit/rollback boundary for staged measured compaction."""
+
+    _OPEN = "open"
+    _COMMITTED = "committed"
+    _ROLLED_BACK = "rolled_back"
+
+    def __init__(
+        self,
+        context: SimpleContextManager,
+        snapshot: tuple[set[int], set[int], set[int], int, dict[str, Any] | None, dict[str, Any] | None]
+        | None = None,
+    ):
+        self._context = context
+        self._snapshot = snapshot or (
+            context._removed_seqs.copy(),
+            context._truncated_seqs.copy(),
+            context._stubbed_seqs.copy(),
+            context._sticky_level,
+            context._last_compaction_stats,
+            context._last_token_meter_stats,
+        )
+        self._state = self._OPEN
+
+    async def commit(self, *, is_cancelled: Callable[[], bool] | None = None) -> bool:
+        """Accept the selected candidate immediately before Loop dispatch.
+
+        Event delivery remains part of the open transaction.  A caller can
+        therefore veto a candidate after the await, while its snapshot is
+        still available to rollback.
+        """
+        if self._state == self._COMMITTED:
+            return True
+        if self._state == self._ROLLED_BACK:
+            return False
+        if self._context._hooks is not None and self._context._last_compaction_stats:
+            try:
+                await self._context._hooks.emit(
+                    "context:compaction", self._context._last_compaction_stats
+                )
+            except Exception as error:
+                logger.warning(f"Could not emit measured compaction event: {error}")
+        if self._state != self._OPEN:
+            return False
+        if is_cancelled is not None and is_cancelled():
+            self.rollback()
+            return False
+        if self._state != self._OPEN:
+            return False
+        self._state = self._COMMITTED
+        return True
+
+    def rollback(self) -> None:
+        """Restore pre-candidate state unless the transaction was committed."""
+        if self._state != self._OPEN:
+            return
+        (
+            self._context._removed_seqs,
+            self._context._truncated_seqs,
+            self._context._stubbed_seqs,
+            self._context._sticky_level,
+            self._context._last_compaction_stats,
+            self._context._last_token_meter_stats,
+        ) = self._snapshot
+        self._state = self._ROLLED_BACK

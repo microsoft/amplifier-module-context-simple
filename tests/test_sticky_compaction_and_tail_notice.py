@@ -233,6 +233,42 @@ async def test_notice_is_still_visible_and_informative():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("verbosity", ["minimal", "normal", "verbose"])
+async def test_notice_omits_token_totals_but_keeps_diagnostic_stats(verbosity):
+    """Local compaction estimates must not be presented as provider token counts."""
+    context = _make_context(compaction_notice_verbosity=verbosity)
+    await _fill_until_compacted(context)
+
+    messages = await context.get_messages_for_request()
+    stats = context._last_compaction_stats
+    assert stats is not None, "The fixture must actually compact"
+    for key in ("before_tokens", "after_tokens", "target_tokens"):
+        assert isinstance(stats[key], int) and stats[key] > 0
+
+    notices = [
+        message
+        for message in messages
+        if (message.get("metadata") or {}).get("source") == "context-compaction"
+    ]
+    assert len(notices) == 1
+    notice = notices[0]
+    assert messages[-1] is notice
+    assert notice["role"] == "user"
+    assert notice["metadata"]["ephemeral"] is True
+    content = notice["content"]
+    assert '<system-reminder source="context-compaction">' in content
+    assert "Context has been compacted" in content
+    assert "- Tokens:" not in content
+    assert "(target:" not in content
+    if verbosity != "minimal":
+        assert "- Strategy level:" in content
+        assert "- Messages:" in content
+        assert "- Tool results:" in content
+        assert "What was preserved:" in content
+        assert "What may be affected:" in content
+
+
+@pytest.mark.asyncio
 async def test_sticky_removal_decisions_never_reversed():
     """Once a message is decided as removed, it must stay removed on every
     subsequent call -- even as more history is added and the raw-history
