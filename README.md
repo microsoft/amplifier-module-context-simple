@@ -33,7 +33,7 @@ Provides straightforward in-memory conversation context management. This is the 
 - No persistence across sessions
 - Automatic compaction when approaching token limit (keeps system messages + last 10 messages)
 - **Preserves tool pairs as atomic units** during compaction (data integrity guarantee)
-- **Optional real-usage token meter** (`token_meter: "actual"`, default off) drives the compaction trigger from real provider usage instead of the built-in estimator -- see [Real-usage token meter](#real-usage-token-meter-token_meter) below
+- **Optional real-usage token meter** (`token_meter: "actual"`, default off) can negotiate a complete-request provider count with a compatible orchestrator; older orchestrators retain the legacy actual-meter path -- see [Real-usage token meter](#real-usage-token-meter-token_meter) below
 
 ## Configuration
 
@@ -356,7 +356,25 @@ own reported usage instead of guessing. This module ports that same
   full pre-existing test suite unchanged. An unrecognized `token_meter`
   value logs a warning and falls back to `"estimate"` rather than raising.
 
-### Known, accepted limitation
+### Negotiated provider-count path
+
+When `token_meter: "actual"` is paired with an orchestrator and provider that
+both advertise the optional measured-request capability, Context supplies a
+notice-inclusive candidate view and the orchestrator builds and counts the
+complete request, including its own tools and overlays. Context uses the
+provider's raw input count for both the configured trigger and target, applies
+at most the existing eight legal rungs, and returns the exact final counted
+envelope for dispatch. A protected floor is reported as such rather than being
+called target success; a known request over the provider hard limit fails
+closed.
+
+This is negotiated rather than a Context-side provider call: Context never
+imports provider or Loop types, and cannot count overlays it does not own. The
+returned transaction is committed by the orchestrator immediately before it
+dispatches the already-counted request; otherwise it rolls back staged sticky
+decisions.
+
+### Legacy actual-meter path
 
 Only the **escalation gate** (whether to compact at all, and whether a
 sticky escalation needs to advance) uses the real measurement in `"actual"`
