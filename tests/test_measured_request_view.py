@@ -229,6 +229,7 @@ async def test_cancellation_from_count_callback_propagates_without_sticky_state(
             provider=None, retain_contents=[], count_view=cancelled_count
         )
     assert not context._removed_seqs
+
     assert not context._truncated_seqs
 
 
@@ -322,3 +323,314 @@ async def test_unowned_hook_rejects_malformed_cache_write_without_crashing():
         "llm:response", {"usage": {"input_tokens": 99, "cache_write_tokens": "bad"}}
     )
     assert context._last_measured_prompt_tokens == 12
+
+
+@pytest.mark.asyncio
+async def test_measured_view_keeps_developer_instructions_at_protected_floor():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_recent=0,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    developer = "developer instruction " * 200
+    await context.add_message({"role": "developer", "content": developer})
+    await context.add_message({"role": "user", "content": "first human"})
+    await context.add_message({"role": "assistant", "content": "old removable reply"})
+    await context.add_message({"role": "user", "content": "latest human"})
+    views = []
+
+    async def count_view(view):
+        views.append(view)
+        # The count derives from the instruction's presence: removing it would
+        # falsely make the candidate appear to reach target.
+        has_full_developer = any(
+            message.get("role") == "developer"
+            and message.get("content") == developer
+            for message in view
+        )
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900 if has_full_developer else 400),
+        }
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+
+    assert result["outcome"] == "protected_floor"
+    assert result["measured_before"] == result["measured_after"] == 900
+    assert result["count_calls"] == len(views) == 2
+    assert all(
+        any(
+            message.get("role") == "developer"
+            and message.get("content") == developer
+            for message in view
+        )
+        for view in views
+    )
+    assert (await context.get_messages())[0]["content"] == developer
+    result["transaction"].rollback()
+
+
+@pytest.mark.asyncio
+async def test_initial_unavailable_legacy_fallback_keeps_developer_instructions():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        protected_recent=0,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    developer = "developer instruction " * 200
+    await context.add_message({"role": "developer", "content": developer})
+    await context.add_message({"role": "user", "content": "first human"})
+    await context.add_message({"role": "assistant", "content": "old removable reply"})
+    await context.add_message({"role": "user", "content": "latest human"})
+    views = []
+
+    async def unavailable_count(view):
+        views.append(view)
+        return {"dispatch": object(), "budget_decision": None}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=unavailable_count
+    )
+
+    assert result["outcome"] == "measurement_unavailable"
+    assert result["count_calls"] == len(views) == 2
+    assert any(
+        message.get("role") == "developer" and message.get("content") == developer
+        for message in result["base_view"]
+    )
+    assert (await context.get_messages())[0]["content"] == developer
+    result["transaction"].rollback()
+    assert not context._removed_seqs
+
+
+@pytest.mark.asyncio
+async def test_developer_protection_is_scoped_to_the_measured_capability():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        protected_recent=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    developer = "developer instruction " * 200
+    await context.add_message({"role": "developer", "content": developer})
+    await context.add_message({"role": "user", "content": "first human"})
+    await context.add_message({"role": "user", "content": "latest human"})
+
+    async def count_view(_view):
+        return {"dispatch": object(), "budget_decision": _decision(0)}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+    assert result["outcome"] == "not_needed"
+
+    legacy_view = await context.get_messages_for_request(1_000)
+    assert all(message.get("role") != "developer" for message in legacy_view)
+
+
+@pytest.mark.asyncio
+async def test_no_op_early_rungs_continue_to_a_later_legal_reduction():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await context.add_message({"role": "user", "content": "first"})
+    for index in range(3):
+        await context.add_message({"role": "tool", "content": "x" * 800, "name": str(index)})
+    await context.add_message({"role": "user", "content": "last"})
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900 if calls == 1 else 400),
+        }
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+
+    # Three tool results leave rung one empty; rung two must still be reached.
+    assert result["outcome"] == "target_reached"
+    assert result["count_calls"] == calls == 2
+    assert context._truncated_seqs
+    result["transaction"].rollback()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("estimated_input_tokens", True),
+        ("estimated_input_tokens", -1),
+        ("estimated_input_tokens", None),
+        ("input_limit_tokens", True),
+        ("input_limit_tokens", -1),
+        ("input_limit_tokens", None),
+    ],
+)
+async def test_invalid_old_hard_safety_fields_are_contract_errors(field, value):
+    context = SimpleContextManager(max_tokens=1_000, token_meter="actual")
+
+    async def count_view(_view):
+        decision = _decision(10)
+        if value is None:
+            decision.pop(field)
+        else:
+            decision[field] = value
+        return {"dispatch": object(), "budget_decision": decision}
+
+    with pytest.raises(TypeError, match="estimated_input_tokens and input_limit_tokens"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+
+
+@pytest.mark.asyncio
+async def test_soft_safe_malformed_measurement_remains_unavailable():
+    context = SimpleContextManager(max_tokens=1_000, token_meter="actual")
+
+    async def count_view(_view):
+        return {
+            "dispatch": object(),
+            "budget_decision": {
+                "estimated_input_tokens": 1_000,
+                "input_limit_tokens": 1_000,
+                "measurement": {"kind": "wrong", "source": "test.provider.count"},
+            },
+        }
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+
+    assert result["outcome"] == "measurement_unavailable"
+    assert result["count_calls"] == 1
+    assert result["transaction"] is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "measurement",
+    [
+        None,
+        {"kind": "wrong", "source": "test.provider.count", "input_tokens": 1},
+    ],
+)
+async def test_initial_unavailable_measurement_cannot_bypass_known_hard_oversize(
+    measurement,
+):
+    context = SimpleContextManager(max_tokens=1_000, token_meter="actual")
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        return {
+            "dispatch": object(),
+            "budget_decision": {
+                "estimated_input_tokens": 1_001,
+                "input_limit_tokens": 1_000,
+                "measurement": measurement,
+            },
+        }
+
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_unavailable_measurement_cannot_bypass_known_hard_oversize():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await context.add_message({"role": "user", "content": "first"})
+    for _ in range(4):
+        await context.add_message({"role": "tool", "content": "x" * 800})
+    await context.add_message({"role": "user", "content": "last"})
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"dispatch": object(), "budget_decision": None}
+        return {
+            "dispatch": object(),
+            "budget_decision": {
+                "estimated_input_tokens": 1_001,
+                "input_limit_tokens": 1_000,
+                "measurement": None,
+            },
+        }
+
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+    assert calls == 2
+    assert not context._truncated_seqs
+    assert not context._removed_seqs
+
+
+@pytest.mark.asyncio
+async def test_late_known_hard_oversize_fails_closed_when_next_recount_is_unavailable():
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await context.add_message({"role": "user", "content": "first"})
+    for _ in range(4):
+        await context.add_message({"role": "tool", "content": "x" * 800})
+    await context.add_message({"role": "user", "content": "last"})
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {
+                "dispatch": object(),
+                "budget_decision": _decision(900, estimated=999),
+            }
+        if calls == 2:
+            return {
+                "dispatch": object(),
+                "budget_decision": _decision(800, estimated=1_001),
+            }
+        return {"dispatch": object(), "budget_decision": None}
+
+    with pytest.raises(ContextLengthError, match="recount became unavailable"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+    assert calls == 3
+    assert not context._truncated_seqs
+    assert not context._removed_seqs

@@ -854,24 +854,33 @@ class SimpleContextManager:
     def _measured_budget_decision(
         self, envelope: dict[str, Any]
     ) -> tuple[int, int, int, str] | None:
-        """Validate the additive native-count fields or report unavailability.
+        """Validate old hard-safety fields and additive native-count fields.
 
         A non-dictionary callback envelope is a broken capability contract, not
         an unavailable measurement.  Missing/malformed *advertised*
         measurement, however, is explicitly an unavailable count so an older
-        provider can retain its compatibility path.
+        provider can retain its compatibility path.  The pre-existing
+        estimated-input/limit pair remains mandatory whenever a decision is
+        supplied, regardless of measurement availability.
         """
         decision = envelope.get("budget_decision")
         if decision is None:
             return None
         if not isinstance(decision, dict):
             raise TypeError("count_view returned a non-dictionary budget_decision")
+        estimated = decision.get("estimated_input_tokens")
+        limit = decision.get("input_limit_tokens")
+        if not self._is_nonnegative_int(estimated) or not self._is_nonnegative_int(
+            limit
+        ):
+            raise TypeError(
+                "count_view budget_decision requires nonnegative integer "
+                "estimated_input_tokens and input_limit_tokens"
+            )
         measurement = decision.get("measurement")
         if not isinstance(measurement, dict):
             return None
         count = measurement.get("input_tokens")
-        estimated = decision.get("estimated_input_tokens")
-        limit = decision.get("input_limit_tokens")
         if (
             measurement.get("kind") != "provider_count"
             or not isinstance(measurement.get("source"), str)
@@ -883,6 +892,14 @@ class SimpleContextManager:
         ):
             return None
         return count, estimated, limit, measurement["source"]
+
+    def _measured_hard_oversize(self, envelope: dict[str, Any]) -> bool:
+        """Whether a validated callback envelope exceeds its old hard limit."""
+        decision = envelope.get("budget_decision")
+        return (
+            isinstance(decision, dict)
+            and decision["estimated_input_tokens"] > decision["input_limit_tokens"]
+        )
 
     async def _count_measured_view(
         self, count_view: Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]],
@@ -900,7 +917,10 @@ class SimpleContextManager:
         return public_view, envelope, self._measured_budget_decision(envelope)
 
     def _measured_apply_rung(
-        self, rung: int, view: list[dict[str, Any]]
+        self,
+        rung: int,
+        view: list[dict[str, Any]],
+        developer_seqs: set[int],
     ) -> tuple[list[dict[str, Any]], bool]:
         """Apply one existing legal compaction rung without local success claims."""
         systems = [dict(msg) for msg in view if msg.get("role") == "system"]
@@ -950,6 +970,7 @@ class SimpleContextManager:
                 -1,  # exhaust legal candidates; count_view decides success
                 protected_recent=protection,
                 system_tokens=self._estimate_tokens(systems),
+                additional_protected_seqs=developer_seqs,
             )
         elif rung == 4:
             truncate(
@@ -973,7 +994,7 @@ class SimpleContextManager:
                 first = working[first_user]
                 reduced = self._stub_user_message(first)
                 if (
-                    not self._is_request_protected(first)
+                    not self._is_request_protected(first, developer_seqs)
                     and not _is_human_message(first)
                     and not first.get("_stubbed")
                     and reduced is not first
@@ -986,7 +1007,7 @@ class SimpleContextManager:
                     index >= protected_boundary
                     or index == last_user
                     or not message.get("_stubbed")
-                    or self._is_request_protected(message)
+                    or self._is_request_protected(message, developer_seqs)
                 ):
                     continue
                 self._record_removed(message)
@@ -1093,6 +1114,12 @@ class SimpleContextManager:
             else:
                 working = list(self.messages)
 
+            developer_seqs = {
+                seq
+                for message in working
+                if message.get("role") == "developer"
+                and (seq := self._extract_seq(message)) is not None
+            }
             self._request_protected_seqs = self._protected_sequences(working)
             budget = self._calculate_budget(None, provider)
             if self.compaction_notice_enabled:
@@ -1111,13 +1138,19 @@ class SimpleContextManager:
             initial = [
                 *[dict(message) for message in working if message.get("role") == "system"],
                 *self._apply_sticky_decisions(
-                    [message for message in working if message.get("role") != "system"]
+                    [message for message in working if message.get("role") != "system"],
+                    additional_protected_seqs=developer_seqs,
                 ),
             ]
             initial_view, initial_attempt, initial_measurement = await self._count_measured_view(
                 count_view, initial
             )
             if initial_measurement is None:
+                if self._measured_hard_oversize(initial_attempt):
+                    raise ContextLengthError(
+                        "Context cannot fit protected content within the provider "
+                        "input limit."
+                    )
                 # Native count availability is dynamic.  Preserve the old
                 # actual-meter/estimate behavior from this already-created
                 # snapshot; never call the factory or replay loop overlays.
@@ -1132,7 +1165,11 @@ class SimpleContextManager:
                     transaction = _MeasuredViewTransaction(self, snapshot=cycle_snapshot)
                     self._defer_compaction_delivery = True
                     try:
-                        fallback = await self._compact_ephemeral(effective_budget, working)
+                        fallback = await self._compact_ephemeral(
+                            effective_budget,
+                            working,
+                            additional_protected_seqs=developer_seqs,
+                        )
                     finally:
                         self._defer_compaction_delivery = False
                     changed = (
@@ -1141,13 +1178,10 @@ class SimpleContextManager:
                         self._stubbed_seqs,
                     ) != cycle_snapshot[:3]
                     if changed:
-                        fallback_view, fallback_attempt, fallback_measurement = (
+                        fallback_view, fallback_attempt, _fallback_measurement = (
                             await self._count_measured_view(count_view, fallback)
                         )
-                        if (
-                            fallback_measurement is not None
-                            and fallback_measurement[1] > fallback_measurement[2]
-                        ):
+                        if self._measured_hard_oversize(fallback_attempt):
                             transaction.rollback()
                             raise ContextLengthError(
                                 "Context cannot fit protected content within the "
@@ -1181,6 +1215,7 @@ class SimpleContextManager:
                 }
 
             before, estimated, limit, measurement_source = initial_measurement
+            known_hard_oversize = estimated > limit
             needs_compaction = before >= trigger or estimated > limit
             if not needs_compaction:
                 return {
@@ -1205,7 +1240,9 @@ class SimpleContextManager:
             changed_any = False
             last_changed_rung = 0
             for rung in range(1, 9):
-                candidate, changed = self._measured_apply_rung(rung, candidate)
+                candidate, changed = self._measured_apply_rung(
+                    rung, candidate, developer_seqs
+                )
                 if not changed:
                     continue
                 changed_any = True
@@ -1230,8 +1267,12 @@ class SimpleContextManager:
                 )
                 count_calls += 1
                 if final_measurement is None:
+                    known_hard_oversize = (
+                        known_hard_oversize
+                        or self._measured_hard_oversize(final_attempt)
+                    )
                     transaction.rollback()
-                    if estimated > limit:
+                    if known_hard_oversize:
                         raise ContextLengthError(
                             "Context cannot fit protected content within the provider "
                             "input limit after its recount became unavailable."
@@ -1249,6 +1290,7 @@ class SimpleContextManager:
                         "transaction": None,
                     }
                 measured_after, estimated_after, limit_after, measured_source = final_measurement
+                known_hard_oversize = known_hard_oversize or estimated_after > limit_after
                 if measured_after <= target and estimated_after <= limit_after:
                     self._stage_measured_stats(
                         initial_view=initial,
@@ -1355,8 +1397,19 @@ class SimpleContextManager:
             raise ValueError("Requested retained injection is not in admitted history")
         return {seq for msg in protected if (seq := self._extract_seq(msg)) is not None}
 
-    def _is_request_protected(self, msg: dict[str, Any]) -> bool:
-        return self._extract_seq(msg) in self._request_protected_seqs
+    def _is_request_protected(
+        self,
+        msg: dict[str, Any],
+        additional_protected_seqs: set[int] | None = None,
+    ) -> bool:
+        seq = self._extract_seq(msg)
+        return (
+            seq in self._request_protected_seqs
+            or (
+                additional_protected_seqs is not None
+                and seq in additional_protected_seqs
+            )
+        )
 
     def _check_retained_budget(
         self, messages: list[dict[str, Any]], budget: int
@@ -1913,7 +1966,9 @@ class SimpleContextManager:
             self._stubbed_seqs.add(seq)
 
     def _apply_sticky_decisions(
-        self, messages: list[dict[str, Any]]
+        self,
+        messages: list[dict[str, Any]],
+        additional_protected_seqs: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """Cheaply (O(n), no search) re-apply every previously-recorded
         compaction decision to a fresh copy of `messages`.
@@ -1935,7 +1990,7 @@ class SimpleContextManager:
         result: list[dict[str, Any]] = []
         for msg in messages:
             seq = self._extract_seq(msg)
-            if self._is_request_protected(msg):
+            if self._is_request_protected(msg, additional_protected_seqs):
                 result.append(dict(msg))
                 continue
             if seq is not None and seq in self._removed_seqs:
@@ -1949,7 +2004,10 @@ class SimpleContextManager:
         return result
 
     async def _compact_ephemeral(
-        self, budget: int, source_messages: list[dict[str, Any]] | None = None
+        self,
+        budget: int,
+        source_messages: list[dict[str, Any]] | None = None,
+        additional_protected_seqs: set[int] | None = None,
     ) -> list[dict[str, Any]]:
         """
         Compact the context EPHEMERALLY using progressive interleaved strategy.
@@ -2017,7 +2075,10 @@ class SimpleContextManager:
         # escalation has happened: deterministic given the same input messages,
         # so it reproduces exactly what was returned last time for anything not
         # newly appended -- which is what keeps the shared prefix byte-stable.
-        working_messages = self._apply_sticky_decisions(non_system_messages)
+        working_messages = self._apply_sticky_decisions(
+            non_system_messages,
+            additional_protected_seqs=additional_protected_seqs,
+        )
 
         # === UNITS CONVENTION: TOTAL vs TOTAL, everywhere in this path ===
         #
@@ -2182,6 +2243,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level3_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -2248,6 +2310,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level5_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -2311,6 +2374,7 @@ class SimpleContextManager:
                 target_tokens,
                 protected_recent=level7_protection,
                 system_tokens=system_tokens,
+                additional_protected_seqs=additional_protected_seqs,
             )
         )
         total_removed += removed
@@ -2341,7 +2405,9 @@ class SimpleContextManager:
             if (
                 first_user_idx is not None
                 and first_user_idx != last_user_idx
-                and not self._is_request_protected(working_messages[first_user_idx])
+                and not self._is_request_protected(
+                    working_messages[first_user_idx], additional_protected_seqs
+                )
                 and not _is_human_message(working_messages[first_user_idx])
             ):
                 first_msg = working_messages[first_user_idx]
@@ -2371,7 +2437,7 @@ class SimpleContextManager:
                     if msg.get("_stubbed")
                     and i < protected_boundary  # Outside protected recent zone
                     and i != last_user_idx  # Never remove last user message
-                    and not self._is_request_protected(msg)
+                    and not self._is_request_protected(msg, additional_protected_seqs)
                 ]
 
                 stubs_removed = 0
@@ -2510,6 +2576,7 @@ class SimpleContextManager:
         target_tokens: int,
         protected_recent: float,
         system_tokens: int,
+        additional_protected_seqs: set[int] | None = None,
     ) -> tuple[list[dict[str, Any]], int, int, int]:
         """
         Remove oldest messages with specified protection level.
@@ -2565,7 +2632,9 @@ class SimpleContextManager:
             )
 
         protected_indices.update(
-            i for i, msg in enumerate(messages) if self._is_request_protected(msg)
+            i
+            for i, msg in enumerate(messages)
+            if self._is_request_protected(msg, additional_protected_seqs)
         )
         if first_user_idx is not None:
             protected_indices.add(first_user_idx)
