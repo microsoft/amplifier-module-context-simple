@@ -3261,6 +3261,10 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
 class _MeasuredViewTransaction:
     """Idempotent commit/rollback boundary for staged measured compaction."""
 
+    _OPEN = "open"
+    _COMMITTED = "committed"
+    _ROLLED_BACK = "rolled_back"
+
     def __init__(
         self,
         context: SimpleContextManager,
@@ -3276,12 +3280,19 @@ class _MeasuredViewTransaction:
             context._last_compaction_stats,
             context._last_token_meter_stats,
         )
-        self._terminal = False
+        self._state = self._OPEN
 
-    async def commit(self) -> None:
-        """Accept the selected candidate immediately before Loop dispatch."""
-        if self._terminal:
-            return
+    async def commit(self, *, is_cancelled: Callable[[], bool] | None = None) -> bool:
+        """Accept the selected candidate immediately before Loop dispatch.
+
+        Event delivery remains part of the open transaction.  A caller can
+        therefore veto a candidate after the await, while its snapshot is
+        still available to rollback.
+        """
+        if self._state == self._COMMITTED:
+            return True
+        if self._state == self._ROLLED_BACK:
+            return False
         if self._context._hooks is not None and self._context._last_compaction_stats:
             try:
                 await self._context._hooks.emit(
@@ -3289,14 +3300,19 @@ class _MeasuredViewTransaction:
                 )
             except Exception as error:
                 logger.warning(f"Could not emit measured compaction event: {error}")
-        # Keep rollback possible while event delivery is awaitable.  In
-        # particular, cancellation here means Loop never dispatches and its
-        # finally block must restore the staged decisions.
-        self._terminal = True
+        if self._state != self._OPEN:
+            return False
+        if is_cancelled is not None and is_cancelled():
+            self.rollback()
+            return False
+        if self._state != self._OPEN:
+            return False
+        self._state = self._COMMITTED
+        return True
 
     def rollback(self) -> None:
         """Restore pre-candidate state unless the transaction was committed."""
-        if self._terminal:
+        if self._state != self._OPEN:
             return
         (
             self._context._removed_seqs,
@@ -3306,4 +3322,4 @@ class _MeasuredViewTransaction:
             self._context._last_compaction_stats,
             self._context._last_token_meter_stats,
         ) = self._snapshot
-        self._terminal = True
+        self._state = self._ROLLED_BACK

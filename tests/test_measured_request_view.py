@@ -31,6 +31,34 @@ def _decision(count, *, estimated=None, limit=1_000):
     }
 
 
+async def _staged_transaction(*, hooks=None):
+    """Create a measured candidate whose staged state needs a transaction."""
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+        hooks=hooks,
+    )
+    await context.add_message({"role": "user", "content": "first"})
+    for _ in range(4):
+        await context.add_message({"role": "tool", "content": "x" * 800})
+    await context.add_message({"role": "user", "content": "last"})
+
+    async def count_view(view):
+        count = 400 if any(message.get("_truncated") for message in view) else 900
+        return {"dispatch": object(), "budget_decision": _decision(count)}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+    assert result["transaction"] is not None
+    assert context._truncated_seqs
+    return context, result["transaction"]
+
+
 @pytest.mark.asyncio
 async def test_measured_capability_is_actual_mode_only_and_foreground_is_always_additive():
     estimate = _Coordinator()
@@ -271,6 +299,90 @@ async def test_cancellation_during_commit_leaves_staged_decisions_rollbackable()
         await task
     release.set()
     result["transaction"].rollback()
+    assert not context._truncated_seqs
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_commit_veto_after_awaited_event_restores_the_snapshot():
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled = False
+
+    class Hooks:
+        async def emit(self, _event, _data):
+            started.set()
+            await release.wait()
+
+    context, transaction = await _staged_transaction(hooks=Hooks())
+    task = asyncio.create_task(
+        transaction.commit(is_cancelled=lambda: cancelled)
+    )
+    await asyncio.wait_for(started.wait(), timeout=1)
+    cancelled = True
+    release.set()
+
+    assert await task is False
+    assert not context._truncated_seqs
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_concurrent_rollback_during_event_commit_wins():
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    class Hooks:
+        async def emit(self, _event, _data):
+            started.set()
+            await release.wait()
+
+    context, transaction = await _staged_transaction(hooks=Hooks())
+    task = asyncio.create_task(transaction.commit())
+    await asyncio.wait_for(started.wait(), timeout=1)
+    transaction.rollback()
+    release.set()
+
+    assert await task is False
+    assert not context._truncated_seqs
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_transaction_terminal_commit_and_rollback_results_are_idempotent():
+    committed_context, committed = await _staged_transaction()
+    assert await committed.commit() is True
+    committed.rollback()
+    assert await committed.commit() is True
+    assert committed_context._truncated_seqs
+
+    rolled_back_context, rolled_back = await _staged_transaction()
+    rolled_back.rollback()
+    rolled_back.rollback()
+    assert await rolled_back.commit() is False
+    assert not rolled_back_context._truncated_seqs
+    assert rolled_back_context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_commit_with_default_cancellation_predicate_accepts_candidate():
+    context, transaction = await _staged_transaction()
+
+    assert await transaction.commit(is_cancelled=None) is True
+    assert context._truncated_seqs
+
+
+@pytest.mark.asyncio
+async def test_commit_predicate_error_propagates_while_snapshot_is_rollbackable():
+    context, transaction = await _staged_transaction()
+
+    def predicate_error():
+        raise TypeError("predicate failed")
+
+    with pytest.raises(TypeError, match="predicate failed"):
+        await transaction.commit(is_cancelled=predicate_error)
+
+    transaction.rollback()
     assert not context._truncated_seqs
     assert context._last_compaction_stats is None
 
