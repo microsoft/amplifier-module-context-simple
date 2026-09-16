@@ -2404,9 +2404,8 @@ class SimpleContextManager:
         removed = stats.get("messages_removed", 0)
         stubbed = stats.get("user_messages_stubbed", 0)
         truncated = stats.get("messages_truncated", 0)
-        old_tokens = stats.get("before_tokens", 0)
-        new_tokens = stats.get("after_tokens", 0)
-        target_tokens = stats.get("target_tokens", 0)
+        # Local chars/4 statistics are not provider input counts; keep them
+        # in diagnostic stats rather than presenting them as tokens to the model.
         protected_recent = stats.get("protected_recent", 0.0)
         protected_tool_results = stats.get("protected_tool_results", 0)
 
@@ -2417,7 +2416,6 @@ Compaction summary:
 - Strategy level: {level}/8
 - Messages: {old_count} → {new_count} ({removed} removed, {stubbed} stubbed)
 - Tool results: {truncated} truncated
-- Tokens: {old_tokens:,} → {new_tokens:,} (target: {target_tokens:,})
 
 What was preserved:
 - All system messages (your instructions and identity)
