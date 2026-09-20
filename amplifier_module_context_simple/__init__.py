@@ -916,6 +916,39 @@ class SimpleContextManager:
             raise TypeError("count_view must return {dispatch, budget_decision}")
         return public_view, envelope, self._measured_budget_decision(envelope)
 
+    async def _fit_measured_output(
+        self,
+        fit_output: Callable[
+            [list[dict[str, Any]], dict[str, Any]],
+            Awaitable[dict[str, Any] | None],
+        ],
+        view: list[dict[str, Any]],
+        attempt: dict[str, Any],
+    ) -> tuple[dict[str, Any], tuple[int, int, int, str], int] | None:
+        """Ask the request owner for a bounded output-reserve fit."""
+        fitted = await fit_output(view, attempt)
+        if fitted is None:
+            return None
+        if not isinstance(fitted, dict) or "dispatch" not in fitted:
+            raise TypeError("fit_output must return {dispatch, budget_decision, count_calls}")
+        extra_count_calls = fitted.get("count_calls")
+        if (
+            not isinstance(extra_count_calls, int)
+            or isinstance(extra_count_calls, bool)
+            or extra_count_calls <= 0
+        ):
+            raise TypeError("fit_output count_calls must be a positive integer")
+        measurement = self._measured_budget_decision(fitted)
+        if measurement is None:
+            raise TypeError("fit_output must return a usable provider_count measurement")
+        _, estimated, limit, _ = measurement
+        if estimated > limit:
+            raise ContextLengthError(
+                "Context cannot fit protected content within the provider input "
+                "limit; required content was not discarded."
+            )
+        return fitted, measurement, extra_count_calls
+
     def _measured_apply_rung(
         self,
         rung: int,
@@ -1072,13 +1105,20 @@ class SimpleContextManager:
         provider: Any,
         retain_contents: list[str],
         count_view: Callable[[list[dict[str, Any]]], Awaitable[dict[str, Any]]],
+        fit_output: Callable[
+            [list[dict[str, Any]], dict[str, Any]],
+            Awaitable[dict[str, Any] | None],
+        ]
+        | None = None,
     ) -> dict[str, Any]:
         """Build and reduce one complete request using provider-native counts.
 
         The loop owns request construction.  Context owns only canonical
         history, its one materialized policy snapshot, and the established
         eight legal reduction rungs.  The returned envelope is the exact
-        callback object that counted the final provider-facing request.
+        callback object that counted the final provider-facing request. After
+        all eight rungs, an optional request-owner callback may reduce only
+        its output reserve and return a newly counted envelope.
         """
         if self.token_meter != TOKEN_METER_ACTUAL:
             raise RuntimeError("measured request views require token_meter='actual'")
@@ -1320,6 +1360,49 @@ class SimpleContextManager:
 
             measured_after, estimated_after, limit_after, measured_source = final_measurement
             if estimated_after > limit_after:
+                if fit_output is not None:
+                    fitted = await self._fit_measured_output(
+                        fit_output, final_view, final_attempt
+                    )
+                    if fitted is not None:
+                        fitted_attempt, fitted_measurement, extra_count_calls = fitted
+                        (
+                            fitted_after,
+                            _fitted_estimated,
+                            _fitted_limit,
+                            fitted_source,
+                        ) = fitted_measurement
+                        fitted_count_calls = count_calls + extra_count_calls
+                        if changed_any:
+                            self._stage_measured_stats(
+                                initial_view=initial,
+                                final_view=candidate,
+                                strategy_level=last_changed_rung,
+                                budget=effective_budget,
+                                measured_before=before,
+                                measured_after=fitted_after,
+                                measurement_source=fitted_source,
+                                trigger=trigger,
+                                target=target,
+                                outcome="reduced_output",
+                                count_calls=fitted_count_calls,
+                            )
+                        else:
+                            # Output relief alone creates no sticky context state.
+                            transaction.rollback()
+                            transaction = None
+                        return {
+                            "base_view": final_view,
+                            "final_attempt": fitted_attempt,
+                            "outcome": "reduced_output",
+                            "measured_before": before,
+                            "measured_after": fitted_after,
+                            "policy_budget": effective_budget,
+                            "trigger": trigger,
+                            "target": target,
+                            "count_calls": fitted_count_calls,
+                            "transaction": transaction,
+                        }
                 transaction.rollback()
                 raise ContextLengthError(
                     "Context cannot fit protected content within the provider input "
