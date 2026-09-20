@@ -746,3 +746,244 @@ async def test_late_known_hard_oversize_fails_closed_when_next_recount_is_unavai
     assert calls == 3
     assert not context._truncated_seqs
     assert not context._removed_seqs
+
+
+async def _hard_oversize_context(*, reducible=False):
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_tool_results=0,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await context.add_message({"role": "user", "content": "first"})
+    if reducible:
+        for index in range(4):
+            await context.add_message(
+                {"role": "tool", "content": "x" * 800, "name": str(index)}
+            )
+        await context.add_message({"role": "user", "content": "last"})
+    return context
+
+
+@pytest.mark.asyncio
+async def test_output_fit_is_opt_in_and_preserves_existing_terminal_failure():
+    context = await _hard_oversize_context()
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+        }
+
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+
+    assert calls == 1
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_output_fit_returns_exact_fitted_attempt_without_staging_noop_context():
+    context = await _hard_oversize_context()
+    canonical = await context.get_messages()
+    old_stats = {"old": "stats"}
+    context._last_compaction_stats = old_stats
+    counted_attempt = {
+        "dispatch": {"output_cap": 64_000},
+        "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+    }
+    fitted_attempt = {
+        "dispatch": {"output_cap": 32_000},
+        "budget_decision": _decision(900, estimated=900, limit=1_000),
+        "count_calls": 2,
+    }
+    received = {}
+
+    async def count_view(_view):
+        return counted_attempt
+
+    async def fit_output(view, attempt):
+        received["view"] = view
+        received["attempt"] = attempt
+        return fitted_attempt
+
+    result = await context.get_measured_request_view(
+        provider=None,
+        retain_contents=[],
+        count_view=count_view,
+        fit_output=fit_output,
+    )
+
+    assert result["outcome"] == "reduced_output"
+    assert result["base_view"] is received["view"]
+    assert received["attempt"] is counted_attempt
+    assert result["final_attempt"] is fitted_attempt
+    assert result["measured_before"] == result["measured_after"] == 900
+    assert result["count_calls"] == 3
+    assert result["transaction"] is None
+    assert await context.get_messages() == canonical
+    assert context._last_compaction_stats is old_stats
+
+
+@pytest.mark.asyncio
+async def test_output_fit_none_rolls_back_and_keeps_terminal_failure():
+    context = await _hard_oversize_context()
+
+    async def count_view(_view):
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+        }
+
+    async def fit_output(_view, _attempt):
+        return None
+
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await context.get_measured_request_view(
+            provider=None,
+            retain_contents=[],
+            count_view=count_view,
+            fit_output=fit_output,
+        )
+
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("fitted", "error"),
+    [
+        (
+            {
+                "budget_decision": _decision(900, estimated=900, limit=1_000),
+                "count_calls": 1,
+            },
+            TypeError,
+        ),
+        (
+            {
+                "dispatch": object(),
+                "budget_decision": _decision(900, estimated=900, limit=1_000),
+                "count_calls": True,
+            },
+            TypeError,
+        ),
+        ({"dispatch": object(), "budget_decision": None, "count_calls": 1}, TypeError),
+        (
+            {
+                "dispatch": object(),
+                "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+                "count_calls": 1,
+            },
+            ContextLengthError,
+        ),
+    ],
+)
+async def test_output_fit_rejects_invalid_or_still_oversized_results(fitted, error):
+    context = await _hard_oversize_context()
+
+    async def count_view(_view):
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+        }
+
+    async def fit_output(_view, _attempt):
+        return fitted
+
+    with pytest.raises(error):
+        await context.get_measured_request_view(
+            provider=None,
+            retain_contents=[],
+            count_view=count_view,
+            fit_output=fit_output,
+        )
+
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("error", [RuntimeError("fit failed"), asyncio.CancelledError()])
+async def test_output_fit_errors_and_cancellation_rollback_staged_compaction(error):
+    context = await _hard_oversize_context(reducible=True)
+
+    async def count_view(_view):
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+        }
+
+    async def fit_output(_view, _attempt):
+        raise error
+
+    with pytest.raises(type(error)):
+        await context.get_measured_request_view(
+            provider=None,
+            retain_contents=[],
+            count_view=count_view,
+            fit_output=fit_output,
+        )
+
+    assert not context._removed_seqs
+    assert not context._truncated_seqs
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_output_fit_stages_changed_compaction_until_rollback_or_commit():
+    async def build_candidate():
+        context = await _hard_oversize_context(reducible=True)
+        counted_views = []
+        raw_attempts = []
+        fit_attempt = {
+            "dispatch": {"output_cap": 32_000},
+            "budget_decision": _decision(900, estimated=900, limit=1_000),
+            "count_calls": 2,
+        }
+
+        async def count_view(view):
+            counted_views.append(view)
+            attempt = {
+                "dispatch": {"output_cap": 64_000},
+                "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+            }
+            raw_attempts.append(attempt)
+            return attempt
+
+        async def fit_output(view, attempt):
+            assert view is counted_views[-1]
+            assert attempt is raw_attempts[-1]
+            return fit_attempt
+
+        result = await context.get_measured_request_view(
+            provider=None,
+            retain_contents=[],
+            count_view=count_view,
+            fit_output=fit_output,
+        )
+        assert result["outcome"] == "reduced_output"
+        assert result["final_attempt"] is fit_attempt
+        assert result["count_calls"] == len(counted_views) + 2
+        assert result["transaction"] is not None
+        assert context._last_compaction_stats["outcome"] == "reduced_output"
+        assert (
+            context._last_compaction_stats["count_calls"] == result["count_calls"]
+        )
+        return context, result
+
+    rolled_back_context, rolled_back = await build_candidate()
+    rolled_back["transaction"].rollback()
+    assert not rolled_back_context._removed_seqs
+    assert not rolled_back_context._truncated_seqs
+    assert rolled_back_context._last_compaction_stats is None
+
+    committed_context, committed = await build_candidate()
+    assert await committed["transaction"].commit()
+    assert committed_context._last_compaction_stats["outcome"] == "reduced_output"

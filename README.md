@@ -374,6 +374,26 @@ returned transaction is committed by the orchestrator immediately before it
 dispatches the already-counted request; otherwise it rolls back staged sticky
 decisions.
 
+After all eight legal Context reduction rungs, a compatible orchestrator may
+optionally supply `fit_output(view, attempt)`. Context calls it only when the
+final provider-derived hard input estimate still exceeds the limit, passing
+the exact notice-inclusive public base view and the exact final counted
+attempt. The
+orchestrator owns any bounded output-cap ladder, request cloning, reminders,
+and options; a successful result returns a newly counted
+`{dispatch, budget_decision, count_calls}` envelope. It must carry a usable
+provider measurement, a hard-safe input estimate, and a positive count-call
+total. `None` means no legal output fit, so Context preserves the existing
+fail-closed `ContextLengthError` and rolls back staged decisions.
+
+This adds no Context protection relaxation and never retries generation. The
+Context ladder performs at most nine base counts (the original candidate plus
+eight legal rungs); the compatible Loop bounds output fitting to at most six
+additional counts. Output relief is reported as `reduced_output`, never as
+input-compaction target success. It helps only when the provider's input
+allowance grows with a smaller output reserve. Independent input ceilings
+remain binding; bounded recounts cannot make oversized required input fit.
+
 ### Legacy actual-meter path
 
 Only the **escalation gate** (whether to compact at all, and whether a
