@@ -428,13 +428,14 @@ a corresponding quality regression.
   `amplifier_core.llm_errors.ContextLengthError` for fail-loud request retention.
   Core remains provided by the host, not installed as a runtime module dependency.
 
-Development and CI pin the released `amplifier-core==1.6.1` package in `uv.lock`.
-A Git `main` source mapping can retain an older commit in the lockfile; the
-release pin ensures tests exercise the Core API required by this module.
+Development and CI resolve Core from canonical `main`. Refresh that dependency
+before testing so an older lock resolution does not silently select an old Core.
+The lock records the exact revision tested; it is evidence for that environment,
+not a fixed source declaration for future validation.
 
 ```bash
-uv sync --locked --all-extras --dev
-uv run --locked pytest -q
+uv sync --all-extras --dev --upgrade-package amplifier-core
+uv run --no-sync pytest -q
 ```
 
 ## Contributing

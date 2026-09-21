@@ -62,11 +62,11 @@ jobs:
           python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
-        run: uv sync --locked --all-extras --dev
+        run: uv sync --all-extras --dev --upgrade-package amplifier-core
 
-      - name: Verify released Core API
+      - name: Verify current Core API and record its resolved revision
         run: |
-          uv run --locked python -c "from importlib.metadata import version; from amplifier_core.llm_errors import ContextLengthError; assert version('amplifier-core') == '1.6.1'"
+          uv run --no-sync python -c 'import json; from importlib.metadata import distribution; from amplifier_core.llm_errors import ContextLengthError; vcs = json.loads(distribution("amplifier-core").read_text("direct_url.json"))["vcs_info"]; assert vcs["requested_revision"] == "main"; print("Resolved Core", vcs["commit_id"])'
 
       # No API key placeholder here, unlike provider-openai's CI. Measured:
       # with ANTHROPIC_API_KEY/OPENAI_API_KEY unset, the suite is
@@ -76,4 +76,4 @@ jobs:
       # No `-m "not live"` deselection either: this repo registers no `live`
       # marker and has no network-dependent tests.
       - name: Run test suite
-        run: uv run --locked pytest -q
+        run: uv run --no-sync pytest -q
