@@ -48,6 +48,8 @@ from typing import Any
 from amplifier_core import ModuleCoordinator, TextBlock
 from amplifier_core.llm_errors import ContextLengthError
 
+from ._text_estimate import estimate_messages
+
 logger = logging.getLogger(__name__)
 
 DEFAULT_MAX_TOOL_RESULT_BYTES = 128 * 1024
@@ -1640,6 +1642,11 @@ class SimpleContextManager:
             "source": meter_source,
             "used_tokens": token_count,
             "estimated_tokens": estimated_tokens,
+            "estimate_scope": (
+                "text_only"
+                if estimate_messages(sticky_view).has_unmeasured_images
+                else "all_text"
+            ),
             "measured_tokens": self._last_measured_prompt_tokens,
             "foreground_usage_stale": self._foreground_usage_stale,
             "budget": effective_budget,
@@ -1907,7 +1914,7 @@ class SimpleContextManager:
         """Return (token_count, source, estimated_tokens) used to evaluate
         the compaction trigger this call.
 
-        `estimated_tokens` is ALWAYS the len(str)//4 heuristic over
+        `estimated_tokens` is ALWAYS the text-only chars/4 heuristic over
         `working_messages` (see _estimate_tokens) -- computed unconditionally
         so the estimator-vs-real-usage drift this meter exists to close is
         observable via `_last_token_meter_stats` regardless of mode.
@@ -1917,7 +1924,7 @@ class SimpleContextManager:
         - token_meter == "estimate" (default): ALWAYS `estimated_tokens`,
           source "estimate" -- regardless of whether a real measurement is
           available. This is what keeps the default mode's behavior
-          byte-identical to before this meter existed.
+          independent of prior provider measurements.
         - token_meter == "actual": the last real usage recorded from
           `llm:response` (input_tokens + cache_write_tokens -- see
           `_on_llm_response`), source "measured", if one has arrived this
@@ -2642,9 +2649,9 @@ class SimpleContextManager:
                     # total-vs-total after this first mutation replaces the
                     # caller-supplied (already total) seed value.
                     true_total = self._estimate_tokens(messages) + system_tokens
-                old_len = len(str(msg)) // 4
+                old_len = self._estimate_tokens([msg])
                 messages[i] = self._truncate_tool_result(msg)
-                new_len = len(str(messages[i])) // 4
+                new_len = self._estimate_tokens([messages[i]])
                 true_total += new_len - old_len
                 truncated += 1
                 current_tokens = true_total
@@ -2758,7 +2765,7 @@ class SimpleContextManager:
         # `messages` is constant here, the base total only needs computing
         # once, and the removed-token total only needs an O(1) delta per
         # newly-removed index.
-        token_lens = [len(str(msg)) // 4 for msg in messages]
+        token_lens = [self._estimate_tokens([msg]) for msg in messages]
         tool_call_id_to_indices: dict[str, list[int]] = {}
         for idx, m in enumerate(messages):
             tcid = m.get("tool_call_id")
@@ -3337,8 +3344,8 @@ Note: This compaction is ephemeral (affects only this request). Full history is 
         return self.max_tokens_fallback
 
     def _estimate_tokens(self, messages: list[dict[str, Any]]) -> int:
-        """Rough token estimation (chars / 4)."""
-        return sum(len(str(msg)) // 4 for msg in messages)
+        """Text estimate; image cost is unknown without a provider count."""
+        return estimate_messages(messages).tokens
 
 
 class _MeasuredViewTransaction:
