@@ -128,11 +128,83 @@ def _carries_loaded_tool_state(msg: dict[str, Any]) -> bool:
     return any(meta.get(key) for key in LOADED_TOOL_STATE_METADATA_KEYS)
 
 
+_STRUCTURED_TOOL_CALL_TYPES = frozenset({"tool_call", "tool_use"})
+_STRUCTURED_TOOL_RESULT_TYPES = frozenset({"tool_result"})
+_SIGNED_THINKING_KEYS = frozenset(
+    {"thinking", "redacted_thinking", "thinking_block"}
+)
+
+
+def _content_blocks(msg: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return recognized structured content blocks without trusting other shapes."""
+    content = msg.get("content")
+    if not isinstance(content, list):
+        return []
+    return [block for block in content if isinstance(block, dict)]
+
+
+def _tool_call_ids(msg: dict[str, Any]) -> set[str]:
+    """Return IDs declared by legacy or structured tool-call representations."""
+    ids: set[str] = set()
+    tool_calls = msg.get("tool_calls")
+    if isinstance(tool_calls, list):
+        for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                continue
+            tool_call_id = tool_call.get("id") or tool_call.get("tool_call_id")
+            if isinstance(tool_call_id, str) and tool_call_id:
+                ids.add(tool_call_id)
+    for block in _content_blocks(msg):
+        if block.get("type") not in _STRUCTURED_TOOL_CALL_TYPES:
+            continue
+        tool_call_id = (
+            block.get("id") or block.get("tool_call_id") or block.get("tool_use_id")
+        )
+        if isinstance(tool_call_id, str) and tool_call_id:
+            ids.add(tool_call_id)
+    return ids
+
+
+def _has_tool_calls(msg: dict[str, Any]) -> bool:
+    """Whether a message declares legacy or structured tool calls."""
+    return bool(msg.get("tool_calls")) or any(
+        block.get("type") in _STRUCTURED_TOOL_CALL_TYPES
+        for block in _content_blocks(msg)
+    )
+
+
+def _tool_result_ids(msg: dict[str, Any]) -> set[str]:
+    """Return IDs referenced by legacy or structured tool-result representations."""
+    ids: set[str] = set()
+    for key in ("tool_call_id", "tool_use_id"):
+        tool_call_id = msg.get(key)
+        if isinstance(tool_call_id, str) and tool_call_id:
+            ids.add(tool_call_id)
+    for block in _content_blocks(msg):
+        if block.get("type") not in _STRUCTURED_TOOL_RESULT_TYPES:
+            continue
+        tool_call_id = (
+            block.get("tool_use_id") or block.get("tool_call_id") or block.get("id")
+        )
+        if isinstance(tool_call_id, str) and tool_call_id:
+            ids.add(tool_call_id)
+    return ids
+
+
+def _is_tool_result_message(msg: dict[str, Any]) -> bool:
+    """Whether a message is a legacy or structured tool result."""
+    return msg.get("role") == "tool" or any(
+        block.get("type") in _STRUCTURED_TOOL_RESULT_TYPES
+        for block in _content_blocks(msg)
+    )
+
+
 def _is_human_message(msg: dict[str, Any]) -> bool:
     """Wire role alone does not distinguish a prompt from an injection."""
     meta = msg.get("metadata") or {}
     return (
         msg.get("role") == "user"
+        and not _is_tool_result_message(msg)
         and not meta.get("ephemeral")
         and meta.get("source") not in ("hook", "context-compaction")
     )
@@ -422,6 +494,10 @@ class SimpleContextManager:
         # "estimate" mode -- see README "Real-usage token meter".
         self._last_measured_prompt_tokens: int | None = None
         self._last_token_meter_stats: dict[str, Any] | None = None
+        # Per-request count of signed-thinking blocks omitted because compaction
+        # rewrote an earlier prefix. This is intentionally observable rather
+        # than silently changing a provider-facing replay.
+        self._last_signed_thinking_blocks_stripped = 0
         # A Loop that understands foreground ownership claims this once, then
         # writes only its successful foreground response usage through the
         # recorder.  Generic llm:response remains a compatibility fallback
@@ -1519,17 +1595,14 @@ class SimpleContextManager:
         """
         trailing_result_ids: set[str] = set()
         for message in reversed(messages):
-            if message.get("role") == "tool":
-                tool_call_id = message.get("tool_call_id")
-                if tool_call_id:
-                    trailing_result_ids.add(tool_call_id)
+            if _is_tool_result_message(message):
+                trailing_result_ids.update(_tool_result_ids(message))
                 continue
-            if message.get("role") != "assistant" or not message.get("tool_calls"):
+            if message.get("role") != "assistant" or not _has_tool_calls(message):
                 return False
-            declared_ids = {
-                tool_call.get("id") or tool_call.get("tool_call_id")
-                for tool_call in message["tool_calls"]
-            }
+            declared_ids = _tool_call_ids(message)
+            if not declared_ids:
+                return True
             return bool(declared_ids - trailing_result_ids)
         return False
 
@@ -1692,6 +1765,7 @@ class SimpleContextManager:
         else:
             self._check_retained_budget(working_messages, budget)
             await self._emit_budget()
+            self._record_signed_thinking_strip_count(0)
             return self._strip_internal_metadata(working_messages)
 
         # Append compaction notice at the TAIL if enabled and level threshold met.
@@ -1742,6 +1816,10 @@ class SimpleContextManager:
         # Strip internal bookkeeping at the module boundary -- everything above
         # this point (sticky decisions, token accounting) still runs on messages
         # carrying `_seq`; only what leaves has it removed.
+        compacted, signed_thinking_blocks_stripped = (
+            self._strip_invalidated_signed_thinking(compacted, working_messages)
+        )
+        self._record_signed_thinking_strip_count(signed_thinking_blocks_stripped)
         self._check_retained_budget(compacted, budget)
         if deferred_hard_fit_stats is not None and self._hooks is not None:
             try:
@@ -1754,6 +1832,82 @@ class SimpleContextManager:
                 logger.warning(f"Could not emit compaction event: {e}")
         await self._emit_budget()
         return self._strip_internal_metadata(compacted)
+
+    def _record_signed_thinking_strip_count(self, count: int) -> None:
+        """Expose signed-thinking stripping on the per-request meter surface."""
+        self._last_signed_thinking_blocks_stripped = count
+        if self._last_token_meter_stats is not None:
+            self._last_token_meter_stats["signed_thinking_blocks_stripped"] = count
+        if self._last_compaction_stats is not None:
+            self._last_compaction_stats["signed_thinking_blocks_stripped"] = count
+
+    def _strip_invalidated_signed_thinking(
+        self,
+        view: list[dict[str, Any]],
+        source_messages: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], int]:
+        """Drop signed thinking only after compaction rewrote its prior prefix.
+
+        Canonical history remains untouched. A replay with an unchanged prefix
+        remains byte-for-byte identical; after a removal, truncation, or stub
+        changes an earlier message, a later Anthropic signature is no longer
+        valid and must not be sent back to the provider.
+        """
+        view_by_seq = {
+            seq: msg
+            for msg in view
+            if (seq := self._extract_seq(msg)) is not None
+        }
+        prefix_rewritten = False
+        rewritten_before: dict[int, bool] = {}
+        for source in source_messages:
+            seq = self._extract_seq(source)
+            if seq is None:
+                continue
+            rendered = view_by_seq.get(seq)
+            if rendered is None or rendered != source:
+                prefix_rewritten = True
+                continue
+            rewritten_before[seq] = prefix_rewritten
+
+        stripped = 0
+        safe_view: list[dict[str, Any]] = []
+        for msg in view:
+            seq = self._extract_seq(msg)
+            if seq is None or not rewritten_before.get(seq, False):
+                safe_view.append(msg)
+                continue
+            safe_message, removed_count = self._without_signed_thinking(msg)
+            safe_view.append(safe_message)
+            stripped += removed_count
+        return safe_view, stripped
+
+    @staticmethod
+    def _without_signed_thinking(msg: dict[str, Any]) -> tuple[dict[str, Any], int]:
+        """Return a copied message without provider-signed thinking blocks."""
+        removed_count = sum(1 for key in _SIGNED_THINKING_KEYS if key in msg)
+        safe_message = {
+            key: value for key, value in msg.items() if key not in _SIGNED_THINKING_KEYS
+        }
+        content = msg.get("content")
+        if isinstance(content, list):
+            safe_content = [
+                block
+                for block in content
+                if not (
+                    isinstance(block, dict) and block.get("type") in _SIGNED_THINKING_KEYS
+                )
+            ]
+            removed_count += len(content) - len(safe_content)
+            if len(safe_content) != len(content):
+                safe_message["content"] = safe_content
+        elif (
+            isinstance(content, dict)
+            and content.get("type") in _SIGNED_THINKING_KEYS
+        ):
+            safe_message["content"] = []
+            removed_count += 1
+        return safe_message if removed_count else msg, removed_count
 
     # Metadata keys that are internal bookkeeping only and must never cross
     # the module boundary into a provider-facing view. `_seq` is sticky
@@ -1851,6 +2005,7 @@ class SimpleContextManager:
         self._last_compaction_stats = None
         self._last_measured_prompt_tokens = None
         self._last_token_meter_stats = None
+        self._last_signed_thinking_blocks_stripped = 0
         # Ownership is a capability claim, not a turn-local meter value.  A
         # cleared Context must not permit utility hook traffic to take it back.
         self._foreground_usage_stale = self._foreground_usage_claimed
@@ -2689,7 +2844,9 @@ class SimpleContextManager:
 
         # Track user messages for stubbing (NEVER removal)
         user_message_indices = {
-            i for i, msg in enumerate(messages) if msg.get("role") == "user"
+            i
+            for i, msg in enumerate(messages)
+            if msg.get("role") == "user" and not _is_tool_result_message(msg)
         }
 
         # Human boundaries must not be displaced by machine user-role messages.
@@ -2739,7 +2896,7 @@ class SimpleContextManager:
         # The last N tool results are protected from removal as well as truncation.
         # Their owning assistant and sibling results are vetoed atomically below.
         tool_result_indices = [
-            i for i, msg in enumerate(messages) if msg.get("role") == "tool"
+            i for i, msg in enumerate(messages) if _is_tool_result_message(msg)
         ]
         protected_indices |= self._protected_tool_indices(tool_result_indices)
 
@@ -2768,8 +2925,7 @@ class SimpleContextManager:
         token_lens = [self._estimate_tokens([msg]) for msg in messages]
         tool_call_id_to_indices: dict[str, list[int]] = {}
         for idx, m in enumerate(messages):
-            tcid = m.get("tool_call_id")
-            if tcid:
+            for tcid in _tool_result_ids(m):
                 tool_call_id_to_indices.setdefault(tcid, []).append(idx)
 
         # Remove messages until under target, preserving tool pairs
@@ -2789,7 +2945,7 @@ class SimpleContextManager:
             newly_removed: list[int] = []
 
             # Handle tool result - must remove with its tool_use pair
-            if msg.get("role") == "tool":
+            if _is_tool_result_message(msg):
                 pair_removed, newly_removed = self._try_remove_tool_pair_from_result(
                     messages, i, protected_indices, tool_call_id_to_indices
                 )
@@ -2797,7 +2953,7 @@ class SimpleContextManager:
                     continue  # Can't remove this one, skip
 
             # Handle assistant with tool_calls - must remove with all its tool results
-            elif msg.get("role") == "assistant" and msg.get("tool_calls"):
+            elif msg.get("role") == "assistant" and _has_tool_calls(msg):
                 pair_removed, tool_result_indices = (
                     self._try_remove_tool_pair_from_assistant(
                         msg, protected_indices, tool_call_id_to_indices
@@ -2888,7 +3044,7 @@ class SimpleContextManager:
         # Find the assistant with tool_calls
         for j in range(result_idx - 1, -1, -1):
             check_msg = messages[j]
-            if check_msg.get("role") == "assistant" and check_msg.get("tool_calls"):
+            if check_msg.get("role") == "assistant" and _has_tool_calls(check_msg):
                 if j in protected_indices:
                     return False, []  # Can't remove protected assistant
 
@@ -2900,7 +3056,7 @@ class SimpleContextManager:
                 if all_removable:
                     return True, [j, *tool_result_indices]
                 return False, []
-            if check_msg.get("role") != "tool":
+            if not _is_tool_result_message(check_msg):
                 break
         return False, []
 
@@ -2940,20 +3096,21 @@ class SimpleContextManager:
         all_removable = True
         tool_result_indices = []
 
-        for tc in assistant_msg.get("tool_calls", []):
-            tc_id = tc.get("id") or tc.get("tool_call_id")
-            if tc_id:
-                result_indices = tool_call_id_to_indices.get(tc_id, [])
-                # An unanswered call must remain until its result arrives.
-                # Removing it now would make a subsequently admitted result
-                # orphaned in the provider-facing view.
-                if not result_indices:
+        declared_ids = _tool_call_ids(assistant_msg)
+        if not declared_ids:
+            return False, []
+        for tc_id in declared_ids:
+            result_indices = tool_call_id_to_indices.get(tc_id, [])
+            # An unanswered call must remain until its result arrives.
+            # Removing it now would make a subsequently admitted result
+            # orphaned in the provider-facing view.
+            if not result_indices:
+                all_removable = False
+            for k in result_indices:
+                if k in protected_indices:
                     all_removable = False
-                for k in result_indices:
-                    if k in protected_indices:
-                        all_removable = False
-                    else:
-                        tool_result_indices.append(k)
+                else:
+                    tool_result_indices.append(k)
 
         return all_removable, tool_result_indices
 
@@ -2981,8 +3138,10 @@ class SimpleContextManager:
 
         final_tokens = self._estimate_tokens(final_messages)
         system_count = len(system_messages)
-        tool_use_count = sum(1 for m in final_messages if m.get("tool_calls"))
-        tool_result_count = sum(1 for m in final_messages if m.get("role") == "tool")
+        tool_use_count = sum(1 for m in final_messages if _has_tool_calls(m))
+        tool_result_count = sum(
+            1 for m in final_messages if _is_tool_result_message(m)
+        )
 
         logger.info(
             f"Compaction complete: {old_count} → {len(final_messages)} messages, "
