@@ -1263,6 +1263,39 @@ class SimpleContextManager:
             initial_view, initial_attempt, initial_measurement = await self._count_measured_view(
                 count_view, initial
             )
+            tail_tool_call = self._tail_unanswered_tool_call_message(initial)
+            if tail_tool_call is not None and self._has_provider_thinking(tail_tool_call):
+                if self._measured_hard_oversize(initial_attempt):
+                    raise ContextLengthError(
+                        "Context cannot fit protected content within the provider "
+                        "input limit."
+                    )
+                if initial_measurement is None:
+                    return {
+                        "base_view": initial_view,
+                        "final_attempt": initial_attempt,
+                        "outcome": "measurement_unavailable",
+                        "measured_before": None,
+                        "measured_after": None,
+                        "policy_budget": effective_budget,
+                        "trigger": trigger,
+                        "target": target,
+                        "count_calls": 1,
+                        "transaction": None,
+                    }
+                before, _estimated, _limit, _measurement_source = initial_measurement
+                return {
+                    "base_view": initial_view,
+                    "final_attempt": initial_attempt,
+                    "outcome": "protected_floor",
+                    "measured_before": before,
+                    "measured_after": before,
+                    "policy_budget": effective_budget,
+                    "trigger": trigger,
+                    "target": target,
+                    "count_calls": 1,
+                    "transaction": None,
+                }
             if initial_measurement is None:
                 if self._measured_hard_oversize(initial_attempt):
                     raise ContextLengthError(
@@ -1586,8 +1619,10 @@ class SimpleContextManager:
             )
 
     @staticmethod
-    def _tail_has_unanswered_tool_calls(messages: list[dict[str, Any]]) -> bool:
-        """Return whether the trailing tool-call group is incomplete.
+    def _tail_unanswered_tool_call_message(
+        messages: list[dict[str, Any]],
+    ) -> dict[str, Any] | None:
+        """Return the assistant message owning an incomplete trailing call group.
 
         A tail can end on the assistant tool-call message itself or on one of
         several sibling tool results. A notice is safe only after every call
@@ -1599,12 +1634,25 @@ class SimpleContextManager:
                 trailing_result_ids.update(_tool_result_ids(message))
                 continue
             if message.get("role") != "assistant" or not _has_tool_calls(message):
-                return False
+                return None
             declared_ids = _tool_call_ids(message)
             if not declared_ids:
-                return True
-            return bool(declared_ids - trailing_result_ids)
-        return False
+                return message
+            return message if declared_ids - trailing_result_ids else None
+        return None
+
+    @staticmethod
+    def _has_provider_thinking(message: dict[str, Any]) -> bool:
+        """Whether an assistant message carries provider-owned thinking state."""
+        return any(key in message for key in _SIGNED_THINKING_KEYS) or any(
+            block.get("type") in _SIGNED_THINKING_KEYS
+            for block in _content_blocks(message)
+        )
+
+    @classmethod
+    def _tail_has_unanswered_tool_calls(cls, messages: list[dict[str, Any]]) -> bool:
+        """Return whether the trailing tool-call group is incomplete."""
+        return cls._tail_unanswered_tool_call_message(messages) is not None
 
     async def get_messages_for_request(
         self,
@@ -1725,6 +1773,23 @@ class SimpleContextManager:
             "budget": effective_budget,
             "ratio": (token_count / effective_budget) if effective_budget > 0 else None,
         }
+
+        # Anthropic requires provider thinking to remain present while its tool
+        # turn is unfinished. Do not rewrite its prefix and then strip that
+        # thinking: preserve the existing sticky view, or fail before sending
+        # an invalid replay. The raw provider budget deliberately excludes the
+        # optional compaction-notice reserve because no notice is added here.
+        tail_tool_call = self._tail_unanswered_tool_call_message(sticky_view)
+        if tail_tool_call is not None and self._has_provider_thinking(tail_tool_call):
+            if estimated_tokens > budget:
+                raise ContextLengthError(
+                    "Context cannot fit the current injections and protected conversation "
+                    "within the estimated input budget; shorten the active instructions "
+                    "or use a larger context window. Required content was not discarded."
+                )
+            self._record_signed_thinking_strip_count(0)
+            await self._emit_budget()
+            return self._strip_internal_metadata(sticky_view)
 
         # Check whether this request needs a new compaction escalation. A
         # provider-directed hard fit applies at the full forced budget, not at
