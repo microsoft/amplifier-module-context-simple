@@ -462,3 +462,15 @@ trademarks or logos is subject to and must follow
 [Microsoft's Trademark & Brand Guidelines](https://www.microsoft.com/legal/intellectualproperty/trademarks/usage/general).
 Use of Microsoft trademarks or logos in modified versions of this project must not cause confusion or imply Microsoft sponsorship.
 Any use of third-party trademarks or logos are subject to those third-party's policies.
+
+### Canonical public history and execution views
+
+`amplifier_module_context_simple.request_view.request_view` is the shared
+projection for request, summary and token-estimate consumers. It excludes
+`amplifier_public_message`, `amplifier_public_copy_source` and
+`amplifier_public_reference_only` metadata from copies. A row whose
+`amplifier_public_reference_only` is exactly `True` is omitted from execution.
+Canonical `get_messages()` history is retained unchanged. Sequence IDs remain
+available while fitting and are stripped only at the existing final request
+boundary; unrelated metadata retains its previous behavior. This helper does
+not validate originals, store messages, negotiate transport or grant access.
