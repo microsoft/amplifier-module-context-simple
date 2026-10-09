@@ -106,9 +106,16 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 - **System messages**: All system messages are always preserved
 - **First human prompt**: The original human task/request is protected, using message metadata rather than treating every user-role message as human input
 - **Last human prompt**: The most recent human input is protected by the same metadata-based classification
-- **Recent messages**: Last N% of messages (configurable via `protected_recent`)
 - **Recent tool results**: The last `protected_tool_results` results (default 5) are protected from both truncation and removal; a protected sibling also prevents removal of its owning call group
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
+
+Recent history also receives a soft preference (`protected_recent`). The normal
+compaction ladder reduces this fraction progressively. If its final view still
+exceeds the effective input budget, one final pass relaxes the fraction to zero
+and targets the budget, not the lower compaction target. Required request
+injections, human boundaries, loaded-tool state, and protected tool-result
+groups keep their protections. A required floor that cannot fit still fails;
+canonical history is never rewritten by this pass.
 
 ### Request-scoped retention
 
