@@ -2557,6 +2557,25 @@ class SimpleContextManager:
                 f"Tokens: {old_tokens:,} → {current_tokens:,}"
             )
 
+        # Recency is a quality preference, not an irreducible requirement.
+        # A small recent slice can contain several large historical machine
+        # reminders. After the normal ladder, relax only that soft preference
+        # if necessary to fit the actual budget (not merely the lower target).
+        # The shared remover still protects current retained injections, human
+        # boundaries, loaded-tool state, and the last tool-result groups.
+        if self._estimate_tokens(working_messages) + system_tokens > budget:
+            working_messages, removed, stubbed, current_tokens = (
+                self._remove_messages_with_protection(
+                    working_messages,
+                    budget,
+                    protected_recent=0,
+                    system_tokens=system_tokens,
+                    additional_protected_seqs=additional_protected_seqs,
+                )
+            )
+            total_removed += removed
+            total_stubbed += stubbed
+
         return await self._finalize_compaction_with_stats(
             working_messages,
             system_messages,
