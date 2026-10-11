@@ -59,6 +59,29 @@ async def _staged_transaction(*, hooks=None):
     return context, result["transaction"]
 
 
+async def _add_partial_signed_tool_turn(context):
+    """Add two calls but return a structured result for only the first."""
+    await context.add_message({"role": "user", "content": "first"})
+    await context.add_message({"role": "assistant", "content": "old removable prefix"})
+    await context.add_message(
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "thinking", "thinking": "private", "signature": "sig"},
+                {"type": "tool_use", "id": "call-1", "name": "read", "input": {}},
+                {"type": "tool_use", "id": "call-2", "name": "list", "input": {}},
+            ],
+        }
+    )
+    await context.add_message(
+        {
+            "role": "user",
+            "content": [{"type": "tool_result", "tool_use_id": "call-1", "content": "one"}],
+        }
+    )
+    context._record_removed(context.messages[1])
+
+
 @pytest.mark.asyncio
 async def test_measured_capability_is_actual_mode_only_and_foreground_is_always_additive():
     estimate = _Coordinator()
@@ -138,6 +161,89 @@ async def test_protected_floor_with_no_legal_change_has_one_count_and_no_sticky_
     assert result["outcome"] == "protected_floor"
     assert result["count_calls"] == calls == 1
     assert result["transaction"] is None
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_unfinished_signed_tool_turn_is_a_measured_protected_floor():
+    """A provider-count fit must not reduce an incomplete signed tool turn."""
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await _add_partial_signed_tool_turn(context)
+    calls = 0
+
+    async def count_view(view):
+        nonlocal calls
+        calls += 1
+        return {"dispatch": object(), "budget_decision": _decision(900)}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+
+    assert result["outcome"] == "protected_floor"
+    assert result["count_calls"] == calls == 1
+    assert result["transaction"] is None
+    assert not context._truncated_seqs
+    replayed = next(message for message in result["base_view"] if message.get("role") == "assistant")
+    assert replayed["content"][0]["type"] == "thinking"
+
+
+@pytest.mark.asyncio
+async def test_unfinished_signed_tool_turn_measured_hard_overlimit_rolls_back():
+    """A known hard overflow fails before staging a reduction."""
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await _add_partial_signed_tool_turn(context)
+
+    async def count_view(_view):
+        return {
+            "dispatch": object(),
+            "budget_decision": _decision(900, estimated=1_001, limit=1_000),
+        }
+
+    with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+        await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+
+    assert not context._truncated_seqs
+    assert context._last_compaction_stats is None
+
+
+@pytest.mark.asyncio
+async def test_unfinished_signed_tool_turn_keeps_unavailable_measurement_unreduced():
+    """An unavailable count returns the existing outcome without legacy compaction."""
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        compact_threshold=0.1,
+        compaction_notice_enabled=False,
+        token_meter="actual",
+    )
+    await _add_partial_signed_tool_turn(context)
+    calls = 0
+
+    async def count_view(_view):
+        nonlocal calls
+        calls += 1
+        return {"dispatch": object(), "budget_decision": None}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+
+    assert result["outcome"] == "measurement_unavailable"
+    assert result["count_calls"] == calls == 1
+    assert result["transaction"] is None
+    assert not context._truncated_seqs
     assert context._last_compaction_stats is None
 
 
