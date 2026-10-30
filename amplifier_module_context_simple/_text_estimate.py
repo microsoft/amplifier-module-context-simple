@@ -8,6 +8,8 @@ remain ordinary text. The original messages and image payloads are never changed
 
 from typing import Any, NamedTuple
 
+from .request_view import request_view
+
 
 class TextEstimate(NamedTuple):
     tokens: int
@@ -17,7 +19,7 @@ class TextEstimate(NamedTuple):
 def estimate_messages(messages: list[dict[str, Any]]) -> TextEstimate:
     tokens = 0
     has_images = False
-    for message in messages:
+    for message in request_view(messages):
         content = message.get("content")
         if isinstance(content, list):
             content, found = _content_without_image_payloads(content)

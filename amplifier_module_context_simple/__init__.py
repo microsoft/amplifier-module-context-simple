@@ -49,6 +49,7 @@ from amplifier_core import ModuleCoordinator, TextBlock
 from amplifier_core.llm_errors import ContextLengthError
 
 from ._text_estimate import estimate_messages
+from .request_view import request_view
 
 logger = logging.getLogger(__name__)
 
@@ -1156,6 +1157,8 @@ class SimpleContextManager:
             else:
                 working = list(self.messages)
 
+            working = request_view(working)
+
             developer_seqs = {
                 seq
                 for message in working
@@ -1610,6 +1613,7 @@ class SimpleContextManager:
             # Static mode: use messages as-is (may include stored system messages)
             working_messages = list(self.messages)
 
+        working_messages = request_view(working_messages)
         self._request_protected_seqs = self._protected_sequences(working_messages)
         self._check_retained_budget(
             [
@@ -1760,44 +1764,11 @@ class SimpleContextManager:
     # compaction identity (see _extract_seq): meaningless to a provider, and --
     # because _estimate_tokens stringifies the whole message dict -- it also
     # inflates the token estimate of every message carrying it.
-    _INTERNAL_METADATA_KEYS = frozenset({"_seq"})
-
     def _strip_internal_metadata(
         self, messages: list[dict[str, Any]]
     ) -> list[dict[str, Any]]:
-        """Return a provider-facing view with internal-only metadata removed.
-
-        CRITICAL: stored history must KEEP `_seq` -- the sticky decision store
-        is keyed on it, so losing it would silently break stickiness (and with
-        it, prefix stability). The returned view can share dict objects with
-        `self.messages`: the no-compaction path returns stored dicts directly,
-        and even the compacted path's `dict(msg)` shallow copies share the SAME
-        nested metadata dict. So this NEVER mutates in place -- any message
-        needing a strip is rebuilt as a new dict with a new metadata dict, and
-        the stored original is left untouched.
-
-        Messages with nothing to strip pass through by identity (no copy),
-        which keeps this deterministic and byte-stable call over call.
-        """
-        result: list[dict[str, Any]] = []
-        for msg in messages:
-            meta = msg.get("metadata")
-            if not isinstance(meta, dict) or self._INTERNAL_METADATA_KEYS.isdisjoint(
-                meta
-            ):
-                result.append(msg)
-                continue
-            result.append(
-                {
-                    **msg,
-                    "metadata": {
-                        k: v
-                        for k, v in meta.items()
-                        if k not in self._INTERNAL_METADATA_KEYS
-                    },
-                }
-            )
-        return result
+        """Final execution projection, after sequence-based fitting decisions."""
+        return request_view(messages, strip_sequence=True)
 
     async def get_messages(self) -> list[dict[str, Any]]:
         """
