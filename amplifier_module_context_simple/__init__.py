@@ -138,6 +138,26 @@ def _is_human_message(msg: dict[str, Any]) -> bool:
     )
 
 
+def _user_text_for_stubbing(content: Any) -> str | None:
+    """Read plain text in either supported shape without discarding other data.
+
+    A text-block list is common for ACP and multimodal-capable clients even
+    when the prompt contains only text. Mixed media, unknown block fields and
+    malformed blocks remain untouched; this is not a general flattening step.
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list) and content and all(
+        isinstance(block, dict)
+        and set(block) == {"type", "text"}
+        and block["type"] == "text"
+        and isinstance(block["text"], str)
+        for block in content
+    ):
+        return "".join(block["text"] for block in content)
+    return None
+
+
 def _validated_max_tokens(raw: Any) -> int | None:
     """Return a usable `max_tokens` cap, or None for 'no cap'.
 
@@ -2502,8 +2522,8 @@ class SimpleContextManager:
             ):
                 first_msg = working_messages[first_user_idx]
                 if not first_msg.get("_stubbed"):
-                    content = first_msg.get("content", "")
-                    if isinstance(content, str) and len(content) > 80:
+                    content = _user_text_for_stubbing(first_msg.get("content", ""))
+                    if content is not None and len(content) > 80:
                         working_messages[first_user_idx] = self._stub_user_message(
                             first_msg
                         )
@@ -2858,8 +2878,8 @@ class SimpleContextManager:
             if current_tokens <= target_tokens:
                 break
             msg = messages[i]
-            content = msg.get("content", "")
-            if isinstance(content, str) and len(content) > 80:
+            content = _user_text_for_stubbing(msg.get("content", ""))
+            if content is not None and len(content) > 80:
                 indices_to_stub.add(i)
                 savings = (len(content) - 70) // 4  # Stub is ~70 chars
                 current_tokens -= savings
@@ -3132,8 +3152,9 @@ class SimpleContextManager:
 
         Returns a NEW dict - does not modify the original.
         """
-        content = msg.get("content", "")
-        if not isinstance(content, str) or len(content) <= 80:
+        original_content = msg.get("content", "")
+        content = _user_text_for_stubbing(original_content)
+        if content is None or len(content) <= 80:
             return msg  # Too short to stub
 
         # Take first 50 chars, clean up for display
@@ -3141,9 +3162,14 @@ class SimpleContextManager:
         if len(content) > 50:
             preview += "..."
 
+        stub = f'[User message compacted - original: "{preview}"]'
         return {
             **msg,
-            "content": f'[User message compacted - original: "{preview}"]',
+            "content": (
+                [{"type": "text", "text": stub}]
+                if isinstance(original_content, list)
+                else stub
+            ),
             "_stubbed": True,
             "_original_length": len(content),
         }
