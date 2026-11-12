@@ -108,6 +108,10 @@ Compaction triggers when token usage reaches the configured threshold (default: 
 - **Last human prompt**: The most recent human input is protected by the same metadata-based classification
 - **Recent tool results**: The last `protected_tool_results` results (default 5) are protected from both truncation and removal; a protected sibling also prevents removal of its owning call group
 - **Tool pairs**: Tool_use and tool_result messages are treated as atomic units
+- **Unfinished signed tool turns**: provider thinking remains intact while any
+  sibling tool result is pending. Context reuses the existing sticky view
+  without a new compaction decision, or fails closed when that complete view
+  cannot fit the request budget.
 
 Recent history also receives a soft preference (`protected_recent`). The normal
 compaction ladder reduces this fraction progressively. If its final view still
