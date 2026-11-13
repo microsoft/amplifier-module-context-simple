@@ -58,6 +58,50 @@ def _make_context(**overrides: Any) -> SimpleContextManager:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("transform", ["truncate", "stub", "remove"])
+async def test_sticky_media_positions_keep_refs_only_while_message_survives(
+    transform, media_metadata
+):
+    import copy
+
+    from amplifier_module_context_simple._text_estimate import estimate_messages
+
+    context = _make_context(max_tokens=100_000, compaction_notice_enabled=False)
+    await context.add_message({"role": "user", "content": "first human"})
+    await context.add_message(
+        {
+            "role": "tool" if transform == "truncate" else "user",
+            "content": "media label " * 100,
+            "metadata": media_metadata,
+        }
+    )
+    await context.add_message({"role": "user", "content": "last human"})
+    canonical = copy.deepcopy(await context.get_messages())
+    seq = canonical[1]["metadata"]["_seq"]
+    decisions = {
+        "truncate": context._truncated_seqs,
+        "stub": context._stubbed_seqs,
+        "remove": context._removed_seqs,
+    }
+    decisions[transform].add(seq)
+    view = await context.get_messages_for_request()
+    if transform == "remove":
+        assert len(view) == 2
+        assert not estimate_messages(view).has_unmeasured_images
+        # Dropped canonical refs cannot poison a later no-media hard-fit view.
+        assert await context.get_messages_for_request_retaining(
+            retain_contents=[], hard_fit=True, token_budget=100_000
+        ) == view
+    else:
+        assert len(view) == 3
+        assert view[1]["content"] != canonical[1]["content"]
+        assert view[1]["metadata"] == media_metadata
+        assert estimate_messages(view).has_unmeasured_images
+    assert await context.get_messages_for_request() == view
+    assert await context.get_messages() == canonical
+
+
+@pytest.mark.asyncio
 async def test_prefix_stability_regression():
     """THE regression test: two consecutive get_messages_for_request() calls,
     where history grew by exactly one turn in between, must produce a

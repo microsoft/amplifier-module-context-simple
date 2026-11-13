@@ -108,3 +108,105 @@ async def test_protected_image_survives_hard_fit_while_real_text_overflow_still_
             retain_contents=[], hard_fit=True, token_budget=1000
         )
     assert (await context.get_messages())[0]["content"][1] == image
+
+
+@pytest.mark.parametrize("content", ["Images from tool", [{"type": "text", "text": "Images"}]])
+def test_canonical_media_refs_have_unknown_cost_without_changing_text_estimate(
+    content, media_metadata
+):
+    message = {"role": "tool", "content": content, "metadata": media_metadata}
+    before = copy.deepcopy(message)
+    estimate = estimate_messages([message])
+    assert estimate.has_unmeasured_images
+    assert estimate.tokens == len(str(message)) // 4
+    assert message == before
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        {"content": '{"experimental.media.v1":{"refs":[{"sha256":"quoted"}]}}'},
+        {"content": [{"type": "text", "text": 'experimental.media.v1 refs ["quoted"]'}]},
+        {"tool_calls": [{"arguments": {"experimental.media.v1": {"refs": ["argument"]}}}]},
+        {"metadata": {"nested": {"experimental.media.v1": {"refs": ["nested"]}}}},
+        {"metadata": {"experimental.media.v2": {"refs": ["future"]}}},
+        {"metadata": {"experimental.media.v1": {"refs": []}}},
+        {"metadata": {"experimental.media.v1": None}},
+        {"metadata": {"experimental.media.v1": '{"refs":["quoted"]}'}},
+        {"metadata": {"experimental.media.v1": {"refs": "not-a-list"}}},
+        {"metadata": None},
+    ],
+)
+def test_only_direct_canonical_ref_lists_mark_unknown_image_cost(message):
+    message = {"role": "user", **message}
+    estimate = estimate_messages([message])
+    assert not estimate.has_unmeasured_images
+    assert estimate.tokens == len(str(message)) // 4
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token_meter", ["estimate", "actual"])
+async def test_refs_are_text_only_hints_and_cannot_certify_estimate_hard_fit(
+    token_meter, media_metadata
+):
+    from amplifier_core import ContextLengthError
+
+    from amplifier_module_context_simple import SimpleContextManager
+
+    context = SimpleContextManager(
+        max_tokens=10_000, token_meter=token_meter, compaction_notice_enabled=False
+    )
+    await context.add_message(
+        {"role": "user", "content": "Describe the images", "metadata": media_metadata}
+    )
+    # A previous response count is not a measurement of this request's images.
+    context.claim_foreground_usage()(input_tokens=1)
+    view = await context.get_messages_for_request()
+    assert view[0]["metadata"] == media_metadata
+    assert context._last_token_meter_stats["estimate_scope"] == "text_only"
+    before = copy.deepcopy(await context.get_messages())
+    stats = context._last_token_meter_stats
+    with pytest.raises(ContextLengthError, match="media references.*measured"):
+        await context.get_messages_for_request_retaining(
+            retain_contents=[], hard_fit=True, token_budget=10_000
+        )
+    assert await context.get_messages() == before
+    assert context._last_token_meter_stats is stats
+    assert not context._removed_seqs
+    assert not context._truncated_seqs
+    assert context._request_hard_fit is False
+
+
+@pytest.mark.asyncio
+async def test_host_unavailable_text_projection_needs_no_media_cost_certification():
+    from amplifier_module_context_simple import SimpleContextManager
+
+    context = SimpleContextManager(max_tokens=1_000, compaction_notice_enabled=False)
+    text = "[Image unavailable: selected route has no vision; no pixels supplied]"
+    await context.add_message({"role": "user", "content": text})
+    view = await context.get_messages_for_request_retaining(
+        retain_contents=[], hard_fit=True, token_budget=1_000
+    )
+    assert view[0]["content"] == text
+    assert context._last_token_meter_stats["estimate_scope"] == "all_text"
+
+
+@pytest.mark.asyncio
+async def test_unprotected_surviving_refs_also_block_final_estimate_hard_fit(media_metadata):
+    from amplifier_core import ContextLengthError
+
+    from amplifier_module_context_simple import SimpleContextManager
+
+    context = SimpleContextManager(max_tokens=10_000, compaction_notice_enabled=False)
+    await context.add_message({"role": "user", "content": "first human"})
+    await context.add_message(
+        {"role": "tool", "content": "Images", "metadata": media_metadata}
+    )
+    await context.add_message({"role": "user", "content": "last human"})
+    before = copy.deepcopy(await context.get_messages())
+    with pytest.raises(ContextLengthError, match="media references.*measured"):
+        await context.get_messages_for_request_retaining(
+            retain_contents=[], hard_fit=True, token_budget=10_000
+        )
+    assert await context.get_messages() == before
+    assert context._last_token_meter_stats is None
