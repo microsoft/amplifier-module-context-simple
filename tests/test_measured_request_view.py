@@ -987,3 +987,123 @@ async def test_output_fit_stages_changed_compaction_until_rollback_or_commit():
     committed_context, committed = await build_candidate()
     assert await committed["transaction"].commit()
     assert committed_context._last_compaction_stats["outcome"] == "reduced_output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("image_count", [100, 1_100])
+async def test_media_refs_reach_authoritative_count_unchanged_and_cannot_fake_fit(
+    image_count, media_metadata
+):
+    import copy
+
+    from amplifier_core import ChatRequest, Message
+
+    context = SimpleContextManager(
+        max_tokens=1_000, token_meter="actual", compaction_notice_enabled=False
+    )
+    await context.add_message(
+        {"role": "user", "content": "Describe images", "metadata": media_metadata}
+    )
+    canonical = copy.deepcopy(await context.get_messages())
+    counted = []
+
+    async def count_view(view):
+        request = ChatRequest(messages=[Message(**message) for message in view])
+        assert request.messages[0].metadata == media_metadata
+        counted.append(view)
+        return {"dispatch": request, "budget_decision": _decision(image_count)}
+
+    if image_count > 1_000:
+        with pytest.raises(ContextLengthError, match="cannot fit protected content"):
+            await context.get_measured_request_view(
+                provider=None, retain_contents=[], count_view=count_view
+            )
+    else:
+        result = await context.get_measured_request_view(
+            provider=None, retain_contents=[], count_view=count_view
+        )
+        assert result["outcome"] == "not_needed"
+        assert result["base_view"] is counted[0]
+        assert result["final_attempt"]["dispatch"].messages[0].metadata == media_metadata
+        assert result["measured_after"] == image_count
+    assert len(counted) == 1
+    assert await context.get_messages() == canonical
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reduction", ["truncate", "remove"])
+async def test_measured_compaction_preserves_selected_ref_order_without_resurrection(
+    reduction, media_metadata
+):
+    import copy
+
+    context = SimpleContextManager(
+        max_tokens=1_000,
+        token_meter="actual",
+        compact_threshold=0.8,
+        target_usage=0.5,
+        protected_recent=0,
+        protected_tool_results=1,
+        compaction_notice_enabled=False,
+    )
+    await context.add_message({"role": "user", "content": "first human"})
+    for index in range(4):
+        await context.add_message(
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": str(index), "tool": "read_image", "arguments": {}}],
+            }
+        )
+        await context.add_message(
+            {
+                "role": "tool",
+                "tool_call_id": str(index),
+                "content": "image label " * 100,
+                "metadata": media_metadata,
+            }
+        )
+    await context.add_message({"role": "user", "content": "last human"})
+    canonical = copy.deepcopy(await context.get_messages())
+    views = []
+
+    async def count_view(view):
+        views.append(view)
+        tools = [message for message in view if message["role"] == "tool"]
+        for message in tools:
+            assert message["metadata"] == media_metadata
+        reduced = (
+            any(message.get("_truncated") for message in tools)
+            if reduction == "truncate"
+            else len(tools) < 4
+        )
+        return {"dispatch": object(), "budget_decision": _decision(400 if reduced else 900)}
+
+    result = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+    assert result["outcome"] == "target_reached"
+    assert result["transaction"] is not None
+    assert await result["transaction"].commit()
+    final_tools = [message for message in result["base_view"] if message["role"] == "tool"]
+    assert final_tools
+    assert [message["tool_call_id"] for message in final_tools] == sorted(
+        message["tool_call_id"] for message in final_tools
+    )
+    if reduction == "remove":
+        assert len(final_tools) < 4
+        selected_ids = {message["tool_call_id"] for message in final_tools}
+        assert {
+            call["id"]
+            for message in result["base_view"]
+            for call in message.get("tool_calls", [])
+        } == selected_ids
+    else:
+        assert any(message.get("_truncated") for message in final_tools)
+    assert result["base_view"] is views[-1]
+    again = await context.get_measured_request_view(
+        provider=None, retain_contents=[], count_view=count_view
+    )
+    assert again["outcome"] == "not_needed"
+    assert again["base_view"] == result["base_view"]
+    assert await context.get_messages() == canonical

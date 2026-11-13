@@ -214,6 +214,37 @@ async def test_tool_identity_metadata_error_and_caller_objects_are_preserved():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("admission", ["add", "resume"])
+async def test_media_refs_survive_text_clipping_core_roundtrip_and_resume(
+    admission, media_metadata
+):
+    from amplifier_core import ChatRequest, Message
+
+    original = {
+        "role": "tool",
+        "tool_call_id": "call-media",
+        "content": "x" * (DEFAULT_CAP + 10),
+        "metadata": media_metadata,
+    }
+    before = copy.deepcopy(original)
+    context = SimpleContextManager(compaction_notice_enabled=False)
+    if admission == "add":
+        await context.add_message(original)
+    else:
+        await context.set_messages([original])
+    stored = (await context.get_messages())[0]
+    assert MARKER_PREFIX in stored["content"]
+    assert stored["metadata"]["experimental.media.v1"] == media_metadata["experimental.media.v1"]
+    view = await context.get_messages_for_request()
+    assert view[0]["metadata"] == media_metadata  # Only internal _seq is stripped.
+    request = ChatRequest(messages=[Message(**message) for message in view])
+    resumed = SimpleContextManager(compaction_notice_enabled=False)
+    await resumed.set_messages(request.model_dump(mode="json")["messages"])
+    assert (await resumed.get_messages_for_request())[0]["metadata"] == media_metadata
+    assert original == before
+
+
+@pytest.mark.asyncio
 async def test_text_blocks_cap_aggregate_text_without_touching_media_or_unknown_blocks():
     hooks = _RecordingHooks()
     image = {"type": "image", "source": {"data": "a" * (DEFAULT_CAP * 2)}}

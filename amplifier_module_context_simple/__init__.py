@@ -48,7 +48,7 @@ from typing import Any
 from amplifier_core import ModuleCoordinator, TextBlock
 from amplifier_core.llm_errors import ContextLengthError
 
-from ._text_estimate import estimate_messages
+from ._text_estimate import estimate_messages, has_media_refs
 
 logger = logging.getLogger(__name__)
 
@@ -1519,6 +1519,17 @@ class SimpleContextManager:
     def _check_retained_budget(
         self, messages: list[dict[str, Any]], budget: int
     ) -> None:
+        if self._request_hard_fit and any(has_media_refs(msg) for msg in messages):
+            # This legacy hard-fit path has no exact request count callback.
+            # A prior response's usage (even in actual mode) cannot certify the
+            # selected refs. The measured capability delegates to the host's
+            # authoritative projection/count; keep that path independent.
+            raise ContextLengthError(
+                "Context cannot certify hard fit with unresolved media references "
+                "using a text estimate; use a measured request view or a host "
+                "unavailable-text projection before counting. Required content "
+                "was not discarded."
+            )
         if (
             (self._request_retained_contents or self._request_hard_fit)
             and self._estimate_tokens(messages) > budget

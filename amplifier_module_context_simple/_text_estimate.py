@@ -2,8 +2,9 @@
 
 Keep this small helper local: runtime modules must not depend on a host or on
 another context/loop implementation. Image cost requires the selected provider.
-Only actual content-block positions are inspected; quoted data and tool arguments
-remain ordinary text. The original messages and image payloads are never changed.
+Only actual content-block positions and direct canonical media-ref metadata are
+inspected; quoted data and tool arguments remain ordinary text. The original
+messages and image payloads are never changed.
 """
 
 from typing import Any, NamedTuple
@@ -14,10 +15,24 @@ class TextEstimate(NamedTuple):
     has_unmeasured_images: bool
 
 
+def has_media_refs(message: dict[str, Any]) -> bool:
+    """Detect unknown media cost, not ref validity, ownership or availability.
+
+    The host validates/projects the reserved namespace. Never parse strings,
+    resolve refs or infer pixel cost from their textual descriptors here.
+    """
+    metadata = message.get("metadata")
+    media = metadata.get("experimental.media.v1") if isinstance(metadata, dict) else None
+    return isinstance(media, dict) and isinstance(media.get("refs"), list) and bool(
+        media["refs"]
+    )
+
+
 def estimate_messages(messages: list[dict[str, Any]]) -> TextEstimate:
     tokens = 0
     has_images = False
     for message in messages:
+        has_images |= has_media_refs(message)
         content = message.get("content")
         if isinstance(content, list):
             content, found = _content_without_image_payloads(content)
